@@ -22,6 +22,7 @@ import {
   matchesClassScope,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type StudentDoc } from '../types/school';
+import { StudentProfileView } from './StudentProfileView';
 
 interface StudentFormState {
   id?: string;
@@ -48,7 +49,15 @@ interface StudentFormState {
   examResults: Record<string, number | string>;
 }
 
-export const StudentsView: React.FC = () => {
+interface StudentsViewProps {
+  selectedProfileId?: string | null;
+  onSelectProfile?: (id: string | null) => void;
+}
+
+export const StudentsView: React.FC<StudentsViewProps> = ({
+  selectedProfileId,
+  onSelectProfile,
+}) => {
   const {
     lang,
     session,
@@ -58,6 +67,14 @@ export const StudentsView: React.FC = () => {
     selectedAcademicYear,
     selectedClass,
   } = useApp();
+
+  const [internalProfileId, setInternalProfileId] = useState<string | null>(null);
+  const activeProfileId =
+    selectedProfileId !== undefined ? selectedProfileId : internalProfileId;
+  const setActiveProfileId = (id: string | null) => {
+    if (onSelectProfile) onSelectProfile(id);
+    else setInternalProfileId(id);
+  };
 
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<'roll' | 'name'>('roll');
@@ -283,26 +300,35 @@ export const StudentsView: React.FC = () => {
 
   return (
     <div className="space-y-5">
-      {statusBanner && (
-        <div
-          className={`flex items-center justify-between gap-3 px-4 py-3 rounded-lg border text-sm ${
-            statusBanner.type === 'success'
-              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
-              : 'bg-rose-50 border-rose-200 text-rose-900'
-          }`}
-        >
-          <span>{statusBanner.text}</span>
-          <button
-            type="button"
-            onClick={() => setStatusBanner(null)}
-            className="p-1 hover:opacity-70 cursor-pointer"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
+      {activeProfileId ? (
+        <StudentProfileView
+          studentId={activeProfileId}
+          onBack={() => setActiveProfileId(null)}
+          onSelectStudent={(id) => setActiveProfileId(id)}
+          onOpenFullEditModal={(st) => openEditModal(st)}
+        />
+      ) : (
+        <>
+          {statusBanner && (
+            <div
+              className={`flex items-center justify-between gap-3 px-4 py-3 rounded-lg border text-sm ${
+                statusBanner.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-rose-50 border-rose-200 text-rose-900'
+              }`}
+            >
+              <span>{statusBanner.text}</span>
+              <button
+                type="button"
+                onClick={() => setStatusBanner(null)}
+                className="p-1 hover:opacity-70 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
 
-      {/* Toolbar */}
+          {/* Toolbar */}
       <div className="bg-white border border-stone-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
         <div className="flex flex-1 flex-wrap items-center gap-3">
           <div className="relative flex-1 min-w-[220px] max-w-md">
@@ -394,7 +420,11 @@ export const StudentsView: React.FC = () => {
                 {filteredStudents.map((st) => {
                   const photo = formatPhotoSrc(st.photoBase64);
                   return (
-                    <tr key={st.id} className="hover:bg-stone-50/70 transition-colors">
+                    <tr
+                      key={st.id}
+                      onClick={() => setActiveProfileId(st.id)}
+                      className="hover:bg-emerald-50/40 transition-colors cursor-pointer"
+                    >
                       <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
                         {st.rollNumber || '—'}
                       </td>
@@ -413,7 +443,7 @@ export const StudentsView: React.FC = () => {
                             </div>
                           )}
                           <div className="min-w-0">
-                            <div className="font-medium text-slate-900 truncate">
+                            <div className="font-medium text-emerald-900 hover:underline truncate">
                               {st.studentNameBn || st.studentNameEn}
                             </div>
                             {st.studentNameBn && st.studentNameEn && (
@@ -440,7 +470,10 @@ export const StudentsView: React.FC = () => {
                       <td className="py-2.5 px-4 text-xs text-slate-600">
                         {st.promotionStatus || '—'}
                       </td>
-                      <td className="py-2.5 px-4 text-right">
+                      <td
+                        className="py-2.5 px-4 text-right"
+                        onClick={(e) => e.stopPropagation()}
+                      >
                         <div className="inline-flex items-center gap-1.5">
                           <button
                             type="button"
@@ -470,6 +503,8 @@ export const StudentsView: React.FC = () => {
           </div>
         )}
       </div>
+        </>
+      )}
 
       {/* Add/Edit Student Modal */}
       {editingStudent && (

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  ArrowUpRight,
   BookOpenCheck,
   CalendarCheck2,
   ClipboardList,
@@ -25,6 +26,7 @@ export type NavTab =
   | 'students'
   | 'batch-marks'
   | 'attendance'
+  | 'promotion'
   | 'batch-fields'
   | 'marksheet'
   | 'comms'
@@ -81,6 +83,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     { id: 'students', label: t(lang, 'navStudents'), icon: Users },
     { id: 'batch-marks', label: t(lang, 'navBatchMarks'), icon: ClipboardList },
     { id: 'attendance', label: t(lang, 'navAttendance'), icon: CalendarCheck2 },
+    { id: 'promotion', label: t(lang, 'navPromotion'), icon: ArrowUpRight },
     { id: 'batch-fields', label: t(lang, 'navBatchFields'), icon: BookOpenCheck },
     { id: 'marksheet', label: t(lang, 'navMarksheet'), icon: FileSpreadsheet },
     { id: 'comms', label: t(lang, 'navComms'), icon: MessageSquareText },

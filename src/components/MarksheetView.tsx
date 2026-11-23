@@ -27,6 +27,9 @@ export const MarksheetView: React.FC = () => {
     session,
     school,
     students,
+    subjects,
+    customFields,
+    attendanceLogs,
     selectedAcademicYear,
     selectedClass,
   } = useApp();
@@ -317,6 +320,68 @@ export const MarksheetView: React.FC = () => {
     XLSX.writeFile(wb, filename, { bookType: format });
   };
 
+  const exportFullSchoolBackup = () => {
+    const wb = XLSX.utils.book_new();
+
+    const studentRows = students.map((st) => ({
+      studentId: st.id,
+      schoolId: st.schoolId,
+      academicYear: st.academicYear,
+      classLevel: st.classLevel,
+      section: st.section || '',
+      rollNumber: st.rollNumber,
+      nextYearRollNumber: st.nextYearRollNumber || '',
+      studentNameBn: st.studentNameBn || '',
+      studentNameEn: st.studentNameEn || '',
+      fatherNameEn: st.fatherNameEn || '',
+      motherNameEn: st.motherNameEn || '',
+      dateOfBirth: st.dateOfBirth || '',
+      guardianPhone: st.guardianPhone || '',
+      address: st.address || '',
+      totalSchoolDays: st.totalSchoolDays || 0,
+      daysPresent: st.daysPresent || 0,
+      promotionStatus: st.promotionStatus || '',
+      sectorNotes: st.sectorNotes || '',
+      customValuesJson: JSON.stringify(st.customValues || {}),
+      subjectValuesJson: JSON.stringify(st.subjectValues || {}),
+      examResultsJson: JSON.stringify(st.examResults || {}),
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(studentRows), 'Students');
+
+    const attRows = attendanceLogs.map((a) => ({
+      docId: a.id,
+      academicYear: a.academicYear,
+      classLevel: a.classLevel,
+      dateKey: a.dateKey,
+      monthKey: a.monthKey,
+      markedByName: a.markedByName,
+      statusesJson: JSON.stringify(a.statuses || {}),
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(attRows), 'AttendanceLogs');
+
+    const subjRows = subjects.map((s) => ({
+      subjectId: s.id,
+      name: s.name,
+      gradeScope: s.gradeScope,
+      fieldsJson: JSON.stringify(s.fields || []),
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(subjRows), 'Subjects');
+
+    const cfRows = customFields.map((c) => ({
+      fieldId: c.id,
+      category: c.category,
+      label: c.label,
+      fieldType: c.fieldType,
+      resetsYearly: c.resetsYearly,
+    }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cfRows), 'CustomFields');
+
+    XLSX.writeFile(
+      wb,
+      `${session?.schoolId || 'School'}_Backup_${selectedAcademicYear}.xlsx`
+    );
+  };
+
   // Import students from .xlsx / .csv
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -360,16 +425,58 @@ export const MarksheetView: React.FC = () => {
         const nextResults: Record<string, number | string> = {
           ...(existingMatch?.examResults || {}),
         };
-
-        // Optional subject columns if present in format "Subject__exam_1__cont" or matching subject names
-        for (const subj of classSubjects) {
-          const contKey = `${subj.subjectName} (Final Cont)`;
-          const sumKey = `${subj.subjectName} (Final Sum)`;
-          if (row[contKey] !== undefined && row[contKey] !== '') {
-            nextResults[`exam_3__${subj.subjectId}__cont`] = Number(row[contKey]) || 0;
+        if (typeof row.examResultsJson === 'string' && row.examResultsJson.trim().startsWith('{')) {
+          try {
+            const parsedExam = JSON.parse(row.examResultsJson) as Record<string, number | string>;
+            Object.assign(nextResults, parsedExam);
+          } catch {
+            // ignore malformed JSON cell
           }
-          if (row[sumKey] !== undefined && row[sumKey] !== '') {
-            nextResults[`exam_3__${subj.subjectId}__sum`] = Number(row[sumKey]) || 0;
+        }
+
+        let nextCustom: Record<string, string | number | boolean> = {
+          ...(existingMatch?.customValues || {}),
+        };
+        if (typeof row.customValuesJson === 'string' && row.customValuesJson.trim().startsWith('{')) {
+          try {
+            const parsedCustom = JSON.parse(row.customValuesJson) as Record<string, string | number | boolean>;
+            nextCustom = { ...nextCustom, ...parsedCustom };
+          } catch {
+            // ignore malformed JSON cell
+          }
+        }
+
+        let nextSubjectVals: Record<string, string | number | boolean> = {
+          ...(existingMatch?.subjectValues || {}),
+        };
+        if (typeof row.subjectValuesJson === 'string' && row.subjectValuesJson.trim().startsWith('{')) {
+          try {
+            const parsedSubj = JSON.parse(row.subjectValuesJson) as Record<string, string | number | boolean>;
+            nextSubjectVals = { ...nextSubjectVals, ...parsedSubj };
+          } catch {
+            // ignore malformed JSON cell
+          }
+        }
+
+        // Optional subject columns for 1st, 2nd, or Final term
+        for (const subj of classSubjects) {
+          const mappings: Array<[string, 'exam_1' | 'exam_2' | 'exam_3']> = [
+            ['1st', 'exam_1'],
+            ['2nd', 'exam_2'],
+            ['Final', 'exam_3'],
+          ];
+          for (const [labelPrefix, termId] of mappings) {
+            const contKey = `${subj.subjectName} (${labelPrefix} Cont)`;
+            const sumKey = `${subj.subjectName} (${labelPrefix} Sum)`;
+            const hasCont = row[contKey] !== undefined && row[contKey] !== '';
+            const hasSum = row[sumKey] !== undefined && row[sumKey] !== '';
+            if (hasCont) nextResults[`${termId}__${subj.subjectId}__cont`] = Number(row[contKey]) || 0;
+            if (hasSum) nextResults[`${termId}__${subj.subjectId}__sum`] = Number(row[sumKey]) || 0;
+            if (hasCont || hasSum) {
+              const cVal = Number(nextResults[`${termId}__${subj.subjectId}__cont`] ?? 0) || 0;
+              const sVal = Number(nextResults[`${termId}__${subj.subjectId}__sum`] ?? 0) || 0;
+              nextResults[`${termId}__${subj.subjectId}`] = cVal + sVal;
+            }
           }
         }
 
@@ -389,12 +496,16 @@ export const MarksheetView: React.FC = () => {
             guardianPhone: String(row.guardianPhone || row['Guardian Phone'] || '').trim(),
             address: String(row.address || row['Address'] || '').trim(),
             rollNumber: roll,
+            nextYearRollNumber: String(row.nextYearRollNumber || row['Next Roll'] || '').trim(),
             classLevel: cls,
             section: String(row.section || row['Section'] || '').trim(),
             academicYear: yr,
             totalSchoolDays: Number(row.totalSchoolDays || 0),
             daysPresent: Number(row.daysPresent || 0),
             promotionStatus: String(row.promotionStatus || '').trim(),
+            sectorNotes: String(row.sectorNotes || '').trim(),
+            customValues: nextCustom,
+            subjectValues: nextSubjectVals,
             examResults: sanitizedResults,
           },
         });
@@ -590,6 +701,15 @@ export const MarksheetView: React.FC = () => {
                   className="hidden"
                 />
               </label>
+              <button
+                type="button"
+                onClick={exportFullSchoolBackup}
+                disabled={students.length === 0}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-stone-300 rounded-lg hover:bg-stone-50 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-700" />
+                <span>{t(lang, 'exportFullBackup')}</span>
+              </button>
             </>
           )}
         </div>

@@ -13,6 +13,7 @@ import { ConfigMissingScreen } from './components/ConfigMissingScreen';
 import { DashboardView } from './components/DashboardView';
 import { LoginScreen } from './components/LoginScreen';
 import { MarksheetView } from './components/MarksheetView';
+import { PromotionManagerView } from './components/PromotionManagerView';
 import { StudentsView } from './components/StudentsView';
 import { WorkspaceLayout, type NavTab } from './components/WorkspaceLayout';
 import { AppProvider, useApp } from './contexts/AppContext';
@@ -21,6 +22,7 @@ import { getFirebaseEnvStatus } from './lib/firebase';
 const MainAppShell: React.FC = () => {
   const { session, dataLoading } = useApp();
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
 
   // Ensure non-Admin users never remain on Admin tab if role downgrades live
   useEffect(() => {
@@ -33,17 +35,42 @@ const MainAppShell: React.FC = () => {
     return <LoginScreen />;
   }
 
+  const handleSelectTab = (tab: NavTab) => {
+    setActiveTab(tab);
+    if (tab !== 'students') {
+      setSelectedProfileId(null);
+    }
+  };
+
+  const handleOpenStudentProfile = (studentId: string) => {
+    setSelectedProfileId(studentId);
+    setActiveTab('students');
+  };
+
   return (
-    <WorkspaceLayout activeTab={activeTab} onSelectTab={setActiveTab}>
+    <WorkspaceLayout activeTab={activeTab} onSelectTab={handleSelectTab}>
       {dataLoading && (
-        <div className="mb-4 px-4 py-2.5 bg-white border border-stone-200 rounded-lg text-xs text-slate-600">
+        <div className="mb-4 px-4 py-2.5 bg-white border border-stone-200 rounded-lg text-xs text-slate-600 no-print">
           Syncing school records...
         </div>
       )}
-      {activeTab === 'dashboard' && <DashboardView onNavigate={setActiveTab} />}
-      {activeTab === 'students' && <StudentsView />}
-      {activeTab === 'batch-marks' && <BatchMarksView />}
+      {activeTab === 'dashboard' && (
+        <DashboardView
+          onNavigate={handleSelectTab}
+          onOpenStudentProfile={handleOpenStudentProfile}
+        />
+      )}
+      {activeTab === 'students' && (
+        <StudentsView
+          selectedProfileId={selectedProfileId}
+          onSelectProfile={setSelectedProfileId}
+        />
+      )}
+      {activeTab === 'batch-marks' && (
+        <BatchMarksView onOpenStudentProfile={handleOpenStudentProfile} />
+      )}
       {activeTab === 'attendance' && <AttendanceView />}
+      {activeTab === 'promotion' && <PromotionManagerView />}
       {activeTab === 'batch-fields' && <BatchFieldsView />}
       {activeTab === 'marksheet' && <MarksheetView />}
       {activeTab === 'comms' && <CommsView />}

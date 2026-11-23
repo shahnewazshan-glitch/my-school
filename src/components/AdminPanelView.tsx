@@ -331,6 +331,12 @@ export const AdminPanelView: React.FC = () => {
                 lastUpdatedByName: change.submittedByName || session.name,
                 updatedAt: serverTimestamp(),
               });
+            } else if (item.fieldsPatch && typeof item.fieldsPatch === 'object') {
+              batch.update(ref, {
+                ...(item.fieldsPatch as Record<string, unknown>),
+                lastUpdatedByName: change.submittedByName || session.name,
+                updatedAt: serverTimestamp(),
+              });
             }
           }
           await batch.commit();

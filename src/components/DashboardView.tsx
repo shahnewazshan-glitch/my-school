@@ -20,9 +20,13 @@ import type { NavTab } from './WorkspaceLayout';
 
 interface DashboardViewProps {
   onNavigate: (tab: NavTab) => void;
+  onOpenStudentProfile: (studentId: string) => void;
 }
 
-export const DashboardView: React.FC<DashboardViewProps> = ({ onNavigate }) => {
+export const DashboardView: React.FC<DashboardViewProps> = ({
+  onNavigate,
+  onOpenStudentProfile,
+}) => {
   const {
     lang,
     session,
@@ -300,7 +304,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ onNavigate }) => {
                         type="button"
                         onClick={() => {
                           setSelectedClass(st.classLevel);
-                          onNavigate('students');
+                          onOpenStudentProfile(st.id);
                         }}
                         className="w-full flex items-center justify-between gap-3 p-2.5 text-left hover:bg-stone-50 cursor-pointer"
                       >
