@@ -71,7 +71,15 @@ export function validateAndBuildStudentPayload(
     customValues,
     subjectValues,
     examResults,
-    sectorNotes: String(input.sectorNotes || '').trim(),
+    sectorNotes:
+      typeof input.sectorNotes === 'string'
+        ? input.sectorNotes.trim()
+        : input.sectorNotes && typeof input.sectorNotes === 'object'
+        ? Object.entries(input.sectorNotes)
+            .map(([k, v]) => `${k}: ${String(v ?? '')}`)
+            .join('\n')
+            .trim()
+        : '',
     lastUpdatedByName: updatedByName,
     createdAt: existingCreatedAt || serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -79,9 +87,10 @@ export function validateAndBuildStudentPayload(
 }
 
 export function sanitizeRecordMap<T extends string | number | boolean>(
-  map: Record<string, T | null | undefined>
+  map: Record<string, T | null | undefined> | null | undefined
 ): Record<string, T> {
   const out: Record<string, T> = {};
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return out;
   for (const [k, v] of Object.entries(map)) {
     if (v !== undefined && v !== null && v !== '') {
       out[k] = v;

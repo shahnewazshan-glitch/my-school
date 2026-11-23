@@ -34,23 +34,25 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
   }, [school?.examConfigs]);
 
   const activeConfig = examDrafts.find((c) => c.examId === activeTerm) || examDrafts[0];
+  const activeSubjects = Array.isArray(activeConfig?.subjects) ? activeConfig.subjects : [];
 
   const handleAddSubject = () => {
     setExamDrafts((prev) =>
       prev.map((term) => {
         if (term.examId !== activeTerm) return term;
-        const idx = term.subjects.length + 1;
+        const currentSubjects = Array.isArray(term.subjects) ? term.subjects : [];
+        const idx = currentSubjects.length + 1;
         return {
           ...term,
           subjects: [
-            ...term.subjects,
+            ...currentSubjects,
             {
               subjectId: `subj_${Date.now()}_${idx}`,
               subjectName: '',
-              classScope: defaultClassScope || 'ALL',
+              classScope: defaultClassScope || 'All Classes',
               fullMarks: 100,
               passMarks: 33,
-              highestMarkOverride: null,
+              highestMarkOverride: 0,
             },
           ],
         };
@@ -203,7 +205,7 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {activeConfig.subjects.length === 0 ? (
+                {activeSubjects.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="py-6 text-center text-slate-500">
                       {lang === 'bn'
@@ -212,12 +214,12 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
                     </td>
                   </tr>
                 ) : (
-                  activeConfig.subjects.map((subj, idx) => (
-                    <tr key={`${subj.subjectId}_${idx}`}>
+                  activeSubjects.map((subj, idx) => (
+                    <tr key={`${subj?.subjectId || 'subj'}_${idx}`}>
                       <td className="py-1.5 px-2">
                         <input
                           type="text"
-                          value={subj.subjectId}
+                          value={subj?.subjectId ?? ''}
                           onChange={(e) =>
                             handleUpdateSubject(idx, { subjectId: e.target.value })
                           }
@@ -227,7 +229,7 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
                       <td className="py-1.5 px-2">
                         <input
                           type="text"
-                          value={subj.subjectName}
+                          value={subj?.subjectName ?? ''}
                           onChange={(e) =>
                             handleUpdateSubject(idx, { subjectName: e.target.value })
                           }
@@ -238,11 +240,12 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
                       <td className="py-1.5 px-2">
                         <input
                           type="text"
-                          value={subj.classScope}
+                          list="exam-class-scope-presets"
+                          value={subj?.classScope ?? 'All Classes'}
                           onChange={(e) =>
                             handleUpdateSubject(idx, { classScope: e.target.value })
                           }
-                          placeholder="ALL or Class 1, Class 2"
+                          placeholder="All Classes or Class 1"
                           className="w-full px-2 py-1.5 border border-stone-300 rounded"
                         />
                       </td>
@@ -300,6 +303,17 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
               </tbody>
             </table>
           </div>
+          <datalist id="exam-class-scope-presets">
+            <option value="All Classes" />
+            <option value="Pre-Primary - Class 2" />
+            <option value="Class 3 - Class 5" />
+            <option value="Pre-Primary" />
+            <option value="Class 1" />
+            <option value="Class 2" />
+            <option value="Class 3" />
+            <option value="Class 4" />
+            <option value="Class 5" />
+          </datalist>
         </div>
 
         <div className="px-6 py-4 border-t border-stone-200 flex items-center justify-end gap-3 bg-stone-50">

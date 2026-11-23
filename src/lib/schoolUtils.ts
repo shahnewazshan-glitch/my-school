@@ -58,8 +58,9 @@ export async function sha256Hex(plainText: string): Promise<string> {
  * Format photoBase64 for HTML <img> src, supporting both raw base64 (Android) and data URLs.
  */
 export function formatPhotoSrc(photoBase64?: string | null): string | null {
-  if (!photoBase64 || !photoBase64.trim()) return null;
+  if (typeof photoBase64 !== 'string') return null;
   const trimmed = photoBase64.trim();
+  if (!trimmed) return null;
   if (trimmed.startsWith('data:image/')) {
     return trimmed;
   }
@@ -96,9 +97,10 @@ export async function compressImageToBase64(
   let quality = 0.82;
 
   for (let attempt = 0; attempt < 8; attempt++) {
-    const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-    const w = Math.max(1, Math.round(img.width * scale));
-    const h = Math.max(1, Math.round(img.height * scale));
+    const maxSide = Math.max(1, img.width || 1, img.height || 1);
+    const scale = Math.min(1, maxDim / maxSide);
+    const w = Math.max(1, Math.round((img.width || 1) * scale));
+    const h = Math.max(1, Math.round((img.height || 1) * scale));
     canvas.width = w;
     canvas.height = h;
     ctx.clearRect(0, 0, w, h);
@@ -121,34 +123,119 @@ export async function compressImageToBase64(
   throw new Error('Image is still too large after compression. Please choose a smaller photo.');
 }
 
+const PRE_TO_2_CLASSES = new Set(['pre-primary', 'class 1', 'class 2']);
+const GRADES_3_TO_5_CLASSES = new Set(['class 3', 'class 4', 'class 5']);
+
 /**
- * Class scope matcher for examConfigs & subjects.
- * Supports 'ALL', '', exact match ('Class 1'), or comma-separated list ('Class 1, Class 2').
+ * Exact Android classScope matching + safe null/undefined guards.
+ * Supports:
+ * - "" / "ALL" / "All Classes" / "ALL_CLASSES" -> all classes
+ * - "Pre-Primary - Class 2" / "GRADES_PRE_TO_2" -> ["Pre-Primary", "Class 1", "Class 2"]
+ * - "Class 3 - Class 5" / "GRADES_3_TO_5" -> ["Class 3", "Class 4", "Class 5"]
+ * - Exact match or comma-separated list (case-insensitive)
  */
-export function matchesClassScope(scope: string | undefined, classLevel: string): boolean {
-  if (!scope || !scope.trim()) return true;
-  const normalizedTarget = classLevel.trim().toLowerCase();
-  const tokens = scope
+export function matchesClassScope(
+  scope: string | undefined | null,
+  classLevel: string | undefined | null
+): boolean {
+  const safeScope = typeof scope === 'string' ? scope.trim() : String(scope || '').trim();
+  if (!safeScope) return true;
+
+  const normalizedScope = safeScope.toLowerCase();
+  if (
+    normalizedScope === 'all' ||
+    normalizedScope === 'all classes' ||
+    normalizedScope === 'all_classes'
+  ) {
+    return true;
+  }
+
+  const safeClass =
+    typeof classLevel === 'string'
+      ? classLevel.trim().toLowerCase()
+      : String(classLevel || 'Class 1').trim().toLowerCase();
+
+  if (normalizedScope === 'pre-primary - class 2' || normalizedScope === 'grades_pre_to_2') {
+    return PRE_TO_2_CLASSES.has(safeClass);
+  }
+  if (normalizedScope === 'class 3 - class 5' || normalizedScope === 'grades_3_to_5') {
+    return GRADES_3_TO_5_CLASSES.has(safeClass);
+  }
+
+  const tokens = safeScope
     .split(',')
     .map((t) => t.trim().toLowerCase())
     .filter(Boolean);
-  if (tokens.length === 0 || tokens.includes('all') || tokens.includes('all classes')) {
+
+  if (
+    tokens.length === 0 ||
+    tokens.includes('all') ||
+    tokens.includes('all classes') ||
+    tokens.includes('all_classes')
+  ) {
     return true;
   }
-  return tokens.includes(normalizedTarget);
+
+  for (const token of tokens) {
+    if (token === 'pre-primary - class 2' || token === 'grades_pre_to_2') {
+      if (PRE_TO_2_CLASSES.has(safeClass)) return true;
+    } else if (token === 'class 3 - class 5' || token === 'grades_3_to_5') {
+      if (GRADES_3_TO_5_CLASSES.has(safeClass)) return true;
+    } else if (token === safeClass) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Safely sanitize a subject spec from Firestore (Android or Web).
+ */
+export function sanitizeSubjectSpec(spec: Partial<ExamSubjectConfig> | null | undefined, fallbackIdx = 0): ExamSubjectConfig {
+  const rawFull = Number(spec?.fullMarks);
+  const fullMarks = Number.isFinite(rawFull) && rawFull > 0 ? rawFull : 100;
+  const rawPass = Number(spec?.passMarks);
+  const passMarks = Number.isFinite(rawPass) && rawPass >= 0 ? rawPass : 0;
+  const rawOverride = Number(spec?.highestMarkOverride);
+  const highestMarkOverride = Number.isFinite(rawOverride) && rawOverride > 0 ? rawOverride : 0;
+
+  return {
+    subjectId: String(spec?.subjectId || `subject_${fallbackIdx + 1}`).trim(),
+    subjectName: String(spec?.subjectName || 'Subject').trim() || 'Subject',
+    classScope: String(spec?.classScope ?? 'All Classes').trim() || 'All Classes',
+    fullMarks,
+    passMarks,
+    highestMarkOverride,
+  };
 }
 
 /**
  * Build canonical examConfigs ensuring 3 terms always exist (exam_1, exam_2, exam_3).
+ * Safely handles null, non-array maps, missing examId (index fallback), and malformed subject specs.
  */
-export function normalizeExamConfigs(rawConfigs?: ExamConfig[]): ExamConfig[] {
-  const existing = rawConfigs || [];
-  return TERM_ORDER.map((examId) => {
-    const found = existing.find((c) => c.examId === examId);
+export function normalizeExamConfigs(rawConfigs?: unknown): ExamConfig[] {
+  let existing: Array<Partial<ExamConfig> | null | undefined> = [];
+  if (Array.isArray(rawConfigs)) {
+    existing = rawConfigs;
+  } else if (rawConfigs && typeof rawConfigs === 'object') {
+    existing = Object.values(rawConfigs as Record<string, Partial<ExamConfig>>);
+  }
+
+  return TERM_ORDER.map((examId, idx) => {
+    const byId = existing.find((c) => c && typeof c === 'object' && c.examId === examId);
+    const byIndex = existing[idx] && typeof existing[idx] === 'object' ? existing[idx] : undefined;
+    const found = byId || byIndex;
+
+    const rawSubjects: unknown[] = Array.isArray(found?.subjects) ? found.subjects : [];
+    const subjects: ExamSubjectConfig[] = rawSubjects
+      .filter((s): s is Partial<ExamSubjectConfig> => Boolean(s && typeof s === 'object'))
+      .map((s, sIdx) => sanitizeSubjectSpec(s, sIdx));
+
     return {
       examId,
-      title: found?.title || DEFAULT_EXAM_TITLES[examId],
-      subjects: Array.isArray(found?.subjects) ? found.subjects : [],
+      title: String(found?.title || DEFAULT_EXAM_TITLES[examId]),
+      subjects,
     };
   });
 }
@@ -157,16 +244,21 @@ export function normalizeExamConfigs(rawConfigs?: ExamConfig[]): ExamConfig[] {
  * Merge unique subjects across the 3 examConfigs for a given classLevel.
  */
 export function getClassSubjectsForMarksheet(
-  examConfigs: ExamConfig[],
-  classLevel: string
+  examConfigs: ExamConfig[] | undefined | null,
+  classLevel: string | undefined | null
 ): ExamSubjectConfig[] {
   const byId = new Map<string, ExamSubjectConfig>();
   const normalized = normalizeExamConfigs(examConfigs);
+  const safeClass = String(classLevel || 'Class 1');
+
   for (const exam of normalized) {
-    for (const subj of exam.subjects) {
-      if (matchesClassScope(subj.classScope, classLevel)) {
-        if (!byId.has(subj.subjectId)) {
-          byId.set(subj.subjectId, subj);
+    const subjs = Array.isArray(exam?.subjects) ? exam.subjects : [];
+    for (const subj of subjs) {
+      if (!subj || typeof subj !== 'object') continue;
+      if (matchesClassScope(subj.classScope, safeClass)) {
+        const key = String(subj.subjectId || subj.subjectName || '');
+        if (key && !byId.has(key)) {
+          byId.set(key, sanitizeSubjectSpec(subj));
         }
       }
     }
@@ -178,9 +270,11 @@ export function getClassSubjectsForMarksheet(
  * Internal Bangladesh pass mark calculation (NOT shown as a table column).
  */
 export function getInternalPassMarks(fullMarks: number): number {
-  if (fullMarks === 100) return 33;
-  if (fullMarks === 50) return 17;
-  return Math.ceil(fullMarks * 0.33);
+  const fm = Number(fullMarks);
+  if (!Number.isFinite(fm) || fm <= 0) return 0;
+  if (fm === 100) return 33;
+  if (fm === 50) return 17;
+  return Math.ceil(fm * 0.33);
 }
 
 export interface GradeResult {
@@ -193,14 +287,16 @@ export interface GradeResult {
  * Bangladesh grading calculation (internal).
  */
 export function calculateSubjectGrade(obtained: number, fullMarks: number): GradeResult {
-  if (fullMarks <= 0) {
+  const fm = Number(fullMarks);
+  const obt = Number(obtained);
+  if (!Number.isFinite(fm) || fm <= 0 || !Number.isFinite(obt)) {
     return { grade: '-', gpa: 0, passed: true };
   }
-  const passMarks = getInternalPassMarks(fullMarks);
-  if (obtained < passMarks) {
+  const passMarks = getInternalPassMarks(fm);
+  if (obt < passMarks) {
     return { grade: 'F', gpa: 0.0, passed: false };
   }
-  const pct = (obtained / fullMarks) * 100;
+  const pct = (obt / fm) * 100;
   if (pct >= 80) return { grade: 'A+', gpa: 5.0, passed: true };
   if (pct >= 70) return { grade: 'A', gpa: 4.0, passed: true };
   if (pct >= 60) return { grade: 'A-', gpa: 3.5, passed: true };
@@ -211,22 +307,28 @@ export function calculateSubjectGrade(obtained: number, fullMarks: number): Grad
 
 export function gpaToLetterGrade(gpa: number, passed: boolean): string {
   if (!passed) return 'F';
-  if (gpa >= 5.0) return 'A+';
-  if (gpa >= 4.0) return 'A';
-  if (gpa >= 3.5) return 'A-';
-  if (gpa >= 3.0) return 'B';
-  if (gpa >= 2.0) return 'C';
-  if (gpa >= 1.0) return 'D';
+  const val = Number(gpa);
+  if (!Number.isFinite(val)) return 'F';
+  if (val >= 5.0) return 'A+';
+  if (val >= 4.0) return 'A';
+  if (val >= 3.5) return 'A-';
+  if (val >= 3.0) return 'B';
+  if (val >= 2.0) return 'C';
+  if (val >= 1.0) return 'D';
   return 'F';
 }
 
 export function readNumericMark(
-  examResults: Record<string, number | string> | undefined,
+  examResults: Record<string, number | string> | undefined | null,
   key: string
 ): number | null {
-  if (!examResults) return null;
+  if (!examResults || typeof examResults !== 'object' || Array.isArray(examResults)) {
+    return null;
+  }
   const val = examResults[key];
-  if (val === undefined || val === null || val === '') return null;
+  if (val === undefined || val === null || val === '' || typeof val === 'object' || typeof val === 'boolean') {
+    return null;
+  }
   const num = typeof val === 'number' ? val : Number(val);
   return Number.isFinite(num) ? num : null;
 }
@@ -239,10 +341,13 @@ export interface TermSubjectScore {
 }
 
 export function getTermSubjectScore(
-  examResults: Record<string, number | string> | undefined,
+  examResults: Record<string, number | string> | undefined | null,
   examId: string,
   subjectId: string
 ): TermSubjectScore {
+  if (!subjectId) {
+    return { cont: null, sum: null, total: null, hasScore: false };
+  }
   const cont = readNumericMark(examResults, `${examId}__${subjectId}__cont`);
   const sum = readNumericMark(examResults, `${examId}__${subjectId}__sum`);
   const storedTotal = readNumericMark(examResults, `${examId}__${subjectId}`);
@@ -267,29 +372,37 @@ export interface StudentTermSummary {
 }
 
 export function computeStudentTermSummary(
-  student: StudentDoc,
-  subjects: ExamSubjectConfig[],
+  student: StudentDoc | null | undefined,
+  subjects: ExamSubjectConfig[] | undefined | null,
   examId: ExamTermId
 ): StudentTermSummary {
+  const safeSubjects = Array.isArray(subjects) ? subjects : [];
+  const safeExamResults =
+    student?.examResults && typeof student.examResults === 'object' && !Array.isArray(student.examResults)
+      ? student.examResults
+      : {};
+
   let totalFullMarks = 0;
   let totalObtained = 0;
   let gpaSum = 0;
   let scoredSubjects = 0;
   let allPassed = true;
 
-  for (const subj of subjects) {
-    const score = getTermSubjectScore(student.examResults, examId, subj.subjectId);
+  for (const subj of safeSubjects) {
+    if (!subj || typeof subj !== 'object' || !subj.subjectId) continue;
+    const fullMarks = Number(subj.fullMarks) > 0 ? Number(subj.fullMarks) : 100;
+    const score = getTermSubjectScore(safeExamResults, examId, subj.subjectId);
     if (score.hasScore && score.total !== null) {
-      totalFullMarks += subj.fullMarks;
+      totalFullMarks += fullMarks;
       totalObtained += score.total;
-      const g = calculateSubjectGrade(score.total, subj.fullMarks);
+      const g = calculateSubjectGrade(score.total, fullMarks);
       if (!g.passed) allPassed = false;
-      gpaSum += g.gpa;
+      gpaSum += Number.isFinite(g.gpa) ? g.gpa : 0;
       scoredSubjects += 1;
     }
   }
 
-  if (scoredSubjects === 0) {
+  if (scoredSubjects === 0 || totalFullMarks <= 0) {
     return {
       totalFullMarks: 0,
       totalObtained: 0,
@@ -300,7 +413,8 @@ export function computeStudentTermSummary(
     };
   }
 
-  const gpa = allPassed ? Number((gpaSum / scoredSubjects).toFixed(2)) : 0.0;
+  const rawGpa = scoredSubjects > 0 ? gpaSum / scoredSubjects : 0;
+  const gpa = allPassed && Number.isFinite(rawGpa) ? Number(rawGpa.toFixed(2)) : 0.0;
   const grade = gpaToLetterGrade(gpa, allPassed);
   return {
     totalFullMarks,
@@ -317,9 +431,11 @@ export function computeStudentTermSummary(
  * Returns Map<studentId, rankNumber (1-based)>.
  */
 export function computeFinalExamMeritMap(
-  students: StudentDoc[],
-  subjects: ExamSubjectConfig[]
+  students: StudentDoc[] | undefined | null,
+  subjects: ExamSubjectConfig[] | undefined | null
 ): Map<string, number> {
+  const safeStudents = Array.isArray(students) ? students : [];
+  const safeSubjects = Array.isArray(subjects) ? subjects : [];
   const passers: Array<{
     studentId: string;
     totalObtained: number;
@@ -327,15 +443,16 @@ export function computeFinalExamMeritMap(
     rollNum: number;
   }> = [];
 
-  for (const st of students) {
-    const summary = computeStudentTermSummary(st, subjects, 'exam_3');
+  for (const st of safeStudents) {
+    if (!st || !st.id) continue;
+    const summary = computeStudentTermSummary(st, safeSubjects, 'exam_3');
     if (summary.scoredSubjects > 0 && summary.passed) {
-      const rollNum = Number(st.rollNumber) || 999999;
+      const rollNum = Number(st.rollNumber);
       passers.push({
         studentId: st.id,
         totalObtained: summary.totalObtained,
         gpa: summary.gpa,
-        rollNum,
+        rollNum: Number.isFinite(rollNum) ? rollNum : 999999,
       });
     }
   }
@@ -366,17 +483,17 @@ export function getAttendanceDocId(
   classLevel: string,
   dateKey: string
 ): string {
-  const classSafe = classLevel.replace(/[^a-zA-Z0-9]/g, '_');
+  const classSafe = String(classLevel || 'Class_1').replace(/[^a-zA-Z0-9]/g, '_');
   return `${academicYear}_${classSafe}_${dateKey}`;
 }
 
 export function compareRollNumbers(a: StudentDoc, b: StudentDoc): number {
-  const na = Number(a.rollNumber);
-  const nb = Number(b.rollNumber);
-  if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+  const na = Number(a?.rollNumber);
+  const nb = Number(b?.rollNumber);
+  if (Number.isFinite(na) && Number.isFinite(nb)) {
     return na - nb;
   }
-  return String(a.rollNumber || '').localeCompare(String(b.rollNumber || ''), undefined, {
+  return String(a?.rollNumber || '').localeCompare(String(b?.rollNumber || ''), undefined, {
     numeric: true,
   });
 }

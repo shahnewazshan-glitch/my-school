@@ -41,6 +41,7 @@ import {
   TERM_ORDER,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type ExamTermId, type StudentDoc } from '../types/school';
+import { ErrorBoundary } from './ErrorBoundary';
 import { ExamSetupModal } from './ExamSetupModal';
 
 type ProfileTab = 'dossier' | 'marksheet' | 'yearly' | 'attendance';
@@ -125,6 +126,47 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   });
 
+  // Safe defensive defaults for every optional Firestore field on StudentRecord
+  const safeClassLevel = String(student?.classLevel || 'Class 1');
+  const safeExamResults = useMemo<Record<string, number | string>>(
+    () =>
+      student?.examResults &&
+      typeof student.examResults === 'object' &&
+      !Array.isArray(student.examResults)
+        ? student.examResults
+        : {},
+    [student?.examResults]
+  );
+  const safeCustomValues = useMemo<Record<string, string | number | boolean>>(
+    () =>
+      student?.customValues &&
+      typeof student.customValues === 'object' &&
+      !Array.isArray(student.customValues)
+        ? student.customValues
+        : {},
+    [student?.customValues]
+  );
+  const safeSubjectValues = useMemo<Record<string, string | number | boolean>>(
+    () =>
+      student?.subjectValues &&
+      typeof student.subjectValues === 'object' &&
+      !Array.isArray(student.subjectValues)
+        ? student.subjectValues
+        : {},
+    [student?.subjectValues]
+  );
+  const safeSectorNotesText = useMemo(() => {
+    const raw = student?.sectorNotes;
+    if (typeof raw === 'string') return raw;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const entries = Object.entries(raw as Record<string, unknown>)
+        .filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')
+        .map(([k, v]) => `${k}: ${String(v)}`);
+      return entries.join('\n');
+    }
+    return '';
+  }, [student?.sectorNotes]);
+
   // Reset edit states when student changes
   useEffect(() => {
     if (!student) return;
@@ -134,13 +176,23 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     setYearlyDraft({
       rollNumber: String(student.rollNumber ?? ''),
       nextYearRollNumber: String(student.nextYearRollNumber ?? ''),
-      classLevel: student.classLevel || 'Class 1',
-      section: student.section || '',
-      promotionStatus: student.promotionStatus || '',
+      classLevel: safeClassLevel,
+      section: String(student.section ?? ''),
+      promotionStatus: String(student.promotionStatus ?? ''),
       totalSchoolDays: String(student.totalSchoolDays ?? 0),
       daysPresent: String(student.daysPresent ?? 0),
     });
-  }, [studentId, student?.rollNumber, student?.nextYearRollNumber, student?.classLevel, student?.section, student?.promotionStatus, student?.totalSchoolDays, student?.daysPresent]);
+  }, [
+    studentId,
+    student,
+    safeClassLevel,
+    student?.rollNumber,
+    student?.nextYearRollNumber,
+    student?.section,
+    student?.promotionStatus,
+    student?.totalSchoolDays,
+    student?.daysPresent,
+  ]);
 
   const examConfigs = useMemo(
     () => normalizeExamConfigs(school?.examConfigs),
@@ -149,22 +201,26 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
 
   const classSubjects = useMemo(() => {
     if (!student) return [];
-    return getClassSubjectsForMarksheet(examConfigs, student.classLevel);
-  }, [examConfigs, student?.classLevel]);
+    return getClassSubjectsForMarksheet(examConfigs, safeClassLevel);
+  }, [examConfigs, student, safeClassLevel]);
 
   const studentSubjectsWithFields = useMemo(() => {
     if (!student) return [];
-    return subjects.filter((s) => matchesClassScope(s.gradeScope, student.classLevel));
-  }, [subjects, student?.classLevel]);
+    const safeSubjList = Array.isArray(subjects) ? subjects : [];
+    return safeSubjList.filter(
+      (s) => s && typeof s === 'object' && matchesClassScope(s.gradeScope, safeClassLevel)
+    );
+  }, [subjects, student, safeClassLevel]);
 
   // Build live examResults map merging stored examResults with any active draftMarks
   const liveExamResults = useMemo(() => {
-    const base: Record<string, number | string> = { ...(student?.examResults || {}) };
+    const base: Record<string, number | string> = { ...safeExamResults };
     if (editMode === 'none') return base;
 
     for (const termId of TERM_ORDER) {
       if (editMode === 'activeTerm' && termId !== activeExamId) continue;
       for (const subj of classSubjects) {
+        if (!subj?.subjectId) continue;
         const contKey = `${termId}__${subj.subjectId}__cont`;
         const sumKey = `${termId}__${subj.subjectId}__sum`;
         const totalKey = `${termId}__${subj.subjectId}`;
@@ -179,21 +235,25 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         else delete base[sumKey];
 
         if (contStr !== '' || sumStr !== '') {
-          base[totalKey] = (contStr !== '' ? Number(contStr) : 0) + (sumStr !== '' ? Number(sumStr) : 0);
-        } else {
+          base[totalKey] =
+            (contStr !== '' ? Number(contStr) : 0) + (sumStr !== '' ? Number(sumStr) : 0);
+        } else if (safeExamResults[contKey] !== undefined || safeExamResults[sumKey] !== undefined) {
+          // Only delete totalKey if user cleared previously existing cont/sum marks;
+          // preserve legacy storedTotal if cont & sum were never set.
           delete base[totalKey];
         }
       }
     }
     return base;
-  }, [student?.examResults, editMode, activeExamId, classSubjects, draftMarks]);
+  }, [safeExamResults, editMode, activeExamId, classSubjects, draftMarks]);
 
   const startEditingMarks = (mode: 'activeTerm' | 'allTerms') => {
     if (!student) return;
     const nextDraft: Record<string, string> = {};
     for (const termId of TERM_ORDER) {
       for (const subj of classSubjects) {
-        const score = getTermSubjectScore(student.examResults, termId, subj.subjectId);
+        if (!subj?.subjectId) continue;
+        const score = getTermSubjectScore(safeExamResults, termId, subj.subjectId);
         nextDraft[`${termId}__${subj.subjectId}__cont`] =
           score.cont !== null ? String(score.cont) : '';
         nextDraft[`${termId}__${subj.subjectId}__sum`] =
@@ -234,8 +294,10 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   }, [liveStudentForCalc, classSubjects, activeExamId]);
 
   const activeTermPercentage =
-    activeTermSummary.totalFullMarks > 0
-      ? Number(((activeTermSummary.totalObtained / activeTermSummary.totalFullMarks) * 100).toFixed(1))
+    activeTermSummary.totalFullMarks > 0 && Number.isFinite(activeTermSummary.totalObtained)
+      ? Number(
+          ((activeTermSummary.totalObtained / activeTermSummary.totalFullMarks) * 100).toFixed(1)
+        )
       : 0;
 
   const finalMeritRank = student ? meritMap.get(student.id) || null : null;
@@ -256,12 +318,13 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     let avgCount = 0;
 
     const rows = classSubjects.map((subj) => {
+      const safeFullMarks = Number(subj?.fullMarks) > 0 ? Number(subj.fullMarks) : 100;
       const s1 = getTermSubjectScore(liveExamResults, 'exam_1', subj.subjectId);
       const s2 = getTermSubjectScore(liveExamResults, 'exam_2', subj.subjectId);
       const s3 = getTermSubjectScore(liveExamResults, 'exam_3', subj.subjectId);
 
       const termTotals = [s1, s2, s3]
-        .filter((s) => s.hasScore && s.total !== null)
+        .filter((s) => s.hasScore && s.total !== null && Number.isFinite(s.total))
         .map((s) => s.total as number);
 
       const rowAvg =
@@ -273,10 +336,10 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         activeExamId === 'exam_1' ? s1 : activeExamId === 'exam_2' ? s2 : s3;
       const activeGrade =
         activeScore.hasScore && activeScore.total !== null
-          ? calculateSubjectGrade(activeScore.total, subj.fullMarks)
+          ? calculateSubjectGrade(activeScore.total, safeFullMarks)
           : null;
 
-      fullMarksSum += subj.fullMarks;
+      fullMarksSum += safeFullMarks;
       if (s1.cont !== null) t1ContSum += s1.cont;
       if (s1.sum !== null) t1SumSum += s1.sum;
       if (s1.total !== null) t1TotalSum += s1.total;
@@ -294,7 +357,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         avgCount += 1;
       }
 
-      return { subj, s1, s2, s3, rowAvg, activeGrade };
+      return { subj: { ...subj, fullMarks: safeFullMarks }, s1, s2, s3, rowAvg, activeGrade };
     });
 
     return {
@@ -404,13 +467,17 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       .filter(Boolean)
       .join('\n');
 
+    const gpaLabel = Number.isFinite(activeTermSummary.gpa)
+      ? activeTermSummary.gpa.toFixed(2)
+      : '0.00';
+
     const summaryText = [
       `*${school?.schoolName || 'My School'}*`,
-      `${student.studentNameBn || student.studentNameEn} (Roll: ${student.rollNumber}, ${getClassLabel(student.classLevel, lang)} ${student.academicYear})`,
+      `${student.studentNameBn || student.studentNameEn || 'Student'} (Roll: ${student.rollNumber ?? '-'}, ${getClassLabel(safeClassLevel, lang)} ${student.academicYear || ''})`,
       `Exam: ${termTitle}`,
       subjectLines,
       `Total: ${activeTermSummary.totalObtained}/${activeTermSummary.totalFullMarks} (${activeTermPercentage}%)`,
-      `GPA: ${activeTermSummary.gpa.toFixed(2)} | Grade: ${activeTermSummary.grade} | ${activeTermSummary.passed ? 'PASSED' : 'FAILED'}`,
+      `GPA: ${gpaLabel} | Grade: ${activeTermSummary.grade} | ${activeTermSummary.passed ? 'PASSED' : 'FAILED'}`,
       activeExamId === 'exam_3' && finalMeritRank ? `Merit Rank: #${finalMeritRank}` : '',
     ]
       .filter(Boolean)
@@ -509,10 +576,9 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Marksheet');
-    XLSX.writeFile(
-      wb,
-      `Marksheet_${student.classLevel.replace(/\s+/g, '_')}_Roll_${student.rollNumber}.xlsx`
-    );
+    const safeClassFile = safeClassLevel.replace(/\s+/g, '_');
+    const safeRollFile = String(student.rollNumber ?? 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
+    XLSX.writeFile(wb, `Marksheet_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
   };
 
   // Save Yearly & Promotion fields
@@ -587,20 +653,22 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   // Student Attendance Log computations
   const studentAttendanceData = useMemo(() => {
     if (!student) return { monthLogs: [], monthStats: { p: 0, a: 0, l: 0 }, yearlyMonths: [] };
-    const classLogs = attendanceLogs
+    const safeLogs = Array.isArray(attendanceLogs) ? attendanceLogs : [];
+    const classLogs = safeLogs
       .filter(
         (log) =>
+          log &&
           Number(log.academicYear) === Number(student.academicYear) &&
-          log.classLevel === student.classLevel
+          String(log.classLevel || '') === safeClassLevel
       )
-      .sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+      .sort((a, b) => String(a?.dateKey || '').localeCompare(String(b?.dateKey || '')));
 
     const monthLogs = classLogs
-      .filter((l) => l.monthKey === selectedMonth)
+      .filter((l) => (l.monthKey || String(l.dateKey || '').slice(0, 7)) === selectedMonth)
       .map((l) => ({
-        dateKey: l.dateKey,
+        dateKey: String(l.dateKey || ''),
         status: l.statuses?.[student.id] || null,
-        markedByName: l.markedByName,
+        markedByName: String(l.markedByName || ''),
       }));
 
     let p = 0;
@@ -869,7 +937,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             <div className="pt-4 border-t border-stone-100">
               <div className="text-xs text-slate-500 mb-1">{t(lang, 'sectorNotes')}</div>
               <p className="text-sm text-slate-800 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-lg p-3">
-                {student.sectorNotes || (lang === 'bn' ? 'কোনো মন্তব্য নেই।' : 'No teacher notes recorded.')}
+                {safeSectorNotesText ||
+                  (lang === 'bn' ? 'কোনো মন্তব্য নেই।' : 'No teacher notes recorded.')}
               </p>
             </div>
           </div>
@@ -886,19 +955,23 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                 </p>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                  {customFields.map((cf) => (
-                    <div key={cf.id} className="bg-stone-50 border border-stone-200 rounded-lg p-3">
-                      <div className="text-xs text-slate-500">
-                        {cf.label} · {cf.category}
+                  {customFields.map((cf) => {
+                    const rawVal = safeCustomValues[cf.id];
+                    const displayVal =
+                      rawVal !== undefined && rawVal !== null && rawVal !== ''
+                        ? typeof rawVal === 'object'
+                          ? JSON.stringify(rawVal)
+                          : String(rawVal)
+                        : '—';
+                    return (
+                      <div key={cf.id} className="bg-stone-50 border border-stone-200 rounded-lg p-3">
+                        <div className="text-xs text-slate-500">
+                          {cf.label} · {cf.category}
+                        </div>
+                        <div className="font-medium text-slate-900 mt-0.5">{displayVal}</div>
                       </div>
-                      <div className="font-medium text-slate-900 mt-0.5">
-                        {student.customValues?.[cf.id] !== undefined &&
-                        student.customValues?.[cf.id] !== ''
-                          ? String(student.customValues[cf.id])
-                          : '—'}
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -908,7 +981,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <h3 className="text-base font-semibold text-slate-900 pb-2 border-b border-stone-100">
                 {t(lang, 'subjectFieldsSection')}
               </h3>
-              {studentSubjectsWithFields.filter((s) => s.fields?.length > 0).length === 0 ? (
+              {studentSubjectsWithFields.filter((s) => Array.isArray(s.fields) && s.fields.length > 0)
+                .length === 0 ? (
                 <p className="text-xs text-slate-500">
                   {lang === 'bn'
                     ? 'এই শ্রেণির জন্য বিষয়ভিত্তিক অতিরিক্ত ফিল্ড নেই।'
@@ -917,19 +991,23 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               ) : (
                 <div className="space-y-3">
                   {studentSubjectsWithFields
-                    .filter((s) => s.fields?.length > 0)
+                    .filter((s) => Array.isArray(s.fields) && s.fields.length > 0)
                     .map((subj) => (
                       <div key={subj.id} className="border border-stone-200 rounded-lg p-3 space-y-2">
                         <div className="text-xs font-semibold text-slate-800">{subj.name}</div>
                         <div className="grid grid-cols-2 gap-2 text-xs">
                           {subj.fields.map((fld) => {
-                            const val = student.subjectValues?.[`${subj.id}__${fld.fieldId}`];
+                            const val = safeSubjectValues[`${subj.id}__${fld.fieldId}`];
+                            const displayVal =
+                              val !== undefined && val !== null && val !== ''
+                                ? typeof val === 'object'
+                                  ? JSON.stringify(val)
+                                  : String(val)
+                                : '—';
                             return (
                               <div key={fld.fieldId} className="bg-stone-50 px-2.5 py-2 rounded">
                                 <span className="text-slate-500">{fld.label}: </span>
-                                <span className="font-semibold text-slate-900">
-                                  {val !== undefined && val !== '' ? String(val) : '—'}
-                                </span>
+                                <span className="font-semibold text-slate-900">{displayVal}</span>
                               </div>
                             );
                           })}
@@ -943,8 +1021,13 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         </div>
       )}
 
-      {/* TAB 2: Interactive 3-Term Marksheet */}
+      {/* TAB 2: Interactive 3-Term Marksheet wrapped in ErrorBoundary */}
       {activeTab === 'marksheet' && (
+        <ErrorBoundary
+          onBackToList={onBack}
+          backLabel={t(lang, 'backToStudents')}
+          title={lang === 'bn' ? 'মার্কশিট প্রদর্শনে সমস্যা হয়েছে' : 'Unable to display Marksheet'}
+        >
         <div className="space-y-4">
           {/* Top Controls inside Marksheet Tab */}
           <div className="bg-white border border-stone-200 rounded-xl p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-4 no-print">
@@ -1095,7 +1178,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <div className="text-xs text-slate-500">GPA / Grade</div>
               <div className="mt-1 text-lg font-bold font-mono tabular-nums text-slate-900">
                 {activeTermSummary.scoredSubjects > 0
-                  ? `${activeTermSummary.gpa.toFixed(2)} (${activeTermSummary.grade})`
+                  ? `${Number.isFinite(activeTermSummary.gpa) ? activeTermSummary.gpa.toFixed(2) : '0.00'} (${activeTermSummary.grade})`
                   : '—'}
               </div>
             </div>
@@ -1131,9 +1214,9 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             <div className="hidden print:block text-center border-b-2 border-slate-800 pb-3 space-y-1">
               <h2 className="text-xl font-bold">{school?.schoolName || 'My School'}</h2>
               <p className="text-xs text-slate-600">
-                {student.studentNameBn || student.studentNameEn} ·{' '}
-                {getClassLabel(student.classLevel, lang)} · Roll {student.rollNumber} ·{' '}
-                {student.academicYear}
+                {student.studentNameBn || student.studentNameEn || 'Student'} ·{' '}
+                {getClassLabel(safeClassLevel, lang)} · Roll {student.rollNumber ?? '—'} ·{' '}
+                {student.academicYear || ''}
               </p>
             </div>
 
@@ -1144,9 +1227,14 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                   <button
                     type="button"
                     onClick={() => setShowExamSetupModal(true)}
-                    className="px-4 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer"
                   >
-                    {t(lang, 'subjectsExamsSetup')}
+                    <Settings2 className="w-3.5 h-3.5" />
+                    <span>
+                      {lang === 'bn'
+                        ? 'এই পরীক্ষার জন্য বিষয় সেটআপ করুন'
+                        : 'Setup Subjects for This Exam'}
+                    </span>
                   </button>
                 )}
               </div>
@@ -1215,7 +1303,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {marksheetGrid.rows.map(({ subj, s1, s2, s3, rowAvg, activeGrade }) => {
+                    {marksheetGrid.rows.map(({ subj, s1, s2, s3, rowAvg, activeGrade }, idx) => {
                       const renderTermCells = (
                         termId: ExamTermId,
                         score: { cont: number | null; sum: number | null; total: number | null }
@@ -1264,7 +1352,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                       };
 
                       return (
-                        <tr key={subj.subjectId} className="hover:bg-stone-50/50">
+                        <tr key={`${subj.subjectId}_${idx}`} className="hover:bg-stone-50/50">
                           <td className="border border-stone-300 py-2 px-3 font-medium text-slate-900">
                             <div className="flex items-center justify-between gap-2">
                               <span>{subj.subjectName}</span>
@@ -1351,6 +1439,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             </div>
           </div>
         </div>
+        </ErrorBoundary>
       )}
 
       {/* TAB 3: Yearly & Promotion */}

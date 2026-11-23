@@ -108,7 +108,7 @@ export interface StudentDoc {
   customValues?: Record<string, string | number | boolean>;
   subjectValues?: Record<string, string | number | boolean>;
   examResults?: Record<string, number | string>;
-  sectorNotes?: string;
+  sectorNotes?: string | Record<string, unknown>;
   lastUpdatedByName?: string;
   createdAt?: Timestamp | unknown;
   updatedAt?: Timestamp | unknown;

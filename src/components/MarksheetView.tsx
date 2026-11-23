@@ -20,6 +20,7 @@ import {
   normalizeExamConfigs,
 } from '../lib/schoolUtils';
 import type { StudentDoc } from '../types/school';
+import { ErrorBoundary } from './ErrorBoundary';
 
 export const MarksheetView: React.FC = () => {
   const {
@@ -243,7 +244,7 @@ export const MarksheetView: React.FC = () => {
         `Roll: ${activeStudent.rollNumber}`,
         `Class: ${selectedClass}`,
         `Year: ${selectedAcademicYear}`,
-        `Final GPA: ${activeData.term3Summary.gpa.toFixed(2)} (${activeData.term3Summary.grade})`,
+        `Final GPA: ${Number.isFinite(activeData.term3Summary.gpa) ? activeData.term3Summary.gpa.toFixed(2) : '0.00'} (${activeData.term3Summary.grade})`,
         activeData.meritRank ? `Merit Rank: #${activeData.meritRank}` : '',
       ],
       [],
@@ -577,6 +578,7 @@ export const MarksheetView: React.FC = () => {
   };
 
   return (
+    <ErrorBoundary title={lang === 'bn' ? 'মার্কশিট লোড করা যায়নি' : 'Unable to render Marksheet'}>
     <div className="space-y-5">
       {importBanner && (
         <div
@@ -1081,5 +1083,6 @@ export const MarksheetView: React.FC = () => {
         </div>
       )}
     </div>
+    </ErrorBoundary>
   );
 };

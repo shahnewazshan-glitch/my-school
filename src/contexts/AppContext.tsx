@@ -198,7 +198,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const data = snap.data() as SchoolDoc;
         const teachers = Array.isArray(data.teachers) ? data.teachers : [];
         const matchedMember = teachers.find(
-          (member) => normalizeBdPhone(member.phoneNumber || '') === phone
+          (member) => member && normalizeBdPhone(member.phoneNumber || '') === phone
         );
 
         if (!matchedMember) {
@@ -207,10 +207,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         const computedHash = await sha256Hex(passwordPlain);
+        const memberHash = typeof matchedMember.passwordHash === 'string' ? matchedMember.passwordHash : '';
         if (
-          !matchedMember.passwordHash ||
-          matchedMember.passwordHash.trim() === '' ||
-          computedHash !== matchedMember.passwordHash.toLowerCase()
+          !memberHash ||
+          memberHash.trim() === '' ||
+          computedHash !== memberHash.toLowerCase()
         ) {
           setAuthMessage({ type: 'error', text: t(lang, 'accessDeniedPassword') });
           return false;
@@ -346,7 +347,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           ...(d.data() as Omit<SubjectDoc, 'id'>),
           id: d.id,
         }));
-        list.sort((a, b) => a.name.localeCompare(b.name));
+        list.sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
         setSubjects(list);
       }
     );

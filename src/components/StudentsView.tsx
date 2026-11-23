@@ -22,6 +22,7 @@ import {
   matchesClassScope,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type StudentDoc } from '../types/school';
+import { ErrorBoundary } from './ErrorBoundary';
 import { StudentProfileView } from './StudentProfileView';
 
 interface StudentFormState {
@@ -160,11 +161,27 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       academicYear: Number(st.academicYear) || selectedAcademicYear,
       totalSchoolDays: String(st.totalSchoolDays ?? 0),
       daysPresent: String(st.daysPresent ?? 0),
-      promotionStatus: st.promotionStatus || '',
-      sectorNotes: st.sectorNotes || '',
-      customValues: { ...(st.customValues || {}) },
-      subjectValues: { ...(st.subjectValues || {}) },
-      examResults: { ...(st.examResults || {}) },
+      promotionStatus: String(st.promotionStatus || ''),
+      sectorNotes:
+        typeof st.sectorNotes === 'string'
+          ? st.sectorNotes
+          : st.sectorNotes && typeof st.sectorNotes === 'object'
+          ? Object.entries(st.sectorNotes)
+              .map(([k, v]) => `${k}: ${String(v ?? '')}`)
+              .join('\n')
+          : '',
+      customValues:
+        st.customValues && typeof st.customValues === 'object' && !Array.isArray(st.customValues)
+          ? { ...st.customValues }
+          : {},
+      subjectValues:
+        st.subjectValues && typeof st.subjectValues === 'object' && !Array.isArray(st.subjectValues)
+          ? { ...st.subjectValues }
+          : {},
+      examResults:
+        st.examResults && typeof st.examResults === 'object' && !Array.isArray(st.examResults)
+          ? { ...st.examResults }
+          : {},
     });
   };
 
@@ -301,12 +318,18 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
   return (
     <div className="space-y-5">
       {activeProfileId ? (
-        <StudentProfileView
-          studentId={activeProfileId}
-          onBack={() => setActiveProfileId(null)}
-          onSelectStudent={(id) => setActiveProfileId(id)}
-          onOpenFullEditModal={(st) => openEditModal(st)}
-        />
+        <ErrorBoundary
+          onBackToList={() => setActiveProfileId(null)}
+          backLabel={t(lang, 'backToStudents')}
+          title={lang === 'bn' ? 'শিক্ষার্থীর প্রোফাইল লোড করা যায়নি' : 'Unable to display Student Profile'}
+        >
+          <StudentProfileView
+            studentId={activeProfileId}
+            onBack={() => setActiveProfileId(null)}
+            onSelectStudent={(id) => setActiveProfileId(id)}
+            onOpenFullEditModal={(st) => openEditModal(st)}
+          />
+        </ErrorBoundary>
       ) : (
         <>
           {statusBanner && (
