@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   ArrowUpRight,
   BookOpenCheck,
@@ -20,12 +20,13 @@ import {
   X,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
-import { getClassLabel, t } from '../lib/i18n';
 import {
-  isSameHostnameUrl,
-  resolveDirectApkDownloadInfo,
-  verifySelfHostedApkUrl,
-} from '../lib/schoolUtils';
+  type ApkDownloadProgress,
+  downloadPrivateApkRelease,
+  NoApkChunksError,
+} from '../lib/apkChunks';
+import { getFirebaseInstances } from '../lib/firebase';
+import { getClassLabel, t } from '../lib/i18n';
 import { CLASS_LEVELS } from '../types/school';
 
 export type NavTab =
@@ -67,37 +68,55 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   } = useApp();
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [downloadingApk, setDownloadingApk] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<ApkDownloadProgress | null>(null);
+  const [apkHeaderNotice, setApkHeaderNotice] = useState<string | null>(null);
 
   const pendingCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
-  const apkDownloadInfo = resolveDirectApkDownloadInfo(school?.appUpdateUrl || '');
-  const appUpdateUrl = apkDownloadInfo?.directDownloadUrl || '';
-  const isSelfUrl = Boolean(appUpdateUrl && isSameHostnameUrl(appUpdateUrl));
-  const [verifiedSelfApkUrl, setVerifiedSelfApkUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!appUpdateUrl || !isSelfUrl) {
-      setVerifiedSelfApkUrl(null);
-      return;
-    }
-    verifySelfHostedApkUrl(appUpdateUrl).then((ok) => {
-      if (!cancelled) {
-        setVerifiedSelfApkUrl(ok ? appUpdateUrl : null);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [appUpdateUrl, isSelfUrl]);
-
   const hasAppUpdate = Boolean(
-    apkDownloadInfo && (!isSelfUrl || verifiedSelfApkUrl === appUpdateUrl)
+    session?.schoolId &&
+      (school?.latestAppVersionCode !== undefined || school?.appUpdateUrl)
   );
   const appUpdateVersionLabel = school?.latestAppVersionName
     ? `v${school.latestAppVersionName}`
     : school?.latestAppVersionCode !== undefined
     ? `#${school.latestAppVersionCode}`
     : '';
+
+  const handleHeaderApkDownload = async () => {
+    const instances = getFirebaseInstances();
+    if (!instances || !session?.schoolId || downloadingApk) return;
+
+    setDownloadingApk(true);
+    setApkHeaderNotice(null);
+    setDownloadProgress({ phase: 'fetching', currentChunk: 0, totalChunks: 1, percent: 5 });
+
+    try {
+      await downloadPrivateApkRelease({
+        db: instances.db,
+        schoolId: session.schoolId,
+        latestAppVersionCode: school?.latestAppVersionCode,
+        latestAppVersionName: school?.latestAppVersionName,
+        onProgress: setDownloadProgress,
+      });
+    } catch (err: unknown) {
+      if (err instanceof NoApkChunksError) {
+        setApkHeaderNotice(t(lang, 'noChunksUploadedNotice'));
+      } else {
+        const fbErr = err as { code?: string; message?: string };
+        setApkHeaderNotice(
+          fbErr?.code
+            ? `${fbErr.code}: ${fbErr.message || String(err)}`
+            : err instanceof Error
+            ? err.message
+            : String(err)
+        );
+      }
+    } finally {
+      setDownloadingApk(false);
+      setDownloadProgress(null);
+    }
+  };
 
   const academicYears = React.useMemo(() => {
     const base = school?.defaultAcademicYear || new Date().getFullYear();
@@ -322,24 +341,30 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
-            {/* Compact Header Android App Update Link (when configured) */}
+            {/* Compact Header Private Android APK Download Button (when configured) */}
             {hasAppUpdate && (
-              <a
-                href={appUpdateUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                type="button"
+                disabled={downloadingApk}
+                onClick={handleHeaderApkDownload}
                 title={t(lang, 'downloadAndroidApp')}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 disabled:opacity-60 border border-emerald-200 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
               >
                 <Smartphone className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
                 <span className="hidden md:inline">{t(lang, 'androidAppUpdateTitle')}</span>
-                {appUpdateVersionLabel && (
+                {downloadingApk && downloadProgress ? (
                   <span className="font-mono tabular-nums text-emerald-800">
-                    {appUpdateVersionLabel}
+                    {downloadProgress.percent}%
                   </span>
+                ) : (
+                  appUpdateVersionLabel && (
+                    <span className="font-mono tabular-nums text-emerald-800">
+                      {appUpdateVersionLabel}
+                    </span>
+                  )
                 )}
                 <Download className="w-3 h-3 text-emerald-700 shrink-0" />
-              </a>
+              </button>
             )}
 
             {/* Live Online / Offline & Pending Sync Indicator */}
@@ -402,6 +427,22 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
         </header>
 
         <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto">
+          {apkHeaderNotice && (
+            <div
+              role="alert"
+              className="mb-4 flex items-center justify-between gap-3 px-4 py-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-900 no-print"
+            >
+              <span>{apkHeaderNotice}</span>
+              <button
+                type="button"
+                onClick={() => setApkHeaderNotice(null)}
+                className="p-1 hover:opacity-70 cursor-pointer shrink-0"
+                aria-label="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
           {children}
         </main>
       </div>

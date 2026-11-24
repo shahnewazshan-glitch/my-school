@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   collection,
   deleteDoc,
@@ -10,16 +10,23 @@ import {
 } from 'firebase/firestore';
 import {
   Check,
-  ExternalLink,
+  FileArchive,
   KeyRound,
   Plus,
   ShieldAlert,
   Smartphone,
   Trash2,
+  Upload,
   UserX,
   X,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
+import {
+  APK_CHUNK_SIZE_BYTES,
+  MAX_APK_CHUNKS,
+  type ApkUploadProgress,
+  uploadPrivateApkRelease,
+} from '../lib/apkChunks';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildAttendancePayload,
@@ -34,13 +41,9 @@ import { t } from '../lib/i18n';
 import {
   formatTimestampDateTime,
   getAttendanceDocId,
-  isSameHostnameUrl,
-  normalizeAppUpdateUrl,
   normalizeBdPhone,
   normalizeExamConfigs,
-  resolveDirectApkDownloadInfo,
   sha256Hex,
-  verifySelfHostedApkUrl,
 } from '../lib/schoolUtils';
 import type {
   CustomFieldType,
@@ -106,40 +109,19 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [newCfType, setNewCfType] = useState<CustomFieldType>('TEXT');
   const [newCfResets, setNewCfResets] = useState(false);
 
-  // App Update Publisher State (baseline Android app is v1.9 / versionCode 10)
+  // Private APK Uploader State
   const [versionCode, setVersionCode] = useState(
     school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
       ? String(school.latestAppVersionCode)
-      : '11'
+      : '13'
   );
-  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '2.0');
-  const [updateUrl, setUpdateUrl] = useState(school?.appUpdateUrl || '');
+  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '2.2');
+  const [apkFile, setApkFile] = useState<File | null>(null);
+  const apkInputRef = useRef<HTMLInputElement | null>(null);
   const [updateNotes, setUpdateNotes] = useState(school?.appUpdateNotes || '');
   const [updateAdminPassword, setUpdateAdminPassword] = useState('');
   const [savingUpdate, setSavingUpdate] = useState(false);
-
-  const resolvedUpdatePreview = useMemo(
-    () => resolveDirectApkDownloadInfo(updateUrl),
-    [updateUrl]
-  );
-  const isSelfUrlPreview = Boolean(
-    resolvedUpdatePreview && isSameHostnameUrl(resolvedUpdatePreview.directDownloadUrl)
-  );
-  const [selfUrlVerifiedApk, setSelfUrlVerifiedApk] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!resolvedUpdatePreview || !isSelfUrlPreview) {
-      setSelfUrlVerifiedApk(false);
-      return;
-    }
-    verifySelfHostedApkUrl(resolvedUpdatePreview.directDownloadUrl).then((ok) => {
-      if (!cancelled) setSelfUrlVerifiedApk(ok);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [resolvedUpdatePreview, isSelfUrlPreview]);
+  const [uploadProgress, setUploadProgress] = useState<ApkUploadProgress | null>(null);
 
   useEffect(() => {
     setAdminTab(initialTab);
@@ -153,15 +135,13 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     setVersionCode(
       school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
         ? String(school.latestAppVersionCode)
-        : '11'
+        : '13'
     );
-    setVersionName(school?.latestAppVersionName || '2.0');
-    setUpdateUrl(school?.appUpdateUrl || '');
+    setVersionName(school?.latestAppVersionName || '2.2');
     setUpdateNotes(school?.appUpdateNotes || '');
   }, [
     school?.latestAppVersionCode,
     school?.latestAppVersionName,
-    school?.appUpdateUrl,
     school?.appUpdateNotes,
   ]);
 
@@ -654,7 +634,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id));
   };
 
-  // 4. Android App Update Publisher (Admin-only + Admin Password Verified, strict 5-field payload)
+  // 4. Private Android APK Uploader (Admin-only + Admin Password Verified)
+  const selectedApkChunkCount = apkFile
+    ? Math.ceil(apkFile.size / APK_CHUNK_SIZE_BYTES)
+    : 0;
+
   const handleSaveAppUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     const instances = getFirebaseInstances();
@@ -680,9 +664,16 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       return;
     }
 
-    const normalizedUrl = normalizeAppUpdateUrl(updateUrl);
-    if (!normalizedUrl || normalizedUrl.length > 500) {
-      setBanner({ type: 'error', text: t(lang, 'invalidUpdateUrl') });
+    if (!apkFile || apkFile.size <= 0) {
+      setBanner({ type: 'error', text: t(lang, 'apkFileRequired') });
+      return;
+    }
+
+    if (selectedApkChunkCount > MAX_APK_CHUNKS) {
+      setBanner({
+        type: 'error',
+        text: `APK size exceeds ${Math.floor((MAX_APK_CHUNKS * APK_CHUNK_SIZE_BYTES) / (1024 * 1024))} MB maximum (${selectedApkChunkCount} > ${MAX_APK_CHUNKS} chunks).`,
+      });
       return;
     }
 
@@ -695,17 +686,9 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
 
     setSavingUpdate(true);
     setBanner(null);
-    try {
-      // Block self-website URLs unless HEAD check verifies a real binary APK (not text/html)
-      if (isSameHostnameUrl(normalizedUrl)) {
-        const isRealApkBinary = await verifySelfHostedApkUrl(normalizedUrl);
-        if (!isRealApkBinary) {
-          setBanner({ type: 'error', text: t(lang, 'selfUrlBlockedError') });
-          setSavingUpdate(false);
-          return;
-        }
-      }
+    setUploadProgress(null);
 
+    try {
       const currentAdminRecord = teachers.find(
         (m) =>
           normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
@@ -714,27 +697,30 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
 
       if (!currentAdminRecord || !currentAdminRecord.passwordHash) {
         setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
-        setSavingUpdate(false);
         return;
       }
 
       const enteredHash = await sha256Hex(updateAdminPassword);
       if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
         setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
-        setSavingUpdate(false);
         return;
       }
 
-      // Write ONLY the exact 5 allowed fields on schools/{schoolId}
-      await updateDoc(doc(instances.db, 'schools', session.schoolId), {
-        latestAppVersionCode: intVersionCode,
-        latestAppVersionName: trimmedVersionName,
-        appUpdateUrl: normalizedUrl,
-        appUpdateNotes: trimmedNotes,
-        updatedAt: serverTimestamp(),
+      await uploadPrivateApkRelease({
+        db: instances.db,
+        schoolId: session.schoolId,
+        file: apkFile,
+        versionCode: intVersionCode,
+        versionName: trimmedVersionName,
+        notes: trimmedNotes,
+        originUrl: window.location.origin,
+        onProgress: setUploadProgress,
       });
 
-      setUpdateUrl(normalizedUrl);
+      setApkFile(null);
+      if (apkInputRef.current) {
+        apkInputRef.current.value = '';
+      }
       setUpdateAdminPassword('');
       setBanner({ type: 'success', text: t(lang, 'appUpdatePublishedSuccess') });
     } catch (err: unknown) {
@@ -750,6 +736,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       });
     } finally {
       setSavingUpdate(false);
+      setUploadProgress(null);
     }
   };
 
@@ -1264,24 +1251,34 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         </div>
       )}
 
-      {/* TAB 4: Android App Update Publisher (Admin-Only, Password-Protected) */}
+      {/* TAB 4: Private In-Website Android APK Uploader (Admin-Only, Password-Protected) */}
       {adminTab === 'update' && (
         <form
           onSubmit={handleSaveAppUpdate}
           className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-4"
         >
-          <div className="flex items-start gap-3 pb-3 border-b border-stone-200">
-            <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
-              <Smartphone className="w-5 h-5" />
+          <div className="flex items-start justify-between gap-3 pb-3 border-b border-stone-200">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
+                <Smartphone className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  {t(lang, 'publishAppUpdate')}
+                </h3>
+                <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
+                  {t(lang, 'versionCodeHint')}
+                </p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-base font-semibold text-slate-900">
-                {t(lang, 'publishAppUpdate')}
-              </h3>
-              <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
-                {t(lang, 'versionCodeHint')}
-              </p>
-            </div>
+            {(school?.latestAppVersionName || school?.latestAppVersionCode !== undefined) && (
+              <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded shrink-0">
+                {school?.latestAppVersionName ? `v${school.latestAppVersionName}` : 'v—'}{' '}
+                {school?.latestAppVersionCode !== undefined
+                  ? `(#${school.latestAppVersionCode})`
+                  : ''}
+              </span>
+            )}
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1295,10 +1292,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 max={999999}
                 step={1}
                 required
+                disabled={savingUpdate}
                 value={versionCode}
                 onChange={(e) => setVersionCode(e.target.value)}
-                placeholder="11"
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                placeholder="13"
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
               />
             </div>
             <div>
@@ -1309,69 +1307,63 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 type="text"
                 required
                 maxLength={20}
+                disabled={savingUpdate}
                 value={versionName}
                 onChange={(e) => setVersionName(e.target.value)}
-                placeholder="2.0"
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                placeholder="2.2"
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
               />
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              {t(lang, 'updateUrl')}
+            <label
+              htmlFor="apk-file-picker"
+              className="block text-xs font-medium text-slate-700 mb-1"
+            >
+              {t(lang, 'apkFileLabel')}
             </label>
-            <input
-              type="text"
-              required
-              maxLength={500}
-              value={updateUrl}
-              onChange={(e) => setUpdateUrl(e.target.value)}
-              placeholder="https://drive.google.com/file/d/.../view or GitHub Releases .apk URL"
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
-            />
-            {isSelfUrlPreview && !selfUrlVerifiedApk && (
-              <p className="mt-2 p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800">
-                {t(lang, 'selfUrlBlockedError')}
-              </p>
-            )}
-            <p className="text-[11px] text-slate-500 mt-1">
-              {lang === 'bn'
-                ? 'Google Drive (Anyone with the link), Dropbox অথবা GitHub Releases লিংক দিন। https:// না থাকলে স্বয়ংক্রিয়ভাবে যুক্ত হবে।'
-                : 'Paste a Google Drive, Dropbox, GitHub Releases, or direct APK link (max 500 chars; https:// added automatically if omitted).'}
-            </p>
+            <div className="border border-dashed border-stone-300 rounded-lg p-4 bg-stone-50/70 space-y-2.5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <input
+                  id="apk-file-picker"
+                  ref={apkInputRef}
+                  type="file"
+                  accept=".apk,application/vnd.android.package-archive"
+                  disabled={savingUpdate}
+                  onChange={(e) => {
+                    const chosen = e.target.files?.[0] || null;
+                    setApkFile(chosen);
+                  }}
+                  className="block w-full text-xs text-slate-700 file:mr-3 file:py-2 file:px-3.5 file:rounded-lg file:border file:border-emerald-200 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-900 hover:file:bg-emerald-100 file:cursor-pointer cursor-pointer"
+                />
+              </div>
 
-            {/* Google Drive / Dropbox Direct Download Auto-Detection Helper */}
-            {resolvedUpdatePreview &&
-              (resolvedUpdatePreview.provider === 'gdrive' ||
-                resolvedUpdatePreview.provider === 'dropbox') && (
-                <div className="mt-2.5 p-3 rounded-lg bg-emerald-50/80 border border-emerald-200 text-xs space-y-1.5">
-                  <div className="font-semibold text-emerald-900">
-                    {resolvedUpdatePreview.provider === 'gdrive'
-                      ? lang === 'bn'
-                        ? 'Google Drive লিংক শনাক্ত হয়েছে — সরাসরি APK ডাউনলোড লিংক:'
-                        : 'Google Drive link detected — Direct APK download URL:'
-                      : lang === 'bn'
-                      ? 'Dropbox লিংক শনাক্ত হয়েছে — সরাসরি ডাউনলোড লিংক:'
-                      : 'Dropbox link detected — Direct APK download URL:'}
+              {apkFile && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-white border border-stone-200 rounded-lg text-xs">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <FileArchive className="w-4 h-4 text-emerald-700 shrink-0" />
+                    <span className="font-mono font-medium text-slate-900 truncate">
+                      {apkFile.name}
+                    </span>
                   </div>
-                  <div className="font-mono text-[11px] text-slate-800 bg-white border border-emerald-200 rounded px-2.5 py-1.5 break-all">
-                    {resolvedUpdatePreview.directDownloadUrl}
+                  <div className="font-mono tabular-nums text-slate-600 shrink-0">
+                    {(apkFile.size / (1024 * 1024)).toFixed(2)} MB · {selectedApkChunkCount}/
+                    {MAX_APK_CHUNKS} chunks
                   </div>
-                  {resolvedUpdatePreview.normalizedUrl !==
-                    resolvedUpdatePreview.directDownloadUrl && (
-                    <button
-                      type="button"
-                      onClick={() => setUpdateUrl(resolvedUpdatePreview.directDownloadUrl)}
-                      className="text-xs font-semibold text-emerald-800 hover:underline cursor-pointer"
-                    >
-                      {lang === 'bn'
-                        ? 'সরাসরি ডাউনলোড URL উপরে বসান'
-                        : 'Use this direct download URL above'}
-                    </button>
-                  )}
                 </div>
               )}
+
+              {apkFile && selectedApkChunkCount > MAX_APK_CHUNKS && (
+                <p className="text-xs text-rose-700 font-medium">
+                  APK exceeds {Math.floor((MAX_APK_CHUNKS * APK_CHUNK_SIZE_BYTES) / (1024 * 1024))} MB limit ({selectedApkChunkCount} chunks).
+                </p>
+              )}
+
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                {t(lang, 'apkFileHint')}
+              </p>
+            </div>
           </div>
 
           <div>
@@ -1386,6 +1378,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             <textarea
               rows={3}
               maxLength={300}
+              disabled={savingUpdate}
               value={updateNotes}
               onChange={(e) => setUpdateNotes(e.target.value)}
               placeholder={
@@ -1393,7 +1386,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                   ? 'যেমন: মার্কশিট উন্নতি ও দ্রুত সিঙ্ক যোগ করা হয়েছে'
                   : 'e.g. Marksheet improvements and faster cloud sync.'
               }
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
             />
           </div>
 
@@ -1410,10 +1403,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 id="update-admin-pw"
                 type="password"
                 required
+                disabled={savingUpdate}
                 value={updateAdminPassword}
                 onChange={(e) => setUpdateAdminPassword(e.target.value)}
                 placeholder="••••••••"
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
               />
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
@@ -1421,36 +1415,42 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </p>
           </div>
 
+          {savingUpdate && uploadProgress && (
+            <div className="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 space-y-2">
+              <div className="flex items-center justify-between text-xs font-medium text-emerald-900">
+                <span>
+                  {uploadProgress.phase === 'clearing'
+                    ? t(lang, 'clearingOldApkChunks')
+                    : uploadProgress.phase === 'finalizing'
+                    ? t(lang, 'finalizingApkPublish')
+                    : uploadProgress.phase === 'reading'
+                    ? t(lang, 'loading')
+                    : `${t(lang, 'uploadingApkProgress')} ${uploadProgress.currentChunk} of ${uploadProgress.totalChunks}...`}
+                </span>
+                <span className="font-mono tabular-nums">{uploadProgress.percent}%</span>
+              </div>
+              <div className="w-full h-2 bg-emerald-200/70 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-emerald-700 transition-all duration-200"
+                  style={{ width: `${uploadProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center gap-3 pt-1">
             <button
               type="submit"
-              disabled={savingUpdate}
-              className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+              disabled={savingUpdate || !apkFile || selectedApkChunkCount > MAX_APK_CHUNKS}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
             >
-              {savingUpdate ? t(lang, 'loading') : t(lang, 'publishAppUpdate')}
-            </button>
-
-            {resolvedUpdatePreview && (!isSelfUrlPreview || selfUrlVerifiedApk) ? (
-              <a
-                href={resolvedUpdatePreview.directDownloadUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-800 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg transition-colors whitespace-nowrap"
-              >
-                <ExternalLink className="w-3.5 h-3.5 text-emerald-700" />
-                <span>{t(lang, 'testDownloadLink')}</span>
-              </a>
-            ) : (
-              <span className="text-xs text-slate-400">
-                {isSelfUrlPreview && !selfUrlVerifiedApk
-                  ? lang === 'bn'
-                    ? 'নিজস্ব ওয়েবসাইটের লিংক পরীক্ষা করা যাবে না'
-                    : 'Self-website URL cannot be tested as an APK download'
-                  : lang === 'bn'
-                  ? 'পরীক্ষা করার জন্য উপরে একটি বৈধ লিংক দিন'
-                  : 'Enter a valid external URL above to enable link testing'}
+              <Upload className="w-3.5 h-3.5" />
+              <span>
+                {savingUpdate && uploadProgress
+                  ? `${uploadProgress.percent}%`
+                  : t(lang, 'publishAppUpdate')}
               </span>
-            )}
+            </button>
           </div>
         </form>
       )}

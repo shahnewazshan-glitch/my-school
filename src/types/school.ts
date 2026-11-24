@@ -203,3 +203,16 @@ export interface ActiveSession {
   role: TeacherRole;
   passwordHash: string;
 }
+
+export interface AppReleaseChunkDoc {
+  schoolId: string;
+  versionCode: number;
+  versionName: string;
+  fileName: string;
+  chunkIndex: number;
+  totalChunks: number;
+  totalSizeBytes: number;
+  dataBase64: string;
+  createdAt?: Timestamp | unknown;
+}
+

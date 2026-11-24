@@ -21,11 +21,22 @@ import { getFirebaseEnvStatus } from './lib/firebase';
 
 const MainAppShell: React.FC = () => {
   const { session, dataLoading } = useApp();
+  const [isUpdateDeepLink] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('update') === '1';
+  });
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [adminInitialTab, setAdminInitialTab] = useState<
     'teachers' | 'approvals' | 'setup' | 'update'
   >('teachers');
+
+  // Ensure ?update=1 lands on Dashboard right after sign-in
+  useEffect(() => {
+    if (session && isUpdateDeepLink) {
+      setActiveTab('dashboard');
+    }
+  }, [session, isUpdateDeepLink]);
 
   // Ensure non-Admin users never remain on Admin tab if role downgrades live
   useEffect(() => {
@@ -70,6 +81,7 @@ const MainAppShell: React.FC = () => {
           onNavigate={handleSelectTab}
           onOpenStudentProfile={handleOpenStudentProfile}
           onOpenAppUpdatePublisher={handleOpenAppUpdatePublisher}
+          highlightAppUpdate={isUpdateDeepLink}
         />
       )}
       {activeTab === 'students' && (
