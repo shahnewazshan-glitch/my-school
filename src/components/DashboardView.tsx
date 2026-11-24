@@ -3,8 +3,11 @@ import {
   ArrowRight,
   CalendarCheck2,
   ClipboardList,
+  Download,
   FileSpreadsheet,
   Search,
+  Settings2,
+  Smartphone,
   Users,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
@@ -14,6 +17,7 @@ import {
   getAttendanceDocId,
   getClassSubjectsForMarksheet,
   getTodayDateKey,
+  isValidHttpUrl,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 import type { NavTab } from './WorkspaceLayout';
@@ -21,11 +25,13 @@ import type { NavTab } from './WorkspaceLayout';
 interface DashboardViewProps {
   onNavigate: (tab: NavTab) => void;
   onOpenStudentProfile: (studentId: string) => void;
+  onOpenAppUpdatePublisher?: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
   onOpenStudentProfile,
+  onOpenAppUpdatePublisher,
 }) => {
   const {
     lang,
@@ -153,6 +159,86 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </section>
+
+      {/* Android App Update Download Card (Visible to All Teachers & Admin) */}
+      {(isValidHttpUrl(school?.appUpdateUrl || '') || session?.role === 'ADMIN') && (
+        <section className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-5">
+          {isValidHttpUrl(school?.appUpdateUrl || '') ? (
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5 min-w-0">
+                <div className="w-10 h-10 rounded-lg bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                  <Smartphone className="w-5 h-5" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-base font-semibold text-slate-900">
+                      {t(lang, 'androidAppUpdateTitle')}
+                    </h3>
+                    <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-white border border-emerald-200 px-2 py-0.5 rounded">
+                      {school?.latestAppVersionName
+                        ? `v${school.latestAppVersionName}`
+                        : 'v—'}{' '}
+                      {school?.latestAppVersionCode !== undefined
+                        ? `(#${school.latestAppVersionCode})`
+                        : ''}
+                    </span>
+                  </div>
+                  {school?.appUpdateNotes && (
+                    <p className="text-sm text-slate-700">{school.appUpdateNotes}</p>
+                  )}
+                  <p className="text-xs text-slate-600">{t(lang, 'appUpdateMobileHint')}</p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                <a
+                  href={String(school?.appUpdateUrl || '').trim()}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Download className="w-4 h-4 shrink-0" />
+                  <span>{t(lang, 'downloadAndroidApp')}</span>
+                </a>
+                {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
+                  <button
+                    type="button"
+                    onClick={onOpenAppUpdatePublisher}
+                    className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-slate-700 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg cursor-pointer whitespace-nowrap"
+                  >
+                    <Settings2 className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>{t(lang, 'configureAppUpdate')}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-white border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                  <Smartphone className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900">
+                    {t(lang, 'androidAppUpdateTitle')}
+                  </h3>
+                  <p className="text-xs text-slate-600">{t(lang, 'appUpdateNotConfigured')}</p>
+                </div>
+              </div>
+              {onOpenAppUpdatePublisher && (
+                <button
+                  type="button"
+                  onClick={onOpenAppUpdatePublisher}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer whitespace-nowrap self-start sm:self-auto"
+                >
+                  <Settings2 className="w-3.5 h-3.5" />
+                  <span>{t(lang, 'publishAppUpdate')}</span>
+                </button>
+              )}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* 4 Summary Stat Cards */}
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">

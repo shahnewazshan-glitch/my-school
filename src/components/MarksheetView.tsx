@@ -7,7 +7,7 @@ import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
   FIRESTORE_LIMITS,
-  sanitizeRecordMap,
+  sanitizeStringRecordMap,
   validateAndBuildStudentPayload,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
@@ -481,10 +481,13 @@ export const MarksheetView: React.FC = () => {
           }
         }
 
-        const sanitizedResults = sanitizeRecordMap(nextResults);
+        const sanitizedResults = sanitizeStringRecordMap(nextResults);
         if (Object.keys(sanitizedResults).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
           throw new Error('Imported marks exceed Firestore examResults key limit.');
         }
+
+        const sanitizedCustom = sanitizeStringRecordMap(nextCustom);
+        const sanitizedSubjectVals = sanitizeStringRecordMap(nextSubjectVals);
 
         parsedStudents.push({
           existingId: existingMatch?.id,
@@ -505,8 +508,8 @@ export const MarksheetView: React.FC = () => {
             daysPresent: Number(row.daysPresent || 0),
             promotionStatus: String(row.promotionStatus || '').trim(),
             sectorNotes: String(row.sectorNotes || '').trim(),
-            customValues: nextCustom,
-            subjectValues: nextSubjectVals,
+            customValues: sanitizedCustom,
+            subjectValues: sanitizedSubjectVals,
             examResults: sanitizedResults,
           },
         });

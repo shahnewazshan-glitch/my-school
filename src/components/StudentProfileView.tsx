@@ -24,7 +24,7 @@ import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
   FIRESTORE_LIMITS,
-  sanitizeRecordMap,
+  sanitizeStringRecordMap,
   validateAndBuildStudentPayload,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
@@ -387,7 +387,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     setBanner(null);
 
     try {
-      const sanitizedExamResults = sanitizeRecordMap(liveExamResults);
+      const sanitizedExamResults = sanitizeStringRecordMap(liveExamResults);
       if (Object.keys(sanitizedExamResults).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
         throw new Error(
           `Exam results exceed maximum ${FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS} keys.`

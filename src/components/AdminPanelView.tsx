@@ -26,7 +26,7 @@ import {
   buildSubjectPayload,
   FIRESTORE_LIMITS,
   sanitizeExamConfigs,
-  sanitizeRecordMap,
+  sanitizeStringRecordMap,
   validateAndBuildStudentPayload,
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
@@ -49,7 +49,13 @@ import type {
   TeacherMember,
 } from '../types/school';
 
-export const AdminPanelView: React.FC = () => {
+interface AdminPanelViewProps {
+  initialTab?: 'teachers' | 'approvals' | 'setup' | 'update';
+}
+
+export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
+  initialTab = 'teachers',
+}) => {
   const {
     lang,
     session,
@@ -61,7 +67,7 @@ export const AdminPanelView: React.FC = () => {
   } = useApp();
 
   const [adminTab, setAdminTab] = useState<'teachers' | 'approvals' | 'setup' | 'update'>(
-    'teachers'
+    initialTab
   );
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
@@ -96,20 +102,33 @@ export const AdminPanelView: React.FC = () => {
   const [newCfType, setNewCfType] = useState<CustomFieldType>('TEXT');
   const [newCfResets, setNewCfResets] = useState(false);
 
-  // App Update Publisher State
-  const [versionCode, setVersionCode] = useState(String(school?.latestAppVersionCode || 1));
-  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '1.0.0');
+  // App Update Publisher State (baseline Android app is v1.8 / versionCode 9)
+  const [versionCode, setVersionCode] = useState(
+    school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
+      ? String(school.latestAppVersionCode)
+      : '10'
+  );
+  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '1.9');
   const [updateUrl, setUpdateUrl] = useState(school?.appUpdateUrl || '');
   const [updateNotes, setUpdateNotes] = useState(school?.appUpdateNotes || '');
+  const [updateAdminPassword, setUpdateAdminPassword] = useState('');
   const [savingUpdate, setSavingUpdate] = useState(false);
+
+  useEffect(() => {
+    setAdminTab(initialTab);
+  }, [initialTab]);
 
   useEffect(() => {
     setExamDrafts(normalizeExamConfigs(school?.examConfigs));
   }, [school?.examConfigs]);
 
   useEffect(() => {
-    setVersionCode(String(school?.latestAppVersionCode ?? 1));
-    setVersionName(school?.latestAppVersionName || '');
+    setVersionCode(
+      school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
+        ? String(school.latestAppVersionCode)
+        : '10'
+    );
+    setVersionName(school?.latestAppVersionName || '1.9');
     setUpdateUrl(school?.appUpdateUrl || '');
     setUpdateNotes(school?.appUpdateNotes || '');
   }, [
@@ -291,18 +310,18 @@ export const AdminPanelView: React.FC = () => {
             if (item.examResultsPatch && typeof item.examResultsPatch === 'object') {
               const merged = { ...(existing.examResults || {}) } as Record<
                 string,
-                number | string
+                unknown
               >;
               for (const [k, v] of Object.entries(
                 item.examResultsPatch as Record<string, number | string | null>
               )) {
-                if (v === null || v === undefined || v === '') {
+                if (v === null || v === undefined || String(v).trim() === '') {
                   delete merged[k];
                 } else {
-                  merged[k] = v;
+                  merged[k] = String(v).trim();
                 }
               }
-              const sanitized = sanitizeRecordMap(merged);
+              const sanitized = sanitizeStringRecordMap(merged);
               if (Object.keys(sanitized).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
                 throw new Error('Exam results limit exceeded.');
               }
@@ -312,9 +331,9 @@ export const AdminPanelView: React.FC = () => {
                 updatedAt: serverTimestamp(),
               });
             } else if (item.customValues && typeof item.customValues === 'object') {
-              const merged = sanitizeRecordMap({
+              const merged = sanitizeStringRecordMap({
                 ...(existing.customValues || {}),
-                ...(item.customValues as Record<string, string | number | boolean>),
+                ...(item.customValues as Record<string, unknown>),
               });
               batch.update(ref, {
                 customValues: merged,
@@ -322,9 +341,9 @@ export const AdminPanelView: React.FC = () => {
                 updatedAt: serverTimestamp(),
               });
             } else if (item.subjectValues && typeof item.subjectValues === 'object') {
-              const merged = sanitizeRecordMap({
+              const merged = sanitizeStringRecordMap({
                 ...(existing.subjectValues || {}),
-                ...(item.subjectValues as Record<string, string | number | boolean>),
+                ...(item.subjectValues as Record<string, unknown>),
               });
               batch.update(ref, {
                 subjectValues: merged,
@@ -332,8 +351,21 @@ export const AdminPanelView: React.FC = () => {
                 updatedAt: serverTimestamp(),
               });
             } else if (item.fieldsPatch && typeof item.fieldsPatch === 'object') {
+              const rawPatch = { ...(item.fieldsPatch as Record<string, unknown>) };
+              for (const strKey of [
+                'rollNumber',
+                'nextYearRollNumber',
+                'guardianPhone',
+                'sectorNotes',
+                'section',
+                'promotionStatus',
+              ]) {
+                if (strKey in rawPatch) {
+                  rawPatch[strKey] = String(rawPatch[strKey] ?? '').trim();
+                }
+              }
               batch.update(ref, {
-                ...(item.fieldsPatch as Record<string, unknown>),
+                ...rawPatch,
                 lastUpdatedByName: change.submittedByName || session.name,
                 updatedAt: serverTimestamp(),
               });
@@ -595,31 +627,76 @@ export const AdminPanelView: React.FC = () => {
     await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id));
   };
 
-  // 4. Android App Update Publisher
+  // 4. Android App Update Publisher (Admin-only + Admin Password Verified)
   const handleSaveAppUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
 
-    if (updateUrl.trim() && !isValidHttpUrl(updateUrl)) {
-      setBanner({
-        type: 'error',
-        text: 'Update URL must be a valid http:// or https:// link.',
-      });
+    const trimmedCodeStr = versionCode.trim();
+    const parsedCode = Number(trimmedCodeStr);
+    if (
+      trimmedCodeStr === '' ||
+      !Number.isFinite(parsedCode) ||
+      !Number.isInteger(parsedCode) ||
+      parsedCode < 0 ||
+      parsedCode > 999999
+    ) {
+      setBanner({ type: 'error', text: t(lang, 'invalidVersionCode') });
+      return;
+    }
+
+    const trimmedVersionName = versionName.trim().slice(0, 20);
+    if (!trimmedVersionName) {
+      setBanner({ type: 'error', text: t(lang, 'invalidVersionName') });
+      return;
+    }
+
+    const trimmedUrl = updateUrl.trim();
+    if (!trimmedUrl || trimmedUrl.length > 500 || !isValidHttpUrl(trimmedUrl)) {
+      setBanner({ type: 'error', text: t(lang, 'invalidUpdateUrl') });
+      return;
+    }
+
+    const trimmedNotes = updateNotes.trim().slice(0, 300);
+
+    if (!updateAdminPassword) {
+      setBanner({ type: 'error', text: t(lang, 'adminPasswordRequiredForUpdate') });
       return;
     }
 
     setSavingUpdate(true);
     setBanner(null);
     try {
+      const currentAdminRecord = teachers.find(
+        (m) =>
+          normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
+          m.role === 'ADMIN'
+      );
+
+      if (!currentAdminRecord || !currentAdminRecord.passwordHash) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
+        setSavingUpdate(false);
+        return;
+      }
+
+      const enteredHash = await sha256Hex(updateAdminPassword);
+      if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
+        setSavingUpdate(false);
+        return;
+      }
+
       await updateDoc(doc(instances.db, 'schools', session.schoolId), {
-        latestAppVersionCode: Math.max(1, Number(versionCode) || 1),
-        latestAppVersionName: versionName.trim(),
-        appUpdateUrl: updateUrl.trim(),
-        appUpdateNotes: updateNotes.trim(),
+        latestAppVersionCode: Math.trunc(parsedCode),
+        latestAppVersionName: trimmedVersionName,
+        appUpdateUrl: trimmedUrl,
+        appUpdateNotes: trimmedNotes,
         updatedAt: serverTimestamp(),
       });
-      setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+
+      setUpdateAdminPassword('');
+      setBanner({ type: 'success', text: t(lang, 'appUpdatePublishedSuccess') });
     } catch (err) {
       setBanner({
         type: 'error',
@@ -1141,23 +1218,21 @@ export const AdminPanelView: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 4: Android App Update Publisher */}
+      {/* TAB 4: Android App Update Publisher (Admin-Only, Password-Protected) */}
       {adminTab === 'update' && (
         <form
           onSubmit={handleSaveAppUpdate}
           className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-4"
         >
           <div className="flex items-center gap-3 pb-3 border-b border-stone-200">
-            <Smartphone className="w-5 h-5 text-emerald-700" />
+            <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+              <Smartphone className="w-5 h-5" />
+            </div>
             <div>
               <h3 className="text-base font-semibold text-slate-900">
                 {t(lang, 'publishAppUpdate')}
               </h3>
-              <p className="text-xs text-slate-500">
-                {lang === 'bn'
-                  ? 'অ্যান্ড্রয়েড অ্যাপ চালু হলে ব্যবহারকারীদের আপডেটের বিজ্ঞপ্তি প্রদর্শনের জন্য ভার্সন তথ্য হালনাগাদ করুন।'
-                  : 'Push new Android APK or Play Store update metadata to all connected school teachers.'}
-              </p>
+              <p className="text-xs text-slate-500">{t(lang, 'versionCodeHint')}</p>
             </div>
           </div>
 
@@ -1168,11 +1243,14 @@ export const AdminPanelView: React.FC = () => {
               </label>
               <input
                 type="number"
-                min={1}
+                min={0}
+                max={999999}
+                step={1}
                 required
                 value={versionCode}
                 onChange={(e) => setVersionCode(e.target.value)}
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                placeholder="10"
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600"
               />
             </div>
             <div>
@@ -1182,37 +1260,93 @@ export const AdminPanelView: React.FC = () => {
               <input
                 type="text"
                 required
+                maxLength={20}
                 value={versionName}
                 onChange={(e) => setVersionName(e.target.value)}
-                placeholder="e.g. 1.5.2"
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono"
+                placeholder="1.9"
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
               />
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              {t(lang, 'updateUrl')}
-            </label>
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+              <label className="block text-xs font-medium text-slate-700">
+                {t(lang, 'updateUrl')}
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  if (typeof window !== 'undefined') {
+                    setUpdateUrl(`${window.location.origin}/my-school.apk`);
+                  }
+                }}
+                className="text-xs font-medium text-emerald-700 hover:text-emerald-800 hover:underline cursor-pointer"
+              >
+                {t(lang, 'useWebsiteApkUrl')}
+              </button>
+            </div>
             <input
               type="url"
+              required
+              maxLength={500}
               value={updateUrl}
               onChange={(e) => setUpdateUrl(e.target.value)}
-              placeholder="https://..."
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono"
+              placeholder="https://github.com/.../releases/latest/download/my-school.apk"
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
             />
+            <p className="text-[11px] text-slate-500 mt-1">
+              {lang === 'bn'
+                ? 'Google Drive, GitHub Releases অথবা সরাসরি APK লিংক দিন (সর্বোচ্চ ৫০০ অক্ষর)।'
+                : 'Paste a Google Drive, GitHub Releases, or direct APK link (max 500 chars).'}
+            </p>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">
-              {t(lang, 'updateNotes')}
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-xs font-medium text-slate-700">
+                {t(lang, 'updateNotes')}
+              </label>
+              <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                {updateNotes.length}/300
+              </span>
+            </div>
             <textarea
               rows={3}
+              maxLength={300}
               value={updateNotes}
               onChange={(e) => setUpdateNotes(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
+              placeholder={
+                lang === 'bn'
+                  ? 'যেমন: মার্কশিট উন্নতি ও দ্রুত সিঙ্ক যোগ করা হয়েছে'
+                  : 'e.g. Marksheet improvements and faster cloud sync.'
+              }
+              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600"
             />
+          </div>
+
+          <div className="pt-2 border-t border-stone-100">
+            <label
+              htmlFor="update-admin-pw"
+              className="block text-xs font-medium text-slate-700 mb-1"
+            >
+              {t(lang, 'adminPasswordLabel')}
+            </label>
+            <div className="relative">
+              <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                id="update-admin-pw"
+                type="password"
+                required
+                value={updateAdminPassword}
+                onChange={(e) => setUpdateAdminPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              />
+            </div>
+            <p className="text-[11px] text-slate-500 mt-1">
+              {t(lang, 'adminPasswordRequiredForUpdate')}
+            </p>
           </div>
 
           <button

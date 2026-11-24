@@ -29,21 +29,21 @@ export function validateAndBuildStudentPayload(
     );
   }
 
-  const examResults = sanitizeRecordMap(input.examResults || {});
+  const examResults = sanitizeStringRecordMap(input.examResults || {});
   if (Object.keys(examResults).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
     throw new Error(
       `Exam results exceed maximum ${FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS} entries.`
     );
   }
 
-  const customValues = sanitizeRecordMap(input.customValues || {});
+  const customValues = sanitizeStringRecordMap(input.customValues || {});
   if (Object.keys(customValues).length > FIRESTORE_LIMITS.CUSTOM_VALUES_MAX_KEYS) {
     throw new Error(
       `Custom field values exceed maximum ${FIRESTORE_LIMITS.CUSTOM_VALUES_MAX_KEYS} entries.`
     );
   }
 
-  const subjectValues = sanitizeRecordMap(input.subjectValues || {});
+  const subjectValues = sanitizeStringRecordMap(input.subjectValues || {});
   if (Object.keys(subjectValues).length > FIRESTORE_LIMITS.SUBJECT_VALUES_MAX_KEYS) {
     throw new Error(
       `Subject field values exceed maximum ${FIRESTORE_LIMITS.SUBJECT_VALUES_MAX_KEYS} entries.`
@@ -52,22 +52,22 @@ export function validateAndBuildStudentPayload(
 
   return {
     schoolId,
-    studentNameBn: String(input.studentNameBn || '').trim(),
-    studentNameEn: String(input.studentNameEn || '').trim(),
-    fatherNameEn: String(input.fatherNameEn || '').trim(),
-    motherNameEn: String(input.motherNameEn || '').trim(),
-    dateOfBirth: String(input.dateOfBirth || '').trim(),
-    guardianPhone: String(input.guardianPhone || '').trim(),
-    address: String(input.address || '').trim(),
+    studentNameBn: String(input.studentNameBn ?? '').trim(),
+    studentNameEn: String(input.studentNameEn ?? '').trim(),
+    fatherNameEn: String(input.fatherNameEn ?? '').trim(),
+    motherNameEn: String(input.motherNameEn ?? '').trim(),
+    dateOfBirth: String(input.dateOfBirth ?? '').trim(),
+    guardianPhone: String(input.guardianPhone ?? '').trim(),
+    address: String(input.address ?? '').trim(),
     photoBase64,
     rollNumber: String(input.rollNumber ?? '').trim(),
     nextYearRollNumber: String(input.nextYearRollNumber ?? '').trim(),
     classLevel: String(input.classLevel || 'Class 1').trim(),
-    section: String(input.section || '').trim(),
+    section: String(input.section ?? '').trim(),
     academicYear: Number(input.academicYear) || new Date().getFullYear(),
     totalSchoolDays: Number(input.totalSchoolDays) || 0,
     daysPresent: Number(input.daysPresent) || 0,
-    promotionStatus: String(input.promotionStatus || '').trim(),
+    promotionStatus: String(input.promotionStatus ?? '').trim(),
     customValues,
     subjectValues,
     examResults,
@@ -76,14 +76,29 @@ export function validateAndBuildStudentPayload(
         ? input.sectorNotes.trim()
         : input.sectorNotes && typeof input.sectorNotes === 'object'
         ? Object.entries(input.sectorNotes)
-            .map(([k, v]) => `${k}: ${String(v ?? '')}`)
+            .map(([k, v]) => `${k}: ${String(v ?? '').trim()}`)
             .join('\n')
             .trim()
         : '',
-    lastUpdatedByName: updatedByName,
+    lastUpdatedByName: String(updatedByName ?? '').trim(),
     createdAt: existingCreatedAt || serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
+}
+
+export function sanitizeStringRecordMap(
+  map: Record<string, unknown> | null | undefined
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return out;
+  for (const [k, v] of Object.entries(map)) {
+    if (v === undefined || v === null) continue;
+    const str = String(v).trim();
+    if (str !== '') {
+      out[k] = str;
+    }
+  }
+  return out;
 }
 
 export function sanitizeRecordMap<T extends string | number | boolean>(

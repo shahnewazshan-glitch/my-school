@@ -23,6 +23,9 @@ const MainAppShell: React.FC = () => {
   const { session, dataLoading } = useApp();
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [adminInitialTab, setAdminInitialTab] = useState<
+    'teachers' | 'approvals' | 'setup' | 'update'
+  >('teachers');
 
   // Ensure non-Admin users never remain on Admin tab if role downgrades live
   useEffect(() => {
@@ -40,11 +43,19 @@ const MainAppShell: React.FC = () => {
     if (tab !== 'students') {
       setSelectedProfileId(null);
     }
+    if (tab === 'admin') {
+      setAdminInitialTab('teachers');
+    }
   };
 
   const handleOpenStudentProfile = (studentId: string) => {
     setSelectedProfileId(studentId);
     setActiveTab('students');
+  };
+
+  const handleOpenAppUpdatePublisher = () => {
+    setAdminInitialTab('update');
+    setActiveTab('admin');
   };
 
   return (
@@ -58,6 +69,7 @@ const MainAppShell: React.FC = () => {
         <DashboardView
           onNavigate={handleSelectTab}
           onOpenStudentProfile={handleOpenStudentProfile}
+          onOpenAppUpdatePublisher={handleOpenAppUpdatePublisher}
         />
       )}
       {activeTab === 'students' && (
@@ -74,7 +86,9 @@ const MainAppShell: React.FC = () => {
       {activeTab === 'batch-fields' && <BatchFieldsView />}
       {activeTab === 'marksheet' && <MarksheetView />}
       {activeTab === 'comms' && <CommsView />}
-      {activeTab === 'admin' && session.role === 'ADMIN' && <AdminPanelView />}
+      {activeTab === 'admin' && session.role === 'ADMIN' && (
+        <AdminPanelView initialTab={adminInitialTab} />
+      )}
     </WorkspaceLayout>
   );
 };

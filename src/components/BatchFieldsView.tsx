@@ -6,7 +6,7 @@ import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
   FIRESTORE_LIMITS,
-  sanitizeRecordMap,
+  sanitizeStringRecordMap,
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
 import { matchesClassScope } from '../lib/schoolUtils';
@@ -118,7 +118,7 @@ export const BatchFieldsView: React.FC = () => {
 
       for (const st of classStudents) {
         if (!dirtyIds.has(st.id)) continue;
-        const sanitized = sanitizeRecordMap(drafts[st.id] || {});
+        const sanitized = sanitizeStringRecordMap(drafts[st.id] || {});
         const limit =
           mode === 'custom'
             ? FIRESTORE_LIMITS.CUSTOM_VALUES_MAX_KEYS

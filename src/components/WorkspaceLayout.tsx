@@ -4,6 +4,7 @@ import {
   BookOpenCheck,
   CalendarCheck2,
   ClipboardList,
+  Download,
   FileSpreadsheet,
   GraduationCap,
   LayoutDashboard,
@@ -12,6 +13,7 @@ import {
   MessageSquareText,
   RefreshCw,
   ShieldCheck,
+  Smartphone,
   Users,
   Wifi,
   WifiOff,
@@ -19,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getClassLabel, t } from '../lib/i18n';
+import { isValidHttpUrl } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 
 export type NavTab =
@@ -62,6 +65,13 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const pendingCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
+  const appUpdateUrl = String(school?.appUpdateUrl || '').trim();
+  const hasAppUpdate = isValidHttpUrl(appUpdateUrl);
+  const appUpdateVersionLabel = school?.latestAppVersionName
+    ? `v${school.latestAppVersionName}`
+    : school?.latestAppVersionCode !== undefined
+    ? `#${school.latestAppVersionCode}`
+    : '';
 
   const academicYears = React.useMemo(() => {
     const base = school?.defaultAcademicYear || new Date().getFullYear();
@@ -285,7 +295,27 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
+            {/* Compact Header Android App Update Link (when configured) */}
+            {hasAppUpdate && (
+              <a
+                href={appUpdateUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={t(lang, 'downloadAndroidApp')}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-900 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
+              >
+                <Smartphone className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                <span className="hidden md:inline">{t(lang, 'androidAppUpdateTitle')}</span>
+                {appUpdateVersionLabel && (
+                  <span className="font-mono tabular-nums text-emerald-800">
+                    {appUpdateVersionLabel}
+                  </span>
+                )}
+                <Download className="w-3 h-3 text-emerald-700 shrink-0" />
+              </a>
+            )}
+
             {/* Live Online / Offline & Pending Sync Indicator */}
             <div
               className="flex items-center gap-2 text-xs font-medium text-slate-700 px-2.5 py-1.5 rounded-lg border border-stone-200 bg-stone-50 whitespace-nowrap shrink-0"

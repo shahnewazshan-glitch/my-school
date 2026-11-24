@@ -15,7 +15,7 @@ import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
   FIRESTORE_LIMITS,
-  sanitizeRecordMap,
+  sanitizeStringRecordMap,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
@@ -242,21 +242,22 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
           delete nextResults[totalKey];
         }
 
-        const sanitized = sanitizeRecordMap(nextResults);
+        const sanitized = sanitizeStringRecordMap(nextResults);
         if (Object.keys(sanitized).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
           throw new Error(
             `${st.studentNameEn || st.studentNameBn}: examResults exceeds ${FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS} keys.`
           );
         }
 
+        const totalVal = contVal !== null || sumVal !== null ? (contVal ?? 0) + (sumVal ?? 0) : null;
         updates.push({
           studentId: st.id,
           studentName: st.studentNameBn || st.studentNameEn,
           examResults: sanitized,
           patchKeys: {
-            [contKey]: contVal,
-            [sumKey]: sumVal,
-            [totalKey]: contVal !== null || sumVal !== null ? (contVal ?? 0) + (sumVal ?? 0) : null,
+            [contKey]: contVal !== null ? String(contVal).trim() : null,
+            [sumKey]: sumVal !== null ? String(sumVal).trim() : null,
+            [totalKey]: totalVal !== null ? String(totalVal).trim() : null,
           },
         });
       }
@@ -620,7 +621,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
       const updates = classStudents
         .filter((st) => dirtySubjValIds.has(st.id))
         .map((st) => {
-          const sanitized = sanitizeRecordMap(subjValDrafts[st.id] || {});
+          const sanitized = sanitizeStringRecordMap(subjValDrafts[st.id] || {});
           if (Object.keys(sanitized).length > FIRESTORE_LIMITS.SUBJECT_VALUES_MAX_KEYS) {
             throw new Error(
               `${st.studentNameEn || st.studentNameBn}: exceeds maximum ${FIRESTORE_LIMITS.SUBJECT_VALUES_MAX_KEYS} entries.`

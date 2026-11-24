@@ -164,8 +164,8 @@ export const PromotionManagerView: React.FC = () => {
         studentId: st.id,
         studentName: st.studentNameBn || st.studentNameEn,
         fieldsPatch: {
-          promotionStatus: drafts[st.id]?.promotionStatus || '',
-          nextYearRollNumber: drafts[st.id]?.nextYearRollNumber || '',
+          promotionStatus: String(drafts[st.id]?.promotionStatus ?? '').trim(),
+          nextYearRollNumber: String(drafts[st.id]?.nextYearRollNumber ?? '').trim(),
         },
       }));
 
@@ -269,8 +269,8 @@ export const PromotionManagerView: React.FC = () => {
         for (const st of selectedStudents) {
           const d = drafts[st.id];
           batch.update(doc(instances.db, 'schools', session.schoolId, 'students', st.id), {
-            promotionStatus: d?.promotionStatus || 'Promoted',
-            nextYearRollNumber: d?.nextYearRollNumber || '',
+            promotionStatus: String(d?.promotionStatus ?? 'Promoted').trim(),
+            nextYearRollNumber: String(d?.nextYearRollNumber ?? '').trim(),
             lastUpdatedByName: session.name,
             updatedAt: serverTimestamp(),
           });
