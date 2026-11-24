@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { addDoc, collection, doc, serverTimestamp, writeBatch } from 'firebase/firestore';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { addDoc, collection, doc, serverTimestamp } from 'firebase/firestore';
 import {
   CalendarPlus,
   CheckCheck,
@@ -9,13 +9,18 @@ import {
   Send,
   X,
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
+  buildChunkedArrayPendingPayloads,
+  buildChunkedExamPatchPayloads,
   buildPendingChangePayload,
+  clampText,
+  commitBatchesInChunks,
   FIRESTORE_LIMITS,
+  formatFirestoreError,
   sanitizeStringRecordMap,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
@@ -28,13 +33,114 @@ import {
   normalizeExamConfigs,
   TERM_ORDER,
 } from '../lib/schoolUtils';
-import { CLASS_LEVELS, type ExamTermId } from '../types/school';
+import { CLASS_LEVELS, type ExamTermId, type StudentDoc } from '../types/school';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
 type BatchMode = 'marks' | 'attendance' | 'roll' | 'subjectFields' | 'results';
 
 interface BatchMarksViewProps {
   onOpenStudentProfile?: (studentId: string) => void;
 }
+
+interface MarkEntryRowProps {
+  student: StudentDoc;
+  localIdx: number;
+  cont: string;
+  sum: string;
+  isDirty: boolean;
+  otherSum: number;
+  otherCount: number;
+  fullMarks: number;
+  onCellChange: (studentId: string, field: 'cont' | 'sum', value: string) => void;
+  onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>, localIdx: number, col: 'cont' | 'sum') => void;
+  registerInputRef: (key: string, el: HTMLInputElement | null) => void;
+}
+
+const MarkEntryRow = memo<MarkEntryRowProps>(
+  ({
+    student,
+    localIdx,
+    cont,
+    sum,
+    isDirty,
+    otherSum,
+    otherCount,
+    fullMarks,
+    onCellChange,
+    onKeyDown,
+    registerInputRef,
+  }) => {
+    const contNum = cont !== '' ? Number(cont) : null;
+    const sumNum = sum !== '' ? Number(sum) : null;
+    const hasCurrent = contNum !== null || sumNum !== null;
+    const currentTotal = hasCurrent ? (contNum ?? 0) + (sumNum ?? 0) : null;
+
+    const totalSum = otherSum + (currentTotal !== null ? currentTotal : 0);
+    const totalCount = otherCount + (currentTotal !== null ? 1 : 0);
+    const avg3Term = totalCount > 0 ? Number((totalSum / totalCount).toFixed(1)) : null;
+    const grade = currentTotal !== null ? calculateSubjectGrade(currentTotal, fullMarks) : null;
+    const exceedsMax = currentTotal !== null && currentTotal > fullMarks;
+
+    return (
+      <tr className={isDirty ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}>
+        <td className="py-2 px-4 font-mono tabular-nums font-semibold text-slate-900">
+          {student.rollNumber}
+        </td>
+        <td className="py-2 px-4">
+          <div className="font-medium text-slate-900">
+            {student.studentNameBn || student.studentNameEn}
+          </div>
+          {student.studentNameBn && student.studentNameEn && (
+            <div className="text-xs text-slate-500">{student.studentNameEn}</div>
+          )}
+        </td>
+        <td className="py-1.5 px-3">
+          <input
+            ref={(el) => registerInputRef(`${student.id}_cont`, el)}
+            type="text"
+            inputMode="decimal"
+            value={cont}
+            onChange={(e) => onCellChange(student.id, 'cont', e.target.value)}
+            onKeyDown={(e) => onKeyDown(e, localIdx, 'cont')}
+            placeholder="0"
+            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
+          />
+        </td>
+        <td className="py-1.5 px-3">
+          <input
+            ref={(el) => registerInputRef(`${student.id}_sum`, el)}
+            type="text"
+            inputMode="decimal"
+            value={sum}
+            onChange={(e) => onCellChange(student.id, 'sum', e.target.value)}
+            onKeyDown={(e) => onKeyDown(e, localIdx, 'sum')}
+            placeholder="0"
+            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
+          />
+        </td>
+        <td
+          className={`py-2 px-4 text-right font-mono tabular-nums font-semibold ${
+            exceedsMax ? 'text-rose-600' : 'text-slate-900'
+          }`}
+        >
+          {currentTotal !== null ? currentTotal : '—'}
+        </td>
+        <td className="py-2 px-4 text-right font-mono tabular-nums text-slate-700">
+          {avg3Term !== null ? avg3Term : '—'}
+        </td>
+        <td className="py-2 px-4 text-center font-mono font-semibold">
+          {grade ? (
+            <span className={grade.passed ? 'text-emerald-700' : 'text-rose-600'}>
+              {grade.grade}
+            </span>
+          ) : (
+            '—'
+          )}
+        </td>
+      </tr>
+    );
+  }
+);
 
 export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentProfile }) => {
   const {
@@ -45,10 +151,12 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     subjects,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const isAdmin = session?.role === 'ADMIN';
   const [batchMode, setBatchMode] = useState<BatchMode>('marks');
+  const [page, setPage] = useState(1);
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
@@ -68,6 +176,11 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
       ),
     [students, selectedAcademicYear, selectedClass]
   );
+
+  const pagedClassStudents = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return classStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [classStudents, page]);
 
   // =========================================================================
   // MODE 1: EXAM MARKS
@@ -123,85 +236,76 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     setDirtyMarkIds(new Set());
   }, [classStudents, selectedTerm, selectedSubjectId]);
 
-  const handleMarkCellChange = (studentId: string, field: 'cont' | 'sum', value: string) => {
-    if (value !== '' && !/^\d*\.?\d*$/.test(value)) return;
-    setMarksDrafts((prev) => ({
-      ...prev,
-      [studentId]: {
-        cont: field === 'cont' ? value : prev[studentId]?.cont ?? '',
-        sum: field === 'sum' ? value : prev[studentId]?.sum ?? '',
-      },
-    }));
-    setDirtyMarkIds((prev) => {
-      const next = new Set(prev);
-      next.add(studentId);
-      return next;
-    });
-  };
+  const registerInputRef = useCallback((key: string, el: HTMLInputElement | null) => {
+    inputRefs.current[key] = el;
+  }, []);
 
-  const handleMarkKeyDown = (
-    e: React.KeyboardEvent<HTMLInputElement>,
-    rowIdx: number,
-    col: 'cont' | 'sum'
-  ) => {
-    const moveFocus = (nextRow: number, nextCol: 'cont' | 'sum') => {
-      if (nextRow < 0 || nextRow >= classStudents.length) return;
-      const targetStudent = classStudents[nextRow];
-      const el = inputRefs.current[`${targetStudent.id}_${nextCol}`];
-      if (el) {
-        el.focus();
-        el.select();
-      }
-    };
+  const handleMarkCellChange = useCallback(
+    (studentId: string, field: 'cont' | 'sum', value: string) => {
+      if (value !== '' && !/^\d*\.?\d*$/.test(value)) return;
+      setMarksDrafts((prev) => ({
+        ...prev,
+        [studentId]: {
+          cont: field === 'cont' ? value : prev[studentId]?.cont ?? '',
+          sum: field === 'sum' ? value : prev[studentId]?.sum ?? '',
+        },
+      }));
+      setDirtyMarkIds((prev) => {
+        const next = new Set(prev);
+        next.add(studentId);
+        return next;
+      });
+    },
+    []
+  );
 
-    if (e.key === 'Enter' || e.key === 'ArrowDown') {
-      e.preventDefault();
-      moveFocus(rowIdx + 1, col);
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      moveFocus(rowIdx - 1, col);
-    } else if (e.key === 'ArrowRight' && col === 'cont') {
-      e.preventDefault();
-      moveFocus(rowIdx, 'sum');
-    } else if (e.key === 'ArrowLeft' && col === 'sum') {
-      e.preventDefault();
-      moveFocus(rowIdx, 'cont');
-    }
-  };
-
-  const computeMarkRowStats = (
-    studentId: string,
-    examResults?: Record<string, number | string>
-  ) => {
-    const d = marksDrafts[studentId] || { cont: '', sum: '' };
-    const contNum = d.cont !== '' ? Number(d.cont) : null;
-    const sumNum = d.sum !== '' ? Number(d.sum) : null;
-    const hasCurrent = contNum !== null || sumNum !== null;
-    const currentTotal = hasCurrent ? (contNum ?? 0) + (sumNum ?? 0) : null;
-
-    let termSum = 0;
-    let termCount = 0;
-    for (const termId of TERM_ORDER) {
-      if (termId === selectedTerm) {
-        if (currentTotal !== null) {
-          termSum += currentTotal;
-          termCount += 1;
+  const handleMarkKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>, rowIdx: number, col: 'cont' | 'sum') => {
+      const moveFocus = (nextRow: number, nextCol: 'cont' | 'sum') => {
+        if (nextRow < 0 || nextRow >= pagedClassStudents.length) return;
+        const targetStudent = pagedClassStudents[nextRow];
+        const el = inputRefs.current[`${targetStudent.id}_${nextCol}`];
+        if (el) {
+          el.focus();
+          el.select();
         }
-      } else if (selectedSubjectId) {
-        const s = getTermSubjectScore(examResults, termId, selectedSubjectId);
+      };
+
+      if (e.key === 'Enter' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveFocus(rowIdx + 1, col);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveFocus(rowIdx - 1, col);
+      } else if (e.key === 'ArrowRight' && col === 'cont') {
+        e.preventDefault();
+        moveFocus(rowIdx, 'sum');
+      } else if (e.key === 'ArrowLeft' && col === 'sum') {
+        e.preventDefault();
+        moveFocus(rowIdx, 'cont');
+      }
+    },
+    [pagedClassStudents]
+  );
+
+  const otherTermsSumMap = useMemo(() => {
+    const map = new Map<string, { sum: number; count: number }>();
+    if (!selectedSubjectId) return map;
+    for (const st of classStudents) {
+      let sum = 0;
+      let count = 0;
+      for (const termId of TERM_ORDER) {
+        if (termId === selectedTerm) continue;
+        const s = getTermSubjectScore(st.examResults, termId, selectedSubjectId);
         if (s.hasScore && s.total !== null) {
-          termSum += s.total;
-          termCount += 1;
+          sum += s.total;
+          count += 1;
         }
       }
+      map.set(st.id, { sum, count });
     }
-    const avg3Term = termCount > 0 ? Number((termSum / termCount).toFixed(1)) : null;
-    const fullMarks = activeSubject?.fullMarks || 100;
-    const grade =
-      currentTotal !== null ? calculateSubjectGrade(currentTotal, fullMarks) : null;
-
-    return { currentTotal, avg3Term, grade, fullMarks };
-  };
+    return map;
+  }, [classStudents, selectedTerm, selectedSubjectId]);
 
   const handleSaveAllMarks = async () => {
     if (!session || !selectedSubjectId || dirtyMarkIds.size === 0) return;
@@ -209,14 +313,14 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
       const updates: Array<{
         studentId: string;
-        studentName: string;
-        examResults: Record<string, number | string>;
-        patchKeys: Record<string, number | string | null>;
+        examResults: Record<string, string>;
+        patchStrings: Record<string, string>;
       }> = [];
 
       for (const st of classStudents) {
@@ -230,14 +334,26 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         const contVal = d.cont !== '' ? Number(d.cont) : null;
         const sumVal = d.sum !== '' ? Number(d.sum) : null;
 
-        if (contVal !== null) nextResults[contKey] = contVal;
-        else delete nextResults[contKey];
+        if (contVal !== null && !Number.isNaN(contVal)) {
+          nextResults[contKey] = String(contVal).trim();
+        } else {
+          delete nextResults[contKey];
+        }
 
-        if (sumVal !== null) nextResults[sumKey] = sumVal;
-        else delete nextResults[sumKey];
+        if (sumVal !== null && !Number.isNaN(sumVal)) {
+          nextResults[sumKey] = String(sumVal).trim();
+        } else {
+          delete nextResults[sumKey];
+        }
 
-        if (contVal !== null || sumVal !== null) {
-          nextResults[totalKey] = (contVal ?? 0) + (sumVal ?? 0);
+        if (
+          (contVal !== null && !Number.isNaN(contVal)) ||
+          (sumVal !== null && !Number.isNaN(sumVal))
+        ) {
+          nextResults[totalKey] = String(
+            (contVal !== null && !Number.isNaN(contVal) ? contVal : 0) +
+              (sumVal !== null && !Number.isNaN(sumVal) ? sumVal : 0)
+          ).trim();
         } else {
           delete nextResults[totalKey];
         }
@@ -249,66 +365,80 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
           );
         }
 
-        const totalVal = contVal !== null || sumVal !== null ? (contVal ?? 0) + (sumVal ?? 0) : null;
+        const patchStrings: Record<string, string> = {};
+        patchStrings[`examResults.${contKey}`] = sanitized[contKey] ?? '';
+        patchStrings[`examResults.${sumKey}`] = sanitized[sumKey] ?? '';
+        patchStrings[`examResults.${totalKey}`] = sanitized[totalKey] ?? '';
+
         updates.push({
           studentId: st.id,
-          studentName: st.studentNameBn || st.studentNameEn,
           examResults: sanitized,
-          patchKeys: {
-            [contKey]: contVal !== null ? String(contVal).trim() : null,
-            [sumKey]: sumVal !== null ? String(sumVal).trim() : null,
-            [totalKey]: totalVal !== null ? String(totalVal).trim() : null,
-          },
+          patchStrings,
         });
       }
 
-      if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
-          batch.update(doc(instances.db, 'schools', session.schoolId, 'students', u.studentId), {
-            examResults: u.examResults,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
+      if (updates.length === 0) {
         setDirtyMarkIds(new Set());
-        setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
-      } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `${selectedAcademicYear}_${selectedClass}_${selectedTerm}_${selectedSubjectId}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Batch Marks: ${activeSubject?.subjectName || selectedSubjectId} (${selectedTerm}, ${selectedClass})`,
-          detailsText: `${updates.length} student mark rows updated`,
-          payloadJson: JSON.stringify({
-            kind: 'EXAM_MARKS',
-            examId: selectedTerm,
-            subjectId: selectedSubjectId,
-            updates: updates.map((u) => ({
-              studentId: u.studentId,
-              studentName: u.studentName,
-              examResultsPatch: u.patchKeys,
-            })),
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
+        return;
+      }
+
+      if (isAdmin) {
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  examResults: u.examResults,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
         );
         setDirtyMarkIds(new Set());
-        setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+        setBanner({ type: 'success', text: t(lang, 'marksSavedSuccess') });
+      } else {
+        const chunks = buildChunkedExamPatchPayloads(
+          updates.map((u) => ({ studentId: u.studentId, patch: u.patchStrings }))
+        );
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `${selectedAcademicYear}_${selectedClass}_${selectedTerm}_${selectedSubjectId}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary:
+              chunks.length > 1
+                ? `Batch Marks (${idx + 1}/${chunks.length}): ${activeSubject?.subjectName || selectedSubjectId} (${selectedTerm}, ${selectedClass})`
+                : `Batch Marks: ${activeSubject?.subjectName || selectedSubjectId} (${selectedTerm}, ${selectedClass})`,
+            detailsText: `${chunks[idx].studentCount} student mark rows updated`,
+            payloadJson: chunks[idx].payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
+        setDirtyMarkIds(new Set());
+        setBanner({ type: 'success', text: t(lang, 'marksSubmittedSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -372,6 +502,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
@@ -385,54 +516,72 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         }));
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
-          batch.update(doc(instances.db, 'schools', session.schoolId, 'students', u.studentId), {
-            totalSchoolDays: u.totalSchoolDays,
-            daysPresent: u.daysPresent,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  totalSchoolDays: u.totalSchoolDays,
+                  daysPresent: u.daysPresent,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
+        );
         setDirtyAttIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `att_totals_${selectedAcademicYear}_${selectedClass}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Batch Attendance Totals (${selectedClass})`,
-          detailsText: `${updates.length} students updated`,
-          payloadJson: JSON.stringify({
-            kind: 'ATTENDANCE_TOTALS',
-            updates: updates.map((u) => ({
-              studentId: u.studentId,
-              studentName: u.studentName,
-              fieldsPatch: {
-                totalSchoolDays: u.totalSchoolDays,
-                daysPresent: u.daysPresent,
-              },
-            })),
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
+        const chunks = buildChunkedArrayPendingPayloads(
+          'ATTENDANCE_TOTALS',
+          'updates',
+          updates.map((u) => ({
+            studentId: u.studentId,
+            studentName: u.studentName,
+            fieldsPatch: {
+              totalSchoolDays: u.totalSchoolDays,
+              daysPresent: u.daysPresent,
+            },
+          }))
         );
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `att_totals_${selectedAcademicYear}_${selectedClass}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary:
+              chunks.length > 1
+                ? `Batch Attendance Totals (${selectedClass}) (${idx + 1}/${chunks.length})`
+                : `Batch Attendance Totals (${selectedClass})`,
+            detailsText: `${chunks[idx].itemCount} students updated`,
+            payloadJson: chunks[idx].payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setDirtyAttIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -504,6 +653,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
@@ -522,46 +672,60 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         }));
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
-          batch.update(doc(instances.db, 'schools', session.schoolId, 'students', u.studentId), {
-            ...u.fieldsPatch,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  ...u.fieldsPatch,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
+        );
         setDirtyRollIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `roll_promo_${selectedAcademicYear}_${selectedClass}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Batch Roll & Promotion (${selectedClass})`,
-          detailsText: `${updates.length} students updated`,
-          payloadJson: JSON.stringify({
-            kind: 'ROLL_PROMOTION',
-            updates,
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+        const chunks = buildChunkedArrayPendingPayloads('ROLL_PROMOTION', 'updates', updates);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `roll_promo_${selectedAcademicYear}_${selectedClass}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary:
+              chunks.length > 1
+                ? `Batch Roll & Promotion (${selectedClass}) (${idx + 1}/${chunks.length})`
+                : `Batch Roll & Promotion (${selectedClass})`,
+            detailsText: `${chunks[idx].itemCount} students updated`,
+            payloadJson: chunks[idx].payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setDirtyRollIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -615,6 +779,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
@@ -635,46 +800,60 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         });
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
-          batch.update(doc(instances.db, 'schools', session.schoolId, 'students', u.studentId), {
-            subjectValues: u.subjectValues,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        await batch.commit();
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  subjectValues: u.subjectValues,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
+        );
         setDirtySubjValIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `subj_fields_${selectedAcademicYear}_${selectedClass}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Batch Subject Fields (${activeSubjectDoc?.name || selectedClass})`,
-          detailsText: `${updates.length} students updated`,
-          payloadJson: JSON.stringify({
-            kind: 'SUBJECT_VALUES',
-            updates,
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+        const chunks = buildChunkedArrayPendingPayloads('SUBJECT_VALUES', 'updates', updates);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `subj_fields_${selectedAcademicYear}_${selectedClass}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary:
+              chunks.length > 1
+                ? `Batch Subject Fields (${activeSubjectDoc?.name || selectedClass}) (${idx + 1}/${chunks.length})`
+                : `Batch Subject Fields (${activeSubjectDoc?.name || selectedClass})`,
+            detailsText: `${chunks[idx].itemCount} students updated`,
+            payloadJson: chunks[idx].payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setDirtySubjValIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -708,7 +887,17 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
       });
   }, [classStudents, allClassSubjects, meritMap]);
 
-  const exportMeritExcel = () => {
+  const pagedMeritRows = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return meritSortedRows.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [meritSortedRows, page]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [selectedAcademicYear, selectedClass, batchMode, selectedTerm, selectedSubjectId, subjFieldId]);
+
+  const exportMeritExcel = async () => {
+    const XLSX = await import('xlsx');
     const rows = meritSortedRows.map((r) => ({
       MeritRank: r.merit ?? '',
       Roll: r.st.rollNumber,
@@ -868,104 +1057,55 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm text-left border-collapse">
-                  <thead>
-                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                      <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
-                      <th className="py-3 px-4">
-                        {lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}
-                      </th>
-                      <th className="py-3 px-3 text-center w-32">{t(lang, 'contShort')}</th>
-                      <th className="py-3 px-3 text-center w-32">{t(lang, 'sumShort')}</th>
-                      <th className="py-3 px-4 text-right w-28">
-                        {t(lang, 'totalShort')} ({activeSubject?.fullMarks || 100})
-                      </th>
-                      <th className="py-3 px-4 text-right w-28">{t(lang, 'avg3Term')}</th>
-                      <th className="py-3 px-4 text-center w-24">{t(lang, 'gradeInternal')}</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st, rowIdx) => {
-                      const isDirty = dirtyMarkIds.has(st.id);
-                      const d = marksDrafts[st.id] || { cont: '', sum: '' };
-                      const stats = computeMarkRowStats(st.id, st.examResults);
-                      const exceedsMax =
-                        stats.currentTotal !== null && stats.currentTotal > stats.fullMarks;
-
-                      return (
-                        <tr
-                          key={st.id}
-                          className={isDirty ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}
-                        >
-                          <td className="py-2 px-4 font-mono tabular-nums font-semibold text-slate-900">
-                            {st.rollNumber}
-                          </td>
-                          <td className="py-2 px-4">
-                            <div className="font-medium text-slate-900">
-                              {st.studentNameBn || st.studentNameEn}
-                            </div>
-                            {st.studentNameBn && st.studentNameEn && (
-                              <div className="text-xs text-slate-500">{st.studentNameEn}</div>
-                            )}
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              ref={(el) => {
-                                inputRefs.current[`${st.id}_cont`] = el;
-                              }}
-                              type="text"
-                              inputMode="decimal"
-                              value={d.cont}
-                              onChange={(e) => handleMarkCellChange(st.id, 'cont', e.target.value)}
-                              onKeyDown={(e) => handleMarkKeyDown(e, rowIdx, 'cont')}
-                              placeholder="0"
-                              className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
-                            />
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              ref={(el) => {
-                                inputRefs.current[`${st.id}_sum`] = el;
-                              }}
-                              type="text"
-                              inputMode="decimal"
-                              value={d.sum}
-                              onChange={(e) => handleMarkCellChange(st.id, 'sum', e.target.value)}
-                              onKeyDown={(e) => handleMarkKeyDown(e, rowIdx, 'sum')}
-                              placeholder="0"
-                              className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
-                            />
-                          </td>
-                          <td
-                            className={`py-2 px-4 text-right font-mono tabular-nums font-semibold ${
-                              exceedsMax ? 'text-rose-600' : 'text-slate-900'
-                            }`}
-                          >
-                            {stats.currentTotal !== null ? stats.currentTotal : '—'}
-                          </td>
-                          <td className="py-2 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {stats.avg3Term !== null ? stats.avg3Term : '—'}
-                          </td>
-                          <td className="py-2 px-4 text-center font-mono font-semibold">
-                            {stats.grade ? (
-                              <span
-                                className={
-                                  stats.grade.passed ? 'text-emerald-700' : 'text-rose-600'
-                                }
-                              >
-                                {stats.grade.grade}
-                              </span>
-                            ) : (
-                              '—'
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left border-collapse">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4">
+                          {lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}
+                        </th>
+                        <th className="py-3 px-3 text-center w-32">{t(lang, 'contShort')}</th>
+                        <th className="py-3 px-3 text-center w-32">{t(lang, 'sumShort')}</th>
+                        <th className="py-3 px-4 text-right w-28">
+                          {t(lang, 'totalShort')} ({activeSubject?.fullMarks || 100})
+                        </th>
+                        <th className="py-3 px-4 text-right w-28">{t(lang, 'avg3Term')}</th>
+                        <th className="py-3 px-4 text-center w-24">{t(lang, 'gradeInternal')}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedClassStudents.map((st, localIdx) => {
+                        const d = marksDrafts[st.id] || { cont: '', sum: '' };
+                        const other = otherTermsSumMap.get(st.id) || { sum: 0, count: 0 };
+                        return (
+                          <MarkEntryRow
+                            key={st.id}
+                            student={st}
+                            localIdx={localIdx}
+                            cont={d.cont}
+                            sum={d.sum}
+                            isDirty={dirtyMarkIds.has(st.id)}
+                            otherSum={other.sum}
+                            otherCount={other.count}
+                            fullMarks={activeSubject?.fullMarks || 100}
+                            onCellChange={handleMarkCellChange}
+                            onKeyDown={handleMarkKeyDown}
+                            registerInputRef={registerInputRef}
+                          />
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={classStudents.length}
+                  onPageChange={setPage}
+                />
+              </>
             )}
           </div>
         </>
@@ -1017,65 +1157,73 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm text-left">
-                  <thead>
-                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                      <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
-                      <th className="py-3 px-4">{lang === 'bn' ? 'নাম' : 'Student Name'}</th>
-                      <th className="py-3 px-3 text-center w-36">{t(lang, 'totalSchoolDays')}</th>
-                      <th className="py-3 px-3 text-center w-36">{t(lang, 'daysPresent')}</th>
-                      <th className="py-3 px-4 text-right w-28">{t(lang, 'attendancePct')}</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st) => {
-                      const d = attDrafts[st.id] || { totalSchoolDays: '0', daysPresent: '0' };
-                      const tot = Number(d.totalSchoolDays) || 0;
-                      const pres = Number(d.daysPresent) || 0;
-                      const pct = tot > 0 ? Math.round((pres / tot) * 100) : 0;
-                      return (
-                        <tr
-                          key={st.id}
-                          className={dirtyAttIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}
-                        >
-                          <td className="py-2 px-4 font-mono tabular-nums font-semibold">
-                            {st.rollNumber}
-                          </td>
-                          <td className="py-2 px-4 font-medium text-slate-900">
-                            {st.studentNameBn || st.studentNameEn}
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              value={d.totalSchoolDays}
-                              onChange={(e) =>
-                                handleAttChange(st.id, 'totalSchoolDays', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums border border-stone-300 rounded-md"
-                            />
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              value={d.daysPresent}
-                              onChange={(e) =>
-                                handleAttChange(st.id, 'daysPresent', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums border border-stone-300 rounded-md"
-                            />
-                          </td>
-                          <td className="py-2 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
-                            {pct}%
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4">{lang === 'bn' ? 'নাম' : 'Student Name'}</th>
+                        <th className="py-3 px-3 text-center w-36">{t(lang, 'totalSchoolDays')}</th>
+                        <th className="py-3 px-3 text-center w-36">{t(lang, 'daysPresent')}</th>
+                        <th className="py-3 px-4 text-right w-28">{t(lang, 'attendancePct')}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedClassStudents.map((st) => {
+                        const d = attDrafts[st.id] || { totalSchoolDays: '0', daysPresent: '0' };
+                        const tot = Number(d.totalSchoolDays) || 0;
+                        const pres = Number(d.daysPresent) || 0;
+                        const pct = tot > 0 ? Math.round((pres / tot) * 100) : 0;
+                        return (
+                          <tr
+                            key={st.id}
+                            className={dirtyAttIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}
+                          >
+                            <td className="py-2 px-4 font-mono tabular-nums font-semibold">
+                              {st.rollNumber}
+                            </td>
+                            <td className="py-2 px-4 font-medium text-slate-900">
+                              {st.studentNameBn || st.studentNameEn}
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                value={d.totalSchoolDays}
+                                onChange={(e) =>
+                                  handleAttChange(st.id, 'totalSchoolDays', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums border border-stone-300 rounded-md"
+                              />
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                value={d.daysPresent}
+                                onChange={(e) =>
+                                  handleAttChange(st.id, 'daysPresent', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums border border-stone-300 rounded-md"
+                              />
+                            </td>
+                            <td className="py-2 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
+                              {pct}%
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={classStudents.length}
+                  onPageChange={setPage}
+                />
+              </>
             )}
           </div>
         </div>
@@ -1109,105 +1257,113 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm text-left">
-                  <thead>
-                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                      <th className="py-3 px-4 min-w-[160px]">
-                        {lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}
-                      </th>
-                      <th className="py-3 px-3 w-24">{t(lang, 'rollNumber')}</th>
-                      <th className="py-3 px-3 w-28">{t(lang, 'nextYearRollNumber')}</th>
-                      <th className="py-3 px-3 w-36">{t(lang, 'classSelector')}</th>
-                      <th className="py-3 px-3 w-28">{t(lang, 'section')}</th>
-                      <th className="py-3 px-3 w-40">{t(lang, 'promotionStatus')}</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st) => {
-                      const d = rollDrafts[st.id] || {
-                        rollNumber: '',
-                        nextYearRollNumber: '',
-                        classLevel: selectedClass,
-                        section: '',
-                        promotionStatus: '',
-                      };
-                      return (
-                        <tr
-                          key={st.id}
-                          className={
-                            dirtyRollIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'
-                          }
-                        >
-                          <td className="py-2 px-4 font-medium text-slate-900">
-                            {st.studentNameBn || st.studentNameEn}
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              type="text"
-                              value={d.rollNumber}
-                              onChange={(e) =>
-                                handleRollFieldChange(st.id, 'rollNumber', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 font-mono tabular-nums border border-stone-300 rounded-md"
-                            />
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              type="text"
-                              value={d.nextYearRollNumber}
-                              onChange={(e) =>
-                                handleRollFieldChange(st.id, 'nextYearRollNumber', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 font-mono tabular-nums border border-stone-300 rounded-md"
-                            />
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <select
-                              value={d.classLevel}
-                              onChange={(e) =>
-                                handleRollFieldChange(st.id, 'classLevel', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 bg-white border border-stone-300 rounded-md"
-                            >
-                              {CLASS_LEVELS.map((cls) => (
-                                <option key={cls} value={cls}>
-                                  {getClassLabel(cls, lang)}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <input
-                              type="text"
-                              value={d.section}
-                              onChange={(e) =>
-                                handleRollFieldChange(st.id, 'section', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 border border-stone-300 rounded-md"
-                            />
-                          </td>
-                          <td className="py-1.5 px-3">
-                            <select
-                              value={d.promotionStatus}
-                              onChange={(e) =>
-                                handleRollFieldChange(st.id, 'promotionStatus', e.target.value)
-                              }
-                              className="w-full px-2.5 py-1.5 bg-white border border-stone-300 rounded-md"
-                            >
-                              <option value="">—</option>
-                              <option value="Promoted">Promoted</option>
-                              <option value="Retained">Retained</option>
-                              <option value="Graduated">Graduated</option>
-                              <option value="Transferred">Transferred</option>
-                            </select>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4 min-w-[160px]">
+                          {lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}
+                        </th>
+                        <th className="py-3 px-3 w-24">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-3 w-28">{t(lang, 'nextYearRollNumber')}</th>
+                        <th className="py-3 px-3 w-36">{t(lang, 'classSelector')}</th>
+                        <th className="py-3 px-3 w-28">{t(lang, 'section')}</th>
+                        <th className="py-3 px-3 w-40">{t(lang, 'promotionStatus')}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedClassStudents.map((st) => {
+                        const d = rollDrafts[st.id] || {
+                          rollNumber: '',
+                          nextYearRollNumber: '',
+                          classLevel: selectedClass,
+                          section: '',
+                          promotionStatus: '',
+                        };
+                        return (
+                          <tr
+                            key={st.id}
+                            className={
+                              dirtyRollIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'
+                            }
+                          >
+                            <td className="py-2 px-4 font-medium text-slate-900">
+                              {st.studentNameBn || st.studentNameEn}
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <input
+                                type="text"
+                                value={d.rollNumber}
+                                onChange={(e) =>
+                                  handleRollFieldChange(st.id, 'rollNumber', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 font-mono tabular-nums border border-stone-300 rounded-md"
+                              />
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <input
+                                type="text"
+                                value={d.nextYearRollNumber}
+                                onChange={(e) =>
+                                  handleRollFieldChange(st.id, 'nextYearRollNumber', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 font-mono tabular-nums border border-stone-300 rounded-md"
+                              />
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <select
+                                value={d.classLevel}
+                                onChange={(e) =>
+                                  handleRollFieldChange(st.id, 'classLevel', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 bg-white border border-stone-300 rounded-md"
+                              >
+                                {CLASS_LEVELS.map((cls) => (
+                                  <option key={cls} value={cls}>
+                                    {getClassLabel(cls, lang)}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <input
+                                type="text"
+                                value={d.section}
+                                onChange={(e) =>
+                                  handleRollFieldChange(st.id, 'section', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 border border-stone-300 rounded-md"
+                              />
+                            </td>
+                            <td className="py-1.5 px-3">
+                              <select
+                                value={d.promotionStatus}
+                                onChange={(e) =>
+                                  handleRollFieldChange(st.id, 'promotionStatus', e.target.value)
+                                }
+                                className="w-full px-2.5 py-1.5 bg-white border border-stone-300 rounded-md"
+                              >
+                                <option value="">—</option>
+                                <option value="Promoted">Promoted</option>
+                                <option value="Retained">Retained</option>
+                                <option value="Graduated">Graduated</option>
+                                <option value="Transferred">Transferred</option>
+                              </select>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={classStudents.length}
+                  onPageChange={setPage}
+                />
+              </>
             )}
           </div>
         </div>
@@ -1262,63 +1418,71 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                   : 'Configure subject assessment fields in the Admin Panel.'}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm text-left">
-                  <thead>
-                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                      <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
-                      <th className="py-3 px-4">{lang === 'bn' ? 'নাম' : 'Student Name'}</th>
-                      {activeSubjectDoc.fields.map((fld) => (
-                        <th key={fld.fieldId} className="py-3 px-3 min-w-[140px]">
-                          {fld.label}
-                          {fld.maxMarks ? ` (${fld.maxMarks})` : ''}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st) => (
-                      <tr
-                        key={st.id}
-                        className={
-                          dirtySubjValIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'
-                        }
-                      >
-                        <td className="py-2 px-4 font-mono tabular-nums font-semibold">
-                          {st.rollNumber}
-                        </td>
-                        <td className="py-2 px-4 font-medium text-slate-900">
-                          {st.studentNameBn || st.studentNameEn}
-                        </td>
-                        {activeSubjectDoc.fields.map((fld) => {
-                          const key = `${activeSubjectDoc.id}__${fld.fieldId}`;
-                          const val = subjValDrafts[st.id]?.[key] ?? '';
-                          return (
-                            <td key={key} className="py-1.5 px-3">
-                              <input
-                                type={fld.fieldType === 'NUMBER' ? 'number' : 'text'}
-                                value={String(val)}
-                                onChange={(e) => {
-                                  const nextVal =
-                                    fld.fieldType === 'NUMBER' && e.target.value !== ''
-                                      ? Number(e.target.value)
-                                      : e.target.value;
-                                  setSubjValDrafts((p) => ({
-                                    ...p,
-                                    [st.id]: { ...(p[st.id] || {}), [key]: nextVal },
-                                  }));
-                                  setDirtySubjValIds((p) => new Set(p).add(st.id));
-                                }}
-                                className="w-full px-2.5 py-1.5 text-sm border border-stone-300 rounded-md"
-                              />
-                            </td>
-                          );
-                        })}
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4">{lang === 'bn' ? 'নাম' : 'Student Name'}</th>
+                        {activeSubjectDoc.fields.map((fld) => (
+                          <th key={fld.fieldId} className="py-3 px-3 min-w-[140px]">
+                            {fld.label}
+                            {fld.maxMarks ? ` (${fld.maxMarks})` : ''}
+                          </th>
+                        ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedClassStudents.map((st) => (
+                        <tr
+                          key={st.id}
+                          className={
+                            dirtySubjValIds.has(st.id) ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'
+                          }
+                        >
+                          <td className="py-2 px-4 font-mono tabular-nums font-semibold">
+                            {st.rollNumber}
+                          </td>
+                          <td className="py-2 px-4 font-medium text-slate-900">
+                            {st.studentNameBn || st.studentNameEn}
+                          </td>
+                          {activeSubjectDoc.fields.map((fld) => {
+                            const key = `${activeSubjectDoc.id}__${fld.fieldId}`;
+                            const val = subjValDrafts[st.id]?.[key] ?? '';
+                            return (
+                              <td key={key} className="py-1.5 px-3">
+                                <input
+                                  type={fld.fieldType === 'NUMBER' ? 'number' : 'text'}
+                                  value={String(val)}
+                                  onChange={(e) => {
+                                    const nextVal =
+                                      fld.fieldType === 'NUMBER' && e.target.value !== ''
+                                        ? Number(e.target.value)
+                                        : e.target.value;
+                                    setSubjValDrafts((p) => ({
+                                      ...p,
+                                      [st.id]: { ...(p[st.id] || {}), [key]: nextVal },
+                                    }));
+                                    setDirtySubjValIds((p) => new Set(p).add(st.id));
+                                  }}
+                                  className="w-full px-2.5 py-1.5 text-sm border border-stone-300 rounded-md"
+                                />
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={classStudents.length}
+                  onPageChange={setPage}
+                />
+              </>
             )}
           </div>
         </div>
@@ -1355,66 +1519,74 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm text-left">
-                  <thead>
-                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                      <th className="py-3 px-4 w-24">{t(lang, 'meritPosition')}</th>
-                      <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
-                      <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
-                      <th className="py-3 px-4 text-right">GPA / Grade</th>
-                      <th className="py-3 px-4 text-center">Status</th>
-                      <th className="py-3 px-4 text-right"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-stone-100">
-                    {meritSortedRows.map(({ st, t1, t2, t3, merit }) => (
-                      <tr
-                        key={st.id}
-                        onClick={() => onOpenStudentProfile?.(st.id)}
-                        className="hover:bg-stone-50 cursor-pointer"
-                      >
-                        <td className="py-2.5 px-4 font-mono tabular-nums font-bold text-emerald-800">
-                          {merit ? `#${merit}` : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
-                          {st.rollNumber}
-                        </td>
-                        <td className="py-2.5 px-4 font-medium text-slate-900">
-                          {st.studentNameBn || st.studentNameEn}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                          {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                          {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
-                          {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                          {t3.scoredSubjects > 0 ? `${t3.gpa.toFixed(2)} (${t3.grade})` : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-center text-xs font-semibold">
-                          {t3.scoredSubjects === 0 ? (
-                            <span className="text-slate-400">—</span>
-                          ) : t3.passed ? (
-                            <span className="text-emerald-700">{t(lang, 'passedLabel')}</span>
-                          ) : (
-                            <span className="text-rose-600">{t(lang, 'failedLabel')}</span>
-                          )}
-                        </td>
-                        <td className="py-2.5 px-4 text-right text-emerald-700">
-                          <ExternalLink className="w-4 h-4 inline" />
-                        </td>
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4 w-24">{t(lang, 'meritPosition')}</th>
+                        <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
+                        <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
+                        <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
+                        <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
+                        <th className="py-3 px-4 text-right">GPA / Grade</th>
+                        <th className="py-3 px-4 text-center">Status</th>
+                        <th className="py-3 px-4 text-right"></th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedMeritRows.map(({ st, t1, t2, t3, merit }) => (
+                        <tr
+                          key={st.id}
+                          onClick={() => onOpenStudentProfile?.(st.id)}
+                          className="hover:bg-stone-50 cursor-pointer"
+                        >
+                          <td className="py-2.5 px-4 font-mono tabular-nums font-bold text-emerald-800">
+                            {merit ? `#${merit}` : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
+                            {st.rollNumber}
+                          </td>
+                          <td className="py-2.5 px-4 font-medium text-slate-900">
+                            {st.studentNameBn || st.studentNameEn}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                            {t3.scoredSubjects > 0 ? `${t3.gpa.toFixed(2)} (${t3.grade})` : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-center text-xs font-semibold">
+                            {t3.scoredSubjects === 0 ? (
+                              <span className="text-slate-400">—</span>
+                            ) : t3.passed ? (
+                              <span className="text-emerald-700">{t(lang, 'passedLabel')}</span>
+                            ) : (
+                              <span className="text-rose-600">{t(lang, 'failedLabel')}</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-right text-emerald-700">
+                            <ExternalLink className="w-4 h-4 inline" />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={meritSortedRows.length}
+                  onPageChange={setPage}
+                />
+              </>
             )}
           </div>
         </div>

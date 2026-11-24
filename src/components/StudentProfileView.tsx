@@ -18,14 +18,16 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
+  buildChunkedExamPatchPayloads,
   buildPendingChangePayload,
+  clampText,
   FIRESTORE_LIMITS,
+  formatFirestoreError,
   sanitizeStringRecordMap,
-  validateAndBuildStudentPayload,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
@@ -67,6 +69,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     subjects,
     customFields,
     attendanceLogs,
+    setSyncing,
+    activateModule,
   } = useApp();
 
   const isAdmin = session?.role === 'ADMIN';
@@ -99,6 +103,12 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
   );
+
+  useEffect(() => {
+    if (activeTab === 'attendance') {
+      activateModule('attendance');
+    }
+  }, [activeTab, activateModule]);
 
   // Marksheet Tab State
   const [activeExamId, setActiveExamId] = useState<ExamTermId>('exam_3');
@@ -384,6 +394,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     if (!instances) return;
 
     setSavingMarks(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
@@ -395,56 +406,79 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       }
 
       if (isAdmin) {
-        await updateDoc(
-          doc(instances.db, 'schools', session.schoolId, 'students', student.id),
-          {
-            examResults: sanitizedExamResults,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          }
+        await withWriteTimeout(
+          updateDoc(
+            doc(instances.db, 'schools', session.schoolId, 'students', student.id),
+            {
+              examResults: sanitizedExamResults,
+              lastUpdatedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
+              updatedAt: serverTimestamp(),
+            }
+          )
         );
         setEditMode('none');
-        setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+        setDraftMarks({});
+        setBanner({ type: 'success', text: t(lang, 'marksSavedSuccess') });
       } else {
-        const updatedStudentObj: Partial<StudentDoc> = {
-          ...student,
-          examResults: sanitizedExamResults,
-        };
-        validateAndBuildStudentPayload(
-          updatedStudentObj,
-          session.schoolId,
-          session.name,
-          student.createdAt
-        );
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_UPDATE',
-          targetId: student.id,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Marks Update: ${student.studentNameBn || student.studentNameEn} (Roll ${student.rollNumber})`,
-          detailsText: `${student.classLevel} (${student.academicYear})`,
-          payloadJson: JSON.stringify({
-            ...updatedStudentObj,
-            id: student.id,
+        // Send ONLY compact examResults key patch (NO full student object, NO photoBase64)
+        const patch: Record<string, string> = {};
+        const editableTerms = editMode === 'allTerms' ? TERM_ORDER : [activeExamId];
+        for (const termId of editableTerms) {
+          for (const subj of classSubjects) {
+            if (!subj?.subjectId) continue;
+            for (const suffix of ['__cont', '__sum', '']) {
+              const k = `${termId}__${subj.subjectId}${suffix}`;
+              const nextVal = sanitizedExamResults[k];
+              const hadOld = safeExamResults[k] !== undefined && safeExamResults[k] !== '';
+              if (nextVal !== undefined) {
+                patch[k] = nextVal;
+              } else if (hadOld) {
+                patch[k] = '';
+              }
+            }
+          }
+        }
+
+        if (Object.keys(patch).length === 0) {
+          setEditMode('none');
+          setDraftMarks({});
+          return;
+        }
+
+        const chunks = buildChunkedExamPatchPayloads([{ studentId: student.id, patch }]);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const chunk = chunks[idx];
+          const pendingDoc = buildPendingChangePayload({
             schoolId: session.schoolId,
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `${student.id}_${Date.now()}_${idx + 1}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Marks Update: ${student.studentNameBn || student.studentNameEn} (Roll ${student.rollNumber})`,
+            detailsText: `${student.classLevel} (${student.academicYear})`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
+
         setEditMode('none');
-        setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+        setDraftMarks({});
+        setBanner({ type: 'success', text: t(lang, 'marksSubmittedSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSavingMarks(false);
+      setSyncing(false);
     }
   };
 
@@ -492,8 +526,9 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     }
   };
 
-  const handleExportStudentExcel = () => {
+  const handleExportStudentExcel = async () => {
     if (!student) return;
+    const XLSX = await import('xlsx');
     const headerRow1 = [
       'Subject',
       'Full Marks',
@@ -589,6 +624,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     if (!instances) return;
 
     setSavingYearly(true);
+    setSyncing(true);
     setBanner(null);
     try {
       const patch = {
@@ -597,56 +633,59 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         classLevel: yearlyDraft.classLevel,
         section: yearlyDraft.section.trim(),
         promotionStatus: yearlyDraft.promotionStatus.trim(),
-        totalSchoolDays: Math.max(0, Number(yearlyDraft.totalSchoolDays) || 0),
-        daysPresent: Math.max(0, Number(yearlyDraft.daysPresent) || 0),
+        totalSchoolDays: Math.max(0, Math.trunc(Number(yearlyDraft.totalSchoolDays) || 0)),
+        daysPresent: Math.max(0, Math.trunc(Number(yearlyDraft.daysPresent) || 0)),
       };
 
       if (isAdmin) {
-        await updateDoc(
-          doc(instances.db, 'schools', session.schoolId, 'students', student.id),
-          {
-            ...patch,
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          }
+        await withWriteTimeout(
+          updateDoc(
+            doc(instances.db, 'schools', session.schoolId, 'students', student.id),
+            {
+              ...patch,
+              lastUpdatedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
+              updatedAt: serverTimestamp(),
+            }
+          )
         );
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const updatedObj: Partial<StudentDoc> = { ...student, ...patch };
-        validateAndBuildStudentPayload(
-          updatedObj,
-          session.schoolId,
-          session.name,
-          student.createdAt
-        );
         const pendingDoc = buildPendingChangePayload({
           schoolId: session.schoolId,
-          entityType: 'STUDENT_UPDATE',
+          entityType: 'STUDENT_BATCH_UPDATE',
           targetId: student.id,
           submittedByDeviceId: session.deviceId,
           submittedByName: session.name,
           summary: `Yearly/Promotion Update: ${student.studentNameBn || student.studentNameEn}`,
           detailsText: `Roll ${patch.rollNumber}, Status: ${patch.promotionStatus || '-'}`,
           payloadJson: JSON.stringify({
-            ...updatedObj,
-            id: student.id,
-            schoolId: session.schoolId,
+            kind: 'ROLL_PROMOTION',
+            updates: [
+              {
+                studentId: student.id,
+                studentName: clampText(student.studentNameBn || student.studentNameEn, 80),
+                fieldsPatch: patch,
+              },
+            ],
           }),
           status: 'PENDING',
         });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
+        await withWriteTimeout(
+          addDoc(
+            collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+            pendingDoc
+          )
         );
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSavingYearly(false);
+      setSyncing(false);
     }
   };
 
@@ -810,6 +849,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             <img
               src={photo}
               alt={student.studentNameEn || student.studentNameBn}
+              loading="lazy"
+              decoding="async"
               referrerPolicy="no-referrer"
               className="w-16 h-16 rounded-xl object-cover border border-stone-200 shrink-0"
             />

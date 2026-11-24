@@ -1,15 +1,21 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, doc, serverTimestamp, writeBatch } from 'firebase/firestore';
+import { addDoc, collection, doc, serverTimestamp } from 'firebase/firestore';
 import { Save, Send, X } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
+  buildChunkedArrayPendingPayloads,
   buildPendingChangePayload,
+  clampText,
+  commitBatchesInChunks,
   FIRESTORE_LIMITS,
+  formatFirestoreError,
   sanitizeStringRecordMap,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
 import { matchesClassScope } from '../lib/schoolUtils';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
 export const BatchFieldsView: React.FC = () => {
   const {
@@ -20,6 +26,7 @@ export const BatchFieldsView: React.FC = () => {
     customFields,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const isAdmin = session?.role === 'ADMIN';
@@ -30,6 +37,7 @@ export const BatchFieldsView: React.FC = () => {
   >({});
   const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
+  const [page, setPage] = useState(1);
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
   );
@@ -43,6 +51,15 @@ export const BatchFieldsView: React.FC = () => {
       ),
     [students, selectedAcademicYear, selectedClass]
   );
+
+  useEffect(() => {
+    setPage(1);
+  }, [selectedAcademicYear, selectedClass, mode, selectedSubjectId]);
+
+  const pagedStudents = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return classStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [classStudents, page]);
 
   const classSubjectsWithFields = useMemo(
     () =>
@@ -107,13 +124,14 @@ export const BatchFieldsView: React.FC = () => {
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
       const updates: Array<{
         studentId: string;
         studentName: string;
-        values: Record<string, string | number | boolean>;
+        values: Record<string, string>;
       }> = [];
 
       for (const st of classStudents) {
@@ -132,62 +150,66 @@ export const BatchFieldsView: React.FC = () => {
 
         updates.push({
           studentId: st.id,
-          studentName: st.studentNameBn || st.studentNameEn,
+          studentName: clampText(st.studentNameBn || st.studentNameEn, 80),
           values: sanitized,
         });
       }
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
+        const actorName = clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS);
+        await commitBatchesInChunks(instances.db, updates, (batch, u) => {
           const ref = doc(instances.db, 'schools', session.schoolId, 'students', u.studentId);
           batch.update(ref, {
             ...(mode === 'custom'
               ? { customValues: u.values }
               : { subjectValues: u.values }),
-            lastUpdatedByName: session.name,
+            lastUpdatedByName: actorName,
             updatedAt: serverTimestamp(),
           });
-        }
-        await batch.commit();
+        });
         setDirtyIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `${selectedAcademicYear}_${selectedClass}_${mode}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Batch ${mode === 'custom' ? 'Custom Fields' : activeSubject?.name || 'Subject Fields'} (${selectedClass})`,
-          detailsText: `${updates.length} student records updated`,
-          payloadJson: JSON.stringify({
-            kind: mode === 'custom' ? 'CUSTOM_VALUES' : 'SUBJECT_VALUES',
-            updates: updates.map((u) => ({
-              studentId: u.studentId,
-              studentName: u.studentName,
-              ...(mode === 'custom'
-                ? { customValues: u.values }
-                : { subjectValues: u.values }),
-            })),
-          }),
-          status: 'PENDING',
-        });
-
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+        const kind = mode === 'custom' ? 'CUSTOM_VALUES' : 'SUBJECT_VALUES';
+        const formatted = updates.map((u) => ({
+          studentId: u.studentId,
+          studentName: u.studentName,
+          ...(mode === 'custom'
+            ? { customValues: u.values }
+            : { subjectValues: u.values }),
+        }));
+        const chunks = buildChunkedArrayPendingPayloads(kind, 'updates', formatted);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const chunk = chunks[idx];
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `${selectedAcademicYear}_${selectedClass}_${mode}_${idx + 1}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Batch ${mode === 'custom' ? 'Custom Fields' : activeSubject?.name || 'Subject Fields'} (${selectedClass})${chunks.length > 1 ? ` [${idx + 1}/${chunks.length}]` : ''}`,
+            detailsText: `${chunk.itemCount} student records updated`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setDirtyIds(new Set());
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -291,130 +313,139 @@ export const BatchFieldsView: React.FC = () => {
               : 'No subjects with custom assessment fields configured for this class.'}
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left border-collapse">
-              <thead>
-                <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                  <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
-                  <th className="py-3 px-4 min-w-[180px]">
-                    {lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}
-                  </th>
-                  {mode === 'custom'
-                    ? customFields.map((cf) => (
-                        <th key={cf.id} className="py-3 px-3 min-w-[140px]">
-                          <div>{cf.label}</div>
-                          <div className="text-[11px] font-normal text-slate-400">
-                            {cf.category}
-                          </div>
-                        </th>
-                      ))
-                    : activeSubject?.fields.map((fld) => (
-                        <th key={fld.fieldId} className="py-3 px-3 min-w-[140px]">
-                          <div>{fld.label}</div>
-                          {fld.maxMarks ? (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left border-collapse">
+                <thead>
+                  <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                    <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                    <th className="py-3 px-4 min-w-[180px]">
+                      {lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}
+                    </th>
+                    {mode === 'custom'
+                      ? customFields.map((cf) => (
+                          <th key={cf.id} className="py-3 px-3 min-w-[140px]">
+                            <div>{cf.label}</div>
                             <div className="text-[11px] font-normal text-slate-400">
-                              Max {fld.maxMarks}
+                              {cf.category}
                             </div>
-                          ) : null}
-                        </th>
-                      ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-100">
-                {classStudents.map((st) => {
-                  const isDirty = dirtyIds.has(st.id);
-                  const rowMap = drafts[st.id] || {};
-                  return (
-                    <tr
-                      key={st.id}
-                      className={isDirty ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}
-                    >
-                      <td className="py-2 px-4 font-mono tabular-nums font-semibold text-slate-900">
-                        {st.rollNumber}
-                      </td>
-                      <td className="py-2 px-4 font-medium text-slate-900">
-                        {st.studentNameBn || st.studentNameEn}
-                      </td>
-                      {mode === 'custom'
-                        ? customFields.map((cf) => {
-                            const val = rowMap[cf.id] ?? '';
-                            return (
-                              <td key={cf.id} className="py-1.5 px-3">
-                                {cf.fieldType === 'YES_NO' ? (
-                                  <select
-                                    value={String(val)}
-                                    onChange={(e) =>
-                                      handleFieldChange(st.id, cf.id, e.target.value)
-                                    }
-                                    className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
-                                  >
-                                    <option value="">—</option>
-                                    <option value="Yes">Yes</option>
-                                    <option value="No">No</option>
-                                  </select>
-                                ) : (
-                                  <input
-                                    type={cf.fieldType === 'NUMBER' ? 'number' : 'text'}
-                                    value={String(val)}
-                                    onChange={(e) =>
-                                      handleFieldChange(
-                                        st.id,
-                                        cf.id,
-                                        cf.fieldType === 'NUMBER' && e.target.value !== ''
-                                          ? Number(e.target.value)
-                                          : e.target.value
-                                      )
-                                    }
-                                    className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
-                                  />
-                                )}
-                              </td>
-                            );
-                          })
-                        : activeSubject?.fields.map((fld) => {
-                            const key = `${activeSubject.id}__${fld.fieldId}`;
-                            const val = rowMap[key] ?? '';
-                            return (
-                              <td key={key} className="py-1.5 px-3">
-                                {fld.fieldType === 'YES_NO' ? (
-                                  <select
-                                    value={String(val)}
-                                    onChange={(e) =>
-                                      handleFieldChange(st.id, key, e.target.value)
-                                    }
-                                    className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
-                                  >
-                                    <option value="">—</option>
-                                    <option value="Yes">Yes</option>
-                                    <option value="No">No</option>
-                                  </select>
-                                ) : (
-                                  <input
-                                    type={fld.fieldType === 'NUMBER' ? 'number' : 'text'}
-                                    value={String(val)}
-                                    onChange={(e) =>
-                                      handleFieldChange(
-                                        st.id,
-                                        key,
-                                        fld.fieldType === 'NUMBER' && e.target.value !== ''
-                                          ? Number(e.target.value)
-                                          : e.target.value
-                                      )
-                                    }
-                                    className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
-                                  />
-                                )}
-                              </td>
-                            );
-                          })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                          </th>
+                        ))
+                      : activeSubject?.fields.map((fld) => (
+                          <th key={fld.fieldId} className="py-3 px-3 min-w-[140px]">
+                            <div>{fld.label}</div>
+                            {fld.maxMarks ? (
+                              <div className="text-[11px] font-normal text-slate-400">
+                                Max {fld.maxMarks}
+                              </div>
+                            ) : null}
+                          </th>
+                        ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-100">
+                  {pagedStudents.map((st) => {
+                    const isDirty = dirtyIds.has(st.id);
+                    const rowMap = drafts[st.id] || {};
+                    return (
+                      <tr
+                        key={st.id}
+                        className={isDirty ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}
+                      >
+                        <td className="py-2 px-4 font-mono tabular-nums font-semibold text-slate-900">
+                          {st.rollNumber}
+                        </td>
+                        <td className="py-2 px-4 font-medium text-slate-900">
+                          {st.studentNameBn || st.studentNameEn}
+                        </td>
+                        {mode === 'custom'
+                          ? customFields.map((cf) => {
+                              const val = rowMap[cf.id] ?? '';
+                              return (
+                                <td key={cf.id} className="py-1.5 px-3">
+                                  {cf.fieldType === 'YES_NO' ? (
+                                    <select
+                                      value={String(val)}
+                                      onChange={(e) =>
+                                        handleFieldChange(st.id, cf.id, e.target.value)
+                                      }
+                                      className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
+                                    >
+                                      <option value="">—</option>
+                                      <option value="Yes">Yes</option>
+                                      <option value="No">No</option>
+                                    </select>
+                                  ) : (
+                                    <input
+                                      type={cf.fieldType === 'NUMBER' ? 'number' : 'text'}
+                                      value={String(val)}
+                                      onChange={(e) =>
+                                        handleFieldChange(
+                                          st.id,
+                                          cf.id,
+                                          cf.fieldType === 'NUMBER' && e.target.value !== ''
+                                            ? Number(e.target.value)
+                                            : e.target.value
+                                        )
+                                      }
+                                      className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
+                                    />
+                                  )}
+                                </td>
+                              );
+                            })
+                          : activeSubject?.fields.map((fld) => {
+                              const key = `${activeSubject.id}__${fld.fieldId}`;
+                              const val = rowMap[key] ?? '';
+                              return (
+                                <td key={key} className="py-1.5 px-3">
+                                  {fld.fieldType === 'YES_NO' ? (
+                                    <select
+                                      value={String(val)}
+                                      onChange={(e) =>
+                                        handleFieldChange(st.id, key, e.target.value)
+                                      }
+                                      className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
+                                    >
+                                      <option value="">—</option>
+                                      <option value="Yes">Yes</option>
+                                      <option value="No">No</option>
+                                    </select>
+                                  ) : (
+                                    <input
+                                      type={fld.fieldType === 'NUMBER' ? 'number' : 'text'}
+                                      value={String(val)}
+                                      onChange={(e) =>
+                                        handleFieldChange(
+                                          st.id,
+                                          key,
+                                          fld.fieldType === 'NUMBER' && e.target.value !== ''
+                                            ? Number(e.target.value)
+                                            : e.target.value
+                                        )
+                                      }
+                                      className="w-full px-2.5 py-1.5 text-sm bg-white border border-stone-300 rounded-md"
+                                    />
+                                  )}
+                                </td>
+                              );
+                            })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              lang={lang}
+              page={page}
+              totalItems={classStudents.length}
+              onPageChange={setPage}
+            />
+          </>
         )}
       </div>
     </div>
   );
 };
+

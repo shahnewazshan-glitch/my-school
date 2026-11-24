@@ -3,8 +3,8 @@ import {
   collection,
   doc,
   getDoc,
+  limit,
   onSnapshot,
-  onSnapshotsInSync,
   orderBy,
   query,
   where,
@@ -34,6 +34,8 @@ import {
 const SESSION_STORAGE_KEY = 'myschool_companion_session_v1';
 const LANG_STORAGE_KEY = 'myschool_companion_lang_v1';
 
+export type LazyModuleKey = 'attendance' | 'pending' | 'comms';
+
 interface AppContextValue {
   lang: Language;
   setLang: (lang: Language) => void;
@@ -46,12 +48,15 @@ interface AppContextValue {
   parentNotices: ParentNoticeDoc[];
   messages: MessageDoc[];
   attendanceLogs: AttendanceLogDoc[];
+  loadedModules: Record<LazyModuleKey, boolean>;
+  activateModule: (mod: LazyModuleKey) => void;
   selectedAcademicYear: number;
   setSelectedAcademicYear: (yr: number) => void;
   selectedClass: string;
   setSelectedClass: (cls: string) => void;
   isOnline: boolean;
   hasPendingSync: boolean;
+  setSyncing: (active: boolean) => void;
   dataLoading: boolean;
   authMessage: { type: 'error' | 'revoked'; text: string } | null;
   clearAuthMessage: () => void;
@@ -94,6 +99,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [parentNotices, setParentNotices] = useState<ParentNoticeDoc[]>([]);
   const [messages, setMessages] = useState<MessageDoc[]>([]);
   const [attendanceLogs, setAttendanceLogs] = useState<AttendanceLogDoc[]>([]);
+  const [loadedModules, setLoadedModules] = useState<Record<LazyModuleKey, boolean>>({
+    attendance: false,
+    pending: false,
+    comms: false,
+  });
+
   const [selectedAcademicYear, setSelectedAcademicYear] = useState<number>(new Date().getFullYear());
   const [selectedClass, setSelectedClass] = useState<string>(CLASS_LEVELS[1]); // Class 1 default
   const [isOnline, setIsOnline] = useState<boolean>(() =>
@@ -105,7 +116,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     null
   );
 
-  const pendingFlagsRef = useRef<Record<string, boolean>>({});
+  const syncCountRef = useRef<number>(0);
+  const syncSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const yearInitializedRef = useRef<boolean>(false);
 
   const setLang = useCallback((next: Language) => {
@@ -119,6 +131,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const clearAuthMessage = useCallback(() => setAuthMessage(null), []);
 
+  const setSyncing = useCallback((active: boolean) => {
+    if (syncSafetyTimerRef.current) {
+      clearTimeout(syncSafetyTimerRef.current);
+      syncSafetyTimerRef.current = null;
+    }
+
+    if (active) {
+      syncCountRef.current += 1;
+      setHasPendingSync(true);
+      // Safety net so header indicator can NEVER stay pinned on "Syncing..."
+      syncSafetyTimerRef.current = setTimeout(() => {
+        syncCountRef.current = 0;
+        setHasPendingSync(false);
+      }, 30000);
+    } else {
+      syncCountRef.current = Math.max(0, syncCountRef.current - 1);
+      if (syncCountRef.current === 0) {
+        setHasPendingSync(false);
+      }
+    }
+  }, []);
+
+  const activateModule = useCallback((mod: LazyModuleKey) => {
+    setLoadedModules((prev) => (prev[mod] ? prev : { ...prev, [mod]: true }));
+  }, []);
+
   const clearSessionState = useCallback(() => {
     setSession(null);
     setSchool(null);
@@ -129,8 +167,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setParentNotices([]);
     setMessages([]);
     setAttendanceLogs([]);
+    setLoadedModules({ attendance: false, pending: false, comms: false });
     yearInitializedRef.current = false;
-    pendingFlagsRef.current = {};
+    syncCountRef.current = 0;
+    if (syncSafetyTimerRef.current) {
+      clearTimeout(syncSafetyTimerRef.current);
+      syncSafetyTimerRef.current = null;
+    }
     setHasPendingSync(false);
     try {
       localStorage.removeItem(SESSION_STORAGE_KEY);
@@ -144,12 +187,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setAuthMessage(null);
   }, [clearSessionState]);
 
-  const markPendingFlag = useCallback((key: string, pending: boolean) => {
-    pendingFlagsRef.current[key] = pending;
-    const anyPending = Object.values(pendingFlagsRef.current).some(Boolean);
-    setHasPendingSync(anyPending);
-  }, []);
-
   // Browser online/offline tracking
   useEffect(() => {
     const onOnline = () => setIsOnline(true);
@@ -160,17 +197,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
     };
-  }, []);
-
-  // Firestore snapshotsInSync tracking
-  useEffect(() => {
-    const instances = getFirebaseInstances();
-    if (!instances) return;
-    const unsub = onSnapshotsInSync(instances.db, () => {
-      const anyPending = Object.values(pendingFlagsRef.current).some(Boolean);
-      setHasPendingSync(anyPending);
-    });
-    return () => unsub();
   }, []);
 
   const login = useCallback(
@@ -244,7 +270,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [lang]
   );
 
-  // Real-time listeners + Live Session Enforcement when logged in
+  // Core startup listeners: ONLY school, students, subjects, customFields (NEVER appReleaseChunks)
   useEffect(() => {
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
@@ -256,10 +282,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     // 1. Real-time School Doc + Live Session Revocation Enforcement
     const unsubSchool = onSnapshot(
       doc(db, 'schools', schoolId),
-      { includeMetadataChanges: true },
       (snap) => {
-        markPendingFlag('school', snap.metadata.hasPendingWrites);
-
         if (!snap.exists()) {
           clearSessionState();
           setAuthMessage({ type: 'revoked', text: t(lang, 'accessRevoked') });
@@ -325,97 +348,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     // 2. Students
     const unsubStudents = onSnapshot(
       collection(db, 'schools', schoolId, 'students'),
-      { includeMetadataChanges: true },
       (snap) => {
-        markPendingFlag('students', snap.metadata.hasPendingWrites);
         const list: StudentDoc[] = snap.docs.map((d) => ({
           ...(d.data() as Omit<StudentDoc, 'id'>),
           id: d.id,
         }));
         list.sort(compareRollNumbers);
         setStudents(list);
-      }
+      },
+      (err) => console.error('Students snapshot error:', err)
     );
 
     // 3. Subjects
     const unsubSubjects = onSnapshot(
       collection(db, 'schools', schoolId, 'subjects'),
-      { includeMetadataChanges: true },
       (snap) => {
-        markPendingFlag('subjects', snap.metadata.hasPendingWrites);
         const list: SubjectDoc[] = snap.docs.map((d) => ({
           ...(d.data() as Omit<SubjectDoc, 'id'>),
           id: d.id,
         }));
         list.sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
         setSubjects(list);
-      }
+      },
+      (err) => console.error('Subjects snapshot error:', err)
     );
 
     // 4. Custom Fields
     const unsubCustomFields = onSnapshot(
       collection(db, 'schools', schoolId, 'customFields'),
-      { includeMetadataChanges: true },
       (snap) => {
-        markPendingFlag('customFields', snap.metadata.hasPendingWrites);
         const list: CustomFieldDoc[] = snap.docs.map((d) => ({
           ...(d.data() as Omit<CustomFieldDoc, 'id'>),
           id: d.id,
         }));
         list.sort((a, b) => (a.category || '').localeCompare(b.category || ''));
         setCustomFields(list);
-      }
-    );
-
-    // 5. Pending Changes
-    const unsubPending = onSnapshot(
-      query(
-        collection(db, 'schools', schoolId, 'pendingChanges'),
-        orderBy('createdAt', 'desc')
-      ),
-      { includeMetadataChanges: true },
-      (snap) => {
-        markPendingFlag('pendingChanges', snap.metadata.hasPendingWrites);
-        const list: PendingChangeDoc[] = snap.docs.map((d) => ({
-          ...(d.data() as Omit<PendingChangeDoc, 'id'>),
-          id: d.id,
-        }));
-        setPendingChanges(list);
-      }
-    );
-
-    // 6. Parent Notices
-    const unsubNotices = onSnapshot(
-      query(
-        collection(db, 'schools', schoolId, 'parentNotices'),
-        orderBy('createdAt', 'desc')
-      ),
-      { includeMetadataChanges: true },
-      (snap) => {
-        markPendingFlag('parentNotices', snap.metadata.hasPendingWrites);
-        const list: ParentNoticeDoc[] = snap.docs.map((d) => ({
-          ...(d.data() as Omit<ParentNoticeDoc, 'id'>),
-          id: d.id,
-        }));
-        setParentNotices(list);
-      }
-    );
-
-    // 7. Teacher Chat Messages
-    const unsubMessages = onSnapshot(
-      query(
-        collection(db, 'schools', schoolId, 'messages'),
-        orderBy('createdAt', 'asc')
-      ),
-      { includeMetadataChanges: true },
-      (snap) => {
-        markPendingFlag('messages', snap.metadata.hasPendingWrites);
-        const list: MessageDoc[] = snap.docs.map((d) => ({
-          ...(d.data() as Omit<MessageDoc, 'id'>),
-          id: d.id,
-        }));
-        setMessages(list);
-      }
+      },
+      (err) => console.error('CustomFields snapshot error:', err)
     );
 
     return () => {
@@ -423,31 +392,102 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubStudents();
       unsubSubjects();
       unsubCustomFields();
-      unsubPending();
+    };
+  }, [session?.schoolId, session?.phoneNumber, session?.deviceId, session?.passwordHash, clearSessionState, lang]);
+
+  // 5. Lazy Pending Changes (only when Admin Panel / Approvals is opened)
+  useEffect(() => {
+    const instances = getFirebaseInstances();
+    if (!instances || !session || !loadedModules.pending || session.role !== 'ADMIN') return;
+
+    const q = query(
+      collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+      orderBy('createdAt', 'desc'),
+      limit(100)
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: PendingChangeDoc[] = snap.docs.map((d) => ({
+          ...(d.data() as Omit<PendingChangeDoc, 'id'>),
+          id: d.id,
+        }));
+        setPendingChanges(list);
+      },
+      (err) => console.error('PendingChanges snapshot error:', err)
+    );
+    return () => unsub();
+  }, [session?.schoolId, session?.role, loadedModules.pending]);
+
+  // 6 & 7. Lazy Parent Notices & Teacher Chat (latest 30 messages, only when Comms tab opens)
+  useEffect(() => {
+    const instances = getFirebaseInstances();
+    if (!instances || !session || !loadedModules.comms) return;
+
+    const schoolId = session.schoolId;
+
+    const unsubNotices = onSnapshot(
+      query(
+        collection(instances.db, 'schools', schoolId, 'parentNotices'),
+        orderBy('createdAt', 'desc'),
+        limit(50)
+      ),
+      (snap) => {
+        const list: ParentNoticeDoc[] = snap.docs.map((d) => ({
+          ...(d.data() as Omit<ParentNoticeDoc, 'id'>),
+          id: d.id,
+        }));
+        setParentNotices(list);
+      },
+      (err) => console.error('ParentNotices snapshot error:', err)
+    );
+
+    const unsubMessages = onSnapshot(
+      query(
+        collection(instances.db, 'schools', schoolId, 'messages'),
+        orderBy('createdAt', 'desc'),
+        limit(30)
+      ),
+      (snap) => {
+        const list: MessageDoc[] = snap.docs
+          .map((d) => ({
+            ...(d.data() as Omit<MessageDoc, 'id'>),
+            id: d.id,
+          }))
+          .reverse();
+        setMessages(list);
+      },
+      (err) => console.error('Messages snapshot error:', err)
+    );
+
+    return () => {
       unsubNotices();
       unsubMessages();
     };
-  }, [session?.schoolId, session?.phoneNumber, session?.deviceId, session?.passwordHash, clearSessionState, lang, markPendingFlag]);
+  }, [session?.schoolId, loadedModules.comms]);
 
-  // 8. Attendance Logs scoped to selectedAcademicYear
+  // 8. Lazy Attendance Logs scoped to selectedAcademicYear (only when Attendance / Student Attendance tab / Backup opens)
   useEffect(() => {
     const instances = getFirebaseInstances();
-    if (!instances || !session) return;
+    if (!instances || !session || !loadedModules.attendance) return;
 
     const q = query(
       collection(instances.db, 'schools', session.schoolId, 'attendanceLogs'),
       where('academicYear', '==', selectedAcademicYear)
     );
-    const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
-      markPendingFlag('attendanceLogs', snap.metadata.hasPendingWrites);
-      const list: AttendanceLogDoc[] = snap.docs.map((d) => ({
-        ...(d.data() as Omit<AttendanceLogDoc, 'id'>),
-        id: d.id,
-      }));
-      setAttendanceLogs(list);
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: AttendanceLogDoc[] = snap.docs.map((d) => ({
+          ...(d.data() as Omit<AttendanceLogDoc, 'id'>),
+          id: d.id,
+        }));
+        setAttendanceLogs(list);
+      },
+      (err) => console.error('Attendance snapshot error:', err)
+    );
     return () => unsub();
-  }, [session?.schoolId, selectedAcademicYear, markPendingFlag]);
+  }, [session?.schoolId, selectedAcademicYear, loadedModules.attendance]);
 
   const value = useMemo<AppContextValue>(
     () => ({
@@ -462,12 +502,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       parentNotices,
       messages,
       attendanceLogs,
+      loadedModules,
+      activateModule,
       selectedAcademicYear,
       setSelectedAcademicYear,
       selectedClass,
       setSelectedClass,
       isOnline,
       hasPendingSync,
+      setSyncing,
       dataLoading,
       authMessage,
       clearAuthMessage,
@@ -486,10 +529,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       parentNotices,
       messages,
       attendanceLogs,
+      loadedModules,
+      activateModule,
       selectedAcademicYear,
       selectedClass,
       isOnline,
       hasPendingSync,
+      setSyncing,
       dataLoading,
       authMessage,
       clearAuthMessage,

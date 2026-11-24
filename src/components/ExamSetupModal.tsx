@@ -3,7 +3,11 @@ import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { Plus, Save, Trash2, X } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
-import { sanitizeExamConfigs } from '../lib/firestoreValidation';
+import {
+  formatFirestoreError,
+  sanitizeExamConfigs,
+  withWriteTimeout,
+} from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
 import { normalizeExamConfigs } from '../lib/schoolUtils';
 import type { ExamConfig, ExamTermId } from '../types/school';
@@ -21,7 +25,7 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
   onClose,
   onSaved,
 }) => {
-  const { lang, session, school } = useApp();
+  const { lang, session, school, setSyncing } = useApp();
   const [examDrafts, setExamDrafts] = useState<ExamConfig[]>(() =>
     normalizeExamConfigs(school?.examConfigs)
   );
@@ -104,19 +108,23 @@ export const ExamSetupModal: React.FC<ExamSetupModalProps> = ({
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setError(null);
     try {
       const sanitized = sanitizeExamConfigs(examDrafts);
-      await updateDoc(doc(instances.db, 'schools', session.schoolId), {
-        examConfigs: sanitized,
-        updatedAt: serverTimestamp(),
-      });
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', session.schoolId), {
+          examConfigs: sanitized,
+          updatedAt: serverTimestamp(),
+        })
+      );
       onSaved?.();
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(formatFirestoreError(err));
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 

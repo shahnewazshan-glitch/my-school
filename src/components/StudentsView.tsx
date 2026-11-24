@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { addDoc, collection, deleteDoc, doc, setDoc } from 'firebase/firestore';
 import {
   Edit3,
@@ -12,9 +12,11 @@ import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
+  formatFirestoreError,
   validateAndBuildStudentPayload,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
-import { getClassLabel, t } from '../lib/i18n';
+import { getClassLabel, t, type Language } from '../lib/i18n';
 import {
   compareRollNumbers,
   compressImageToBase64,
@@ -23,7 +25,102 @@ import {
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
-import { StudentProfileView } from './StudentProfileView';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
+
+const StudentProfileView = React.lazy(() =>
+  import('./StudentProfileView').then((m) => ({ default: m.StudentProfileView }))
+);
+
+interface StudentRowProps {
+  student: StudentDoc;
+  lang: Language;
+  showAllClasses: boolean;
+  isAdmin: boolean;
+  onSelect: (id: string) => void;
+  onEdit: (student: StudentDoc) => void;
+  onDelete: (student: StudentDoc) => void;
+}
+
+const StudentTableRow = React.memo<StudentRowProps>(
+  ({ student: st, lang, showAllClasses, isAdmin, onSelect, onEdit, onDelete }) => {
+    const photo = formatPhotoSrc(st.photoBase64);
+    return (
+      <tr
+        onClick={() => onSelect(st.id)}
+        className="hover:bg-emerald-50/40 transition-colors cursor-pointer"
+      >
+        <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
+          {st.rollNumber || '—'}
+        </td>
+        <td className="py-2.5 px-4">
+          <div className="flex items-center gap-3">
+            {photo ? (
+              <img
+                src={photo}
+                alt={st.studentNameEn || st.studentNameBn}
+                loading="lazy"
+                decoding="async"
+                referrerPolicy="no-referrer"
+                className="w-9 h-9 rounded-full object-cover border border-stone-200 shrink-0"
+              />
+            ) : (
+              <div className="w-9 h-9 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 flex items-center justify-center text-xs font-semibold shrink-0">
+                {(st.studentNameEn || st.studentNameBn || '?').charAt(0).toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0">
+              <div className="font-medium text-emerald-900 hover:underline truncate">
+                {st.studentNameBn || st.studentNameEn}
+              </div>
+              {st.studentNameBn && st.studentNameEn && (
+                <div className="text-xs text-slate-500 truncate">{st.studentNameEn}</div>
+              )}
+            </div>
+          </div>
+        </td>
+        {showAllClasses && (
+          <td className="py-2.5 px-4 text-slate-700 whitespace-nowrap">
+            {getClassLabel(st.classLevel, lang)}
+          </td>
+        )}
+        <td className="py-2.5 px-4 font-mono tabular-nums text-slate-600">
+          {st.guardianPhone || '—'}
+        </td>
+        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+          {st.totalSchoolDays
+            ? `${st.daysPresent || 0} / ${st.totalSchoolDays}`
+            : st.daysPresent ?? '—'}
+        </td>
+        <td className="py-2.5 px-4 text-xs text-slate-600">
+          {st.promotionStatus || '—'}
+        </td>
+        <td className="py-2.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
+          <div className="inline-flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => onEdit(st)}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-stone-300 rounded-md hover:bg-stone-50 cursor-pointer whitespace-nowrap"
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>{lang === 'bn' ? 'সম্পাদনা' : 'Edit'}</span>
+            </button>
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => onDelete(st)}
+                className="p-1.5 text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 rounded-md cursor-pointer"
+                title={t(lang, 'deleteStudent')}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  }
+);
+StudentTableRow.displayName = 'StudentTableRow';
 
 interface StudentFormState {
   id?: string;
@@ -36,6 +133,7 @@ interface StudentFormState {
   guardianPhone: string;
   address: string;
   photoBase64: string;
+  photoChanged: boolean;
   rollNumber: string;
   nextYearRollNumber: string;
   classLevel: string;
@@ -67,19 +165,24 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     customFields,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const [internalProfileId, setInternalProfileId] = useState<string | null>(null);
   const activeProfileId =
     selectedProfileId !== undefined ? selectedProfileId : internalProfileId;
-  const setActiveProfileId = (id: string | null) => {
-    if (onSelectProfile) onSelectProfile(id);
-    else setInternalProfileId(id);
-  };
+  const setActiveProfileId = useCallback(
+    (id: string | null) => {
+      if (onSelectProfile) onSelectProfile(id);
+      else setInternalProfileId(id);
+    },
+    [onSelectProfile]
+  );
 
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<'roll' | 'name'>('roll');
   const [showAllClasses, setShowAllClasses] = useState(false);
+  const [page, setPage] = useState(1);
   const [editingStudent, setEditingStudent] = useState<StudentFormState | null>(null);
   const [saving, setSaving] = useState(false);
   const [statusBanner, setStatusBanner] = useState<{
@@ -115,6 +218,15 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     });
   }, [students, selectedAcademicYear, selectedClass, showAllClasses, searchQuery, sortBy]);
 
+  useEffect(() => {
+    setPage(1);
+  }, [selectedAcademicYear, selectedClass, showAllClasses, searchQuery, sortBy]);
+
+  const pagedStudents = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return filteredStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [filteredStudents, page]);
+
   const openCreateModal = () => {
     setPhotoError(null);
     setEditingStudent({
@@ -126,6 +238,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       guardianPhone: '',
       address: '',
       photoBase64: '',
+      photoChanged: true,
       rollNumber: String(filteredStudents.length + 1),
       nextYearRollNumber: '',
       classLevel: selectedClass,
@@ -141,49 +254,53 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     });
   };
 
-  const openEditModal = (st: StudentDoc) => {
-    setPhotoError(null);
-    setEditingStudent({
-      id: st.id,
-      createdAt: st.createdAt,
-      studentNameBn: st.studentNameBn || '',
-      studentNameEn: st.studentNameEn || '',
-      fatherNameEn: st.fatherNameEn || '',
-      motherNameEn: st.motherNameEn || '',
-      dateOfBirth: st.dateOfBirth || '',
-      guardianPhone: st.guardianPhone || '',
-      address: st.address || '',
-      photoBase64: st.photoBase64 || '',
-      rollNumber: String(st.rollNumber ?? ''),
-      nextYearRollNumber: String(st.nextYearRollNumber ?? ''),
-      classLevel: st.classLevel || selectedClass,
-      section: st.section || '',
-      academicYear: Number(st.academicYear) || selectedAcademicYear,
-      totalSchoolDays: String(st.totalSchoolDays ?? 0),
-      daysPresent: String(st.daysPresent ?? 0),
-      promotionStatus: String(st.promotionStatus || ''),
-      sectorNotes:
-        typeof st.sectorNotes === 'string'
-          ? st.sectorNotes
-          : st.sectorNotes && typeof st.sectorNotes === 'object'
-          ? Object.entries(st.sectorNotes)
-              .map(([k, v]) => `${k}: ${String(v ?? '')}`)
-              .join('\n')
-          : '',
-      customValues:
-        st.customValues && typeof st.customValues === 'object' && !Array.isArray(st.customValues)
-          ? { ...st.customValues }
-          : {},
-      subjectValues:
-        st.subjectValues && typeof st.subjectValues === 'object' && !Array.isArray(st.subjectValues)
-          ? { ...st.subjectValues }
-          : {},
-      examResults:
-        st.examResults && typeof st.examResults === 'object' && !Array.isArray(st.examResults)
-          ? { ...st.examResults }
-          : {},
-    });
-  };
+  const openEditModal = useCallback(
+    (st: StudentDoc) => {
+      setPhotoError(null);
+      setEditingStudent({
+        id: st.id,
+        createdAt: st.createdAt,
+        studentNameBn: st.studentNameBn || '',
+        studentNameEn: st.studentNameEn || '',
+        fatherNameEn: st.fatherNameEn || '',
+        motherNameEn: st.motherNameEn || '',
+        dateOfBirth: st.dateOfBirth || '',
+        guardianPhone: st.guardianPhone || '',
+        address: st.address || '',
+        photoBase64: st.photoBase64 || '',
+        photoChanged: false,
+        rollNumber: String(st.rollNumber ?? ''),
+        nextYearRollNumber: String(st.nextYearRollNumber ?? ''),
+        classLevel: st.classLevel || selectedClass,
+        section: st.section || '',
+        academicYear: Number(st.academicYear) || selectedAcademicYear,
+        totalSchoolDays: String(st.totalSchoolDays ?? 0),
+        daysPresent: String(st.daysPresent ?? 0),
+        promotionStatus: String(st.promotionStatus || ''),
+        sectorNotes:
+          typeof st.sectorNotes === 'string'
+            ? st.sectorNotes
+            : st.sectorNotes && typeof st.sectorNotes === 'object'
+            ? Object.entries(st.sectorNotes)
+                .map(([k, v]) => `${k}: ${String(v ?? '')}`)
+                .join('\n')
+            : '',
+        customValues:
+          st.customValues && typeof st.customValues === 'object' && !Array.isArray(st.customValues)
+            ? { ...st.customValues }
+            : {},
+        subjectValues:
+          st.subjectValues && typeof st.subjectValues === 'object' && !Array.isArray(st.subjectValues)
+            ? { ...st.subjectValues }
+            : {},
+        examResults:
+          st.examResults && typeof st.examResults === 'object' && !Array.isArray(st.examResults)
+            ? { ...st.examResults }
+            : {},
+      });
+    },
+    [selectedClass, selectedAcademicYear]
+  );
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -191,7 +308,9 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     setPhotoError(null);
     try {
       const compressed = await compressImageToBase64(file, 98000);
-      setEditingStudent((prev) => (prev ? { ...prev, photoBase64: compressed } : null));
+      setEditingStudent((prev) =>
+        prev ? { ...prev, photoBase64: compressed, photoChanged: true } : null
+      );
     } catch (err) {
       setPhotoError(err instanceof Error ? err.message : 'Photo compression failed');
     }
@@ -204,6 +323,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setStatusBanner(null);
 
     try {
@@ -241,10 +361,9 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           ? doc(instances.db, 'schools', session.schoolId, 'students', editingStudent.id)
           : doc(collection(instances.db, 'schools', session.schoolId, 'students'));
 
-        await setDoc(targetRef, payload, { merge: true });
+        await withWriteTimeout(setDoc(targetRef, payload, { merge: true }));
         setStatusBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        // Validate limits before queueing pending change
         validateAndBuildStudentPayload(
           studentInput,
           session.schoolId,
@@ -257,6 +376,33 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         const displayName =
           editingStudent.studentNameBn || editingStudent.studentNameEn || 'Student';
 
+        // For non-admin edits, omit heavy unchanged photoBase64 and examResults (not edited in this modal)
+        const pendingStudentBody: Record<string, unknown> = {
+          studentNameBn: editingStudent.studentNameBn,
+          studentNameEn: editingStudent.studentNameEn,
+          fatherNameEn: editingStudent.fatherNameEn,
+          motherNameEn: editingStudent.motherNameEn,
+          dateOfBirth: editingStudent.dateOfBirth,
+          guardianPhone: editingStudent.guardianPhone,
+          address: editingStudent.address,
+          rollNumber: editingStudent.rollNumber,
+          nextYearRollNumber: editingStudent.nextYearRollNumber,
+          classLevel: editingStudent.classLevel,
+          section: editingStudent.section,
+          academicYear: editingStudent.academicYear,
+          totalSchoolDays: Number(editingStudent.totalSchoolDays) || 0,
+          daysPresent: Number(editingStudent.daysPresent) || 0,
+          promotionStatus: editingStudent.promotionStatus,
+          sectorNotes: editingStudent.sectorNotes,
+          customValues: editingStudent.customValues,
+          subjectValues: editingStudent.subjectValues,
+          schoolId: session.schoolId,
+          id: editingStudent.id || undefined,
+        };
+        if (isCreate || editingStudent.photoChanged) {
+          pendingStudentBody.photoBase64 = editingStudent.photoBase64;
+        }
+
         const pendingDoc = buildPendingChangePayload({
           schoolId: session.schoolId,
           entityType: isCreate ? 'STUDENT_CREATE' : 'STUDENT_UPDATE',
@@ -265,17 +411,15 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           submittedByName: session.name,
           summary: `${isCreate ? 'New student' : 'Update student'}: ${displayName} (Roll ${editingStudent.rollNumber})`,
           detailsText: `Class ${editingStudent.classLevel} (${editingStudent.academicYear})`,
-          payloadJson: JSON.stringify({
-            ...studentInput,
-            schoolId: session.schoolId,
-            id: editingStudent.id || undefined,
-          }),
+          payloadJson: JSON.stringify(pendingStudentBody),
           status: 'PENDING',
         });
 
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
+        await withWriteTimeout(
+          addDoc(
+            collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+            pendingDoc
+          )
         );
         setStatusBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
@@ -284,10 +428,11 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     } catch (err) {
       setStatusBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -296,17 +441,22 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     const instances = getFirebaseInstances();
     if (!instances) return;
 
+    setSyncing(true);
     try {
-      await deleteDoc(
-        doc(instances.db, 'schools', session.schoolId, 'students', confirmDeleteStudent.id)
+      await withWriteTimeout(
+        deleteDoc(
+          doc(instances.db, 'schools', session.schoolId, 'students', confirmDeleteStudent.id)
+        )
       );
       setConfirmDeleteStudent(null);
       setStatusBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setStatusBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -323,12 +473,20 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           backLabel={t(lang, 'backToStudents')}
           title={lang === 'bn' ? 'শিক্ষার্থীর প্রোফাইল লোড করা যায়নি' : 'Unable to display Student Profile'}
         >
-          <StudentProfileView
-            studentId={activeProfileId}
-            onBack={() => setActiveProfileId(null)}
-            onSelectStudent={(id) => setActiveProfileId(id)}
-            onOpenFullEditModal={(st) => openEditModal(st)}
-          />
+          <Suspense
+            fallback={
+              <div className="bg-white border border-stone-200 rounded-xl p-10 text-center text-sm text-slate-500">
+                {t(lang, 'loading')}
+              </div>
+            }
+          >
+            <StudentProfileView
+              studentId={activeProfileId}
+              onBack={() => setActiveProfileId(null)}
+              onSelectStudent={(id) => setActiveProfileId(id)}
+              onOpenFullEditModal={(st) => openEditModal(st)}
+            />
+          </Suspense>
         </ErrorBoundary>
       ) : (
         <>
@@ -426,6 +584,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
             </button>
           </div>
         ) : (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left">
               <thead>
@@ -440,90 +599,28 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {filteredStudents.map((st) => {
-                  const photo = formatPhotoSrc(st.photoBase64);
-                  return (
-                    <tr
-                      key={st.id}
-                      onClick={() => setActiveProfileId(st.id)}
-                      className="hover:bg-emerald-50/40 transition-colors cursor-pointer"
-                    >
-                      <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
-                        {st.rollNumber || '—'}
-                      </td>
-                      <td className="py-2.5 px-4">
-                        <div className="flex items-center gap-3">
-                          {photo ? (
-                            <img
-                              src={photo}
-                              alt={st.studentNameEn || st.studentNameBn}
-                              referrerPolicy="no-referrer"
-                              className="w-9 h-9 rounded-full object-cover border border-stone-200 shrink-0"
-                            />
-                          ) : (
-                            <div className="w-9 h-9 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 flex items-center justify-center text-xs font-semibold shrink-0">
-                              {(st.studentNameEn || st.studentNameBn || '?').charAt(0).toUpperCase()}
-                            </div>
-                          )}
-                          <div className="min-w-0">
-                            <div className="font-medium text-emerald-900 hover:underline truncate">
-                              {st.studentNameBn || st.studentNameEn}
-                            </div>
-                            {st.studentNameBn && st.studentNameEn && (
-                              <div className="text-xs text-slate-500 truncate">
-                                {st.studentNameEn}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </td>
-                      {showAllClasses && (
-                        <td className="py-2.5 px-4 text-slate-700 whitespace-nowrap">
-                          {getClassLabel(st.classLevel, lang)}
-                        </td>
-                      )}
-                      <td className="py-2.5 px-4 font-mono tabular-nums text-slate-600">
-                        {st.guardianPhone || '—'}
-                      </td>
-                      <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                        {st.totalSchoolDays
-                          ? `${st.daysPresent || 0} / ${st.totalSchoolDays}`
-                          : st.daysPresent ?? '—'}
-                      </td>
-                      <td className="py-2.5 px-4 text-xs text-slate-600">
-                        {st.promotionStatus || '—'}
-                      </td>
-                      <td
-                        className="py-2.5 px-4 text-right"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => openEditModal(st)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-stone-300 rounded-md hover:bg-stone-50 cursor-pointer whitespace-nowrap"
-                          >
-                            <Edit3 className="w-3.5 h-3.5" />
-                            <span>{lang === 'bn' ? 'সম্পাদনা' : 'Edit'}</span>
-                          </button>
-                          {isAdmin && (
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteStudent(st)}
-                              className="p-1.5 text-rose-600 hover:bg-rose-50 border border-transparent hover:border-rose-200 rounded-md cursor-pointer"
-                              title={t(lang, 'deleteStudent')}
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {pagedStudents.map((st) => (
+                  <StudentTableRow
+                    key={st.id}
+                    student={st}
+                    lang={lang}
+                    showAllClasses={showAllClasses}
+                    isAdmin={isAdmin}
+                    onSelect={setActiveProfileId}
+                    onEdit={openEditModal}
+                    onDelete={setConfirmDeleteStudent}
+                  />
+                ))}
               </tbody>
             </table>
           </div>
+          <PaginationBar
+            lang={lang}
+            page={page}
+            totalItems={filteredStudents.length}
+            onPageChange={setPage}
+          />
+          </>
         )}
       </div>
         </>
@@ -553,6 +650,8 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
                   <img
                     src={formatPhotoSrc(editingStudent.photoBase64)!}
                     alt="Student preview"
+                    loading="lazy"
+                    decoding="async"
                     referrerPolicy="no-referrer"
                     className="w-16 h-16 rounded-xl object-cover border border-stone-200"
                   />
@@ -577,7 +676,9 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
                       <button
                         type="button"
                         onClick={() =>
-                          setEditingStudent((p) => (p ? { ...p, photoBase64: '' } : null))
+                          setEditingStudent((p) =>
+                            p ? { ...p, photoBase64: '', photoChanged: true } : null
+                          )
                         }
                         className="px-3 py-1.5 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 rounded-lg hover:bg-rose-100 cursor-pointer"
                       >

@@ -1,14 +1,25 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { addDoc, collection, doc, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore';
+import {
+  addDoc,
+  collection,
+  doc,
+  getDocs,
+  query,
+  where,
+} from 'firebase/firestore';
 import { Download, FileSpreadsheet, Printer, Upload, X } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
+  buildChunkedArrayPendingPayloads,
+  buildChunkedExamPatchPayloads,
   buildPendingChangePayload,
+  commitBatchesInChunks,
   FIRESTORE_LIMITS,
+  formatFirestoreError,
   sanitizeStringRecordMap,
   validateAndBuildStudentPayload,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
@@ -19,8 +30,9 @@ import {
   getTermSubjectScore,
   normalizeExamConfigs,
 } from '../lib/schoolUtils';
-import type { StudentDoc } from '../types/school';
+import type { AttendanceLogDoc, StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
 export const MarksheetView: React.FC = () => {
   const {
@@ -31,13 +43,16 @@ export const MarksheetView: React.FC = () => {
     subjects,
     customFields,
     attendanceLogs,
+    loadedModules,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const isAdmin = session?.role === 'ADMIN';
   const [viewMode, setViewMode] = useState<'card' | 'tabulation'>('card');
   const [selectedStudentId, setSelectedStudentId] = useState<string>('');
+  const [tabPage, setTabPage] = useState(1);
   const [importBanner, setImportBanner] = useState<{
     type: 'success' | 'error';
     text: string;
@@ -54,6 +69,15 @@ export const MarksheetView: React.FC = () => {
       ),
     [students, selectedAcademicYear, selectedClass]
   );
+
+  useEffect(() => {
+    setTabPage(1);
+  }, [selectedAcademicYear, selectedClass]);
+
+  const pagedTabStudents = useMemo(() => {
+    const start = (tabPage - 1) * DEFAULT_PAGE_SIZE;
+    return classStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [classStudents, tabPage]);
 
   useEffect(() => {
     if (classStudents.length > 0) {
@@ -175,8 +199,9 @@ export const MarksheetView: React.FC = () => {
   );
 
   // Export 3-Term Marksheet (NO Pass Marks column!)
-  const exportMarksheetFile = (format: 'xlsx' | 'csv') => {
+  const exportMarksheetFile = async (format: 'xlsx' | 'csv') => {
     if (!activeStudent || !activeData) return;
+    const XLSX = await import('xlsx');
 
     const headerRow1 = [
       'Subject',
@@ -272,7 +297,8 @@ export const MarksheetView: React.FC = () => {
   };
 
   // Export full class tabulation + student roster compatible with Android app
-  const exportClassRosterOrTabulation = (format: 'xlsx' | 'csv') => {
+  const exportClassRosterOrTabulation = async (format: 'xlsx' | 'csv') => {
+    const XLSX = await import('xlsx');
     const rows = classStudents.map((st) => {
       const t1 = computeStudentTermSummary(st, classSubjects, 'exam_1');
       const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
@@ -321,7 +347,9 @@ export const MarksheetView: React.FC = () => {
     XLSX.writeFile(wb, filename, { bookType: format });
   };
 
-  const exportFullSchoolBackup = () => {
+  const exportFullSchoolBackup = async () => {
+    if (!session) return;
+    const XLSX = await import('xlsx');
     const wb = XLSX.utils.book_new();
 
     const studentRows = students.map((st) => ({
@@ -349,7 +377,24 @@ export const MarksheetView: React.FC = () => {
     }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(studentRows), 'Students');
 
-    const attRows = attendanceLogs.map((a) => ({
+    let attSource = attendanceLogs;
+    if (!loadedModules.attendance) {
+      const instances = getFirebaseInstances();
+      if (instances) {
+        const snap = await getDocs(
+          query(
+            collection(instances.db, 'schools', session.schoolId, 'attendanceLogs'),
+            where('academicYear', '==', Number(selectedAcademicYear))
+          )
+        );
+        attSource = snap.docs.map((d) => ({
+          id: d.id,
+          ...(d.data() as Omit<AttendanceLogDoc, 'id'>),
+        }));
+      }
+    }
+
+    const attRows = attSource.map((a) => ({
       docId: a.id,
       academicYear: a.academicYear,
       classLevel: a.classLevel,
@@ -379,11 +424,11 @@ export const MarksheetView: React.FC = () => {
 
     XLSX.writeFile(
       wb,
-      `${session?.schoolId || 'School'}_Backup_${selectedAcademicYear}.xlsx`
+      `${session.schoolId || 'School'}_Backup_${selectedAcademicYear}.xlsx`
     );
   };
 
-  // Import students from .xlsx / .csv
+  // Import students & marksheets from .xlsx / .csv
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !session) return;
@@ -391,9 +436,11 @@ export const MarksheetView: React.FC = () => {
     if (!instances) return;
 
     setImporting(true);
+    setSyncing(true);
     setImportBanner(null);
 
     try {
+      const XLSX = await import('xlsx');
       const buffer = await file.arrayBuffer();
       const wb = XLSX.read(buffer, { type: 'array' });
       const firstSheet = wb.Sheets[wb.SheetNames[0]];
@@ -405,7 +452,13 @@ export const MarksheetView: React.FC = () => {
         throw new Error('The uploaded spreadsheet is empty.');
       }
 
-      const parsedStudents: Array<{ existingId?: string; data: Partial<StudentDoc> }> = [];
+      const parsedStudents: Array<{
+        existingId?: string;
+        data: Partial<StudentDoc>;
+        marksPatch?: Record<string, string>;
+        hasNonExamChanges: boolean;
+      }> = [];
+
       for (const row of rawRows) {
         const nameBn = String(row.studentNameBn || row['Student Name (Bangla)'] || row['Name (Bn)'] || '').trim();
         const nameEn = String(row.studentNameEn || row['Student Name (English)'] || row['Name'] || '').trim();
@@ -423,43 +476,58 @@ export const MarksheetView: React.FC = () => {
             String(s.rollNumber) === roll
         );
 
-        const nextResults: Record<string, number | string> = {
+        const nextResults: Record<string, unknown> = {
           ...(existingMatch?.examResults || {}),
         };
+        const marksPatch: Record<string, string> = {};
+
         if (typeof row.examResultsJson === 'string' && row.examResultsJson.trim().startsWith('{')) {
           try {
-            const parsedExam = JSON.parse(row.examResultsJson) as Record<string, number | string>;
-            Object.assign(nextResults, parsedExam);
+            const parsedExam = JSON.parse(row.examResultsJson) as Record<string, unknown>;
+            for (const [k, v] of Object.entries(parsedExam)) {
+              const s = typeof v === 'number' && !Number.isFinite(v) ? '' : String(v ?? '').trim();
+              if (s !== '' && s !== 'NaN') {
+                nextResults[k] = s;
+                marksPatch[k] = s;
+              } else {
+                delete nextResults[k];
+                if (existingMatch?.examResults?.[k] !== undefined) marksPatch[k] = '';
+              }
+            }
           } catch {
             // ignore malformed JSON cell
           }
         }
 
-        let nextCustom: Record<string, string | number | boolean> = {
+        let nextCustom: Record<string, unknown> = {
           ...(existingMatch?.customValues || {}),
         };
+        let hasCustomJson = false;
         if (typeof row.customValuesJson === 'string' && row.customValuesJson.trim().startsWith('{')) {
           try {
-            const parsedCustom = JSON.parse(row.customValuesJson) as Record<string, string | number | boolean>;
+            const parsedCustom = JSON.parse(row.customValuesJson) as Record<string, unknown>;
             nextCustom = { ...nextCustom, ...parsedCustom };
+            hasCustomJson = true;
           } catch {
             // ignore malformed JSON cell
           }
         }
 
-        let nextSubjectVals: Record<string, string | number | boolean> = {
+        let nextSubjectVals: Record<string, unknown> = {
           ...(existingMatch?.subjectValues || {}),
         };
+        let hasSubjJson = false;
         if (typeof row.subjectValuesJson === 'string' && row.subjectValuesJson.trim().startsWith('{')) {
           try {
-            const parsedSubj = JSON.parse(row.subjectValuesJson) as Record<string, string | number | boolean>;
+            const parsedSubj = JSON.parse(row.subjectValuesJson) as Record<string, unknown>;
             nextSubjectVals = { ...nextSubjectVals, ...parsedSubj };
+            hasSubjJson = true;
           } catch {
             // ignore malformed JSON cell
           }
         }
 
-        // Optional subject columns for 1st, 2nd, or Final term
+        // Subject columns for 1st, 2nd, or Final term (store ONLY trimmed strings!)
         for (const subj of classSubjects) {
           const mappings: Array<[string, 'exam_1' | 'exam_2' | 'exam_3']> = [
             ['1st', 'exam_1'],
@@ -467,16 +535,46 @@ export const MarksheetView: React.FC = () => {
             ['Final', 'exam_3'],
           ];
           for (const [labelPrefix, termId] of mappings) {
-            const contKey = `${subj.subjectName} (${labelPrefix} Cont)`;
-            const sumKey = `${subj.subjectName} (${labelPrefix} Sum)`;
-            const hasCont = row[contKey] !== undefined && row[contKey] !== '';
-            const hasSum = row[sumKey] !== undefined && row[sumKey] !== '';
-            if (hasCont) nextResults[`${termId}__${subj.subjectId}__cont`] = Number(row[contKey]) || 0;
-            if (hasSum) nextResults[`${termId}__${subj.subjectId}__sum`] = Number(row[sumKey]) || 0;
+            const contHeader = `${subj.subjectName} (${labelPrefix} Cont)`;
+            const sumHeader = `${subj.subjectName} (${labelPrefix} Sum)`;
+            const totalHeader = `${subj.subjectName} (${labelPrefix} Total)`;
+            const hasCont = row[contHeader] !== undefined && String(row[contHeader]).trim() !== '';
+            const hasSum = row[sumHeader] !== undefined && String(row[sumHeader]).trim() !== '';
+            const hasTotalOnly = row[totalHeader] !== undefined && String(row[totalHeader]).trim() !== '';
+
+            const contKey = `${termId}__${subj.subjectId}__cont`;
+            const sumKey = `${termId}__${subj.subjectId}__sum`;
+            const totalKey = `${termId}__${subj.subjectId}`;
+
+            if (hasCont) {
+              const num = Number(row[contHeader]);
+              if (Number.isFinite(num)) {
+                const s = String(num).trim();
+                nextResults[contKey] = s;
+                marksPatch[contKey] = s;
+              }
+            }
+            if (hasSum) {
+              const num = Number(row[sumHeader]);
+              if (Number.isFinite(num)) {
+                const s = String(num).trim();
+                nextResults[sumKey] = s;
+                marksPatch[sumKey] = s;
+              }
+            }
             if (hasCont || hasSum) {
-              const cVal = Number(nextResults[`${termId}__${subj.subjectId}__cont`] ?? 0) || 0;
-              const sVal = Number(nextResults[`${termId}__${subj.subjectId}__sum`] ?? 0) || 0;
-              nextResults[`${termId}__${subj.subjectId}`] = cVal + sVal;
+              const cVal = Number(nextResults[contKey] ?? 0);
+              const sVal = Number(nextResults[sumKey] ?? 0);
+              const totStr = String((Number.isFinite(cVal) ? cVal : 0) + (Number.isFinite(sVal) ? sVal : 0)).trim();
+              nextResults[totalKey] = totStr;
+              marksPatch[totalKey] = totStr;
+            } else if (hasTotalOnly) {
+              const num = Number(row[totalHeader]);
+              if (Number.isFinite(num)) {
+                const s = String(num).trim();
+                nextResults[totalKey] = s;
+                marksPatch[totalKey] = s;
+              }
             }
           }
         }
@@ -489,25 +587,40 @@ export const MarksheetView: React.FC = () => {
         const sanitizedCustom = sanitizeStringRecordMap(nextCustom);
         const sanitizedSubjectVals = sanitizeStringRecordMap(nextSubjectVals);
 
+        const nextStudentNameBn = nameBn || nameEn;
+        const nextStudentNameEn = nameEn || nameBn;
+        const hasNonExamChanges =
+          !existingMatch ||
+          hasCustomJson ||
+          hasSubjJson ||
+          nextStudentNameBn !== (existingMatch.studentNameBn || '') ||
+          nextStudentNameEn !== (existingMatch.studentNameEn || '') ||
+          String(row.fatherNameEn || row["Father's Name"] || '').trim() !== (existingMatch.fatherNameEn || '') ||
+          String(row.motherNameEn || row["Mother's Name"] || '').trim() !== (existingMatch.motherNameEn || '') ||
+          String(row.guardianPhone || row['Guardian Phone'] || '').trim() !== (existingMatch.guardianPhone || '') ||
+          String(row.section || row['Section'] || '').trim() !== (existingMatch.section || '');
+
         parsedStudents.push({
           existingId: existingMatch?.id,
+          marksPatch,
+          hasNonExamChanges,
           data: {
-            studentNameBn: nameBn || nameEn,
-            studentNameEn: nameEn || nameBn,
-            fatherNameEn: String(row.fatherNameEn || row["Father's Name"] || '').trim(),
-            motherNameEn: String(row.motherNameEn || row["Mother's Name"] || '').trim(),
-            dateOfBirth: String(row.dateOfBirth || row['Date of Birth'] || '').trim(),
-            guardianPhone: String(row.guardianPhone || row['Guardian Phone'] || '').trim(),
-            address: String(row.address || row['Address'] || '').trim(),
+            studentNameBn: nextStudentNameBn,
+            studentNameEn: nextStudentNameEn,
+            fatherNameEn: String(row.fatherNameEn || row["Father's Name"] || existingMatch?.fatherNameEn || '').trim(),
+            motherNameEn: String(row.motherNameEn || row["Mother's Name"] || existingMatch?.motherNameEn || '').trim(),
+            dateOfBirth: String(row.dateOfBirth || row['Date of Birth'] || existingMatch?.dateOfBirth || '').trim(),
+            guardianPhone: String(row.guardianPhone || row['Guardian Phone'] || existingMatch?.guardianPhone || '').trim(),
+            address: String(row.address || row['Address'] || existingMatch?.address || '').trim(),
             rollNumber: roll,
-            nextYearRollNumber: String(row.nextYearRollNumber || row['Next Roll'] || '').trim(),
+            nextYearRollNumber: String(row.nextYearRollNumber || row['Next Roll'] || existingMatch?.nextYearRollNumber || '').trim(),
             classLevel: cls,
-            section: String(row.section || row['Section'] || '').trim(),
+            section: String(row.section || row['Section'] || existingMatch?.section || '').trim(),
             academicYear: yr,
-            totalSchoolDays: Number(row.totalSchoolDays || 0),
-            daysPresent: Number(row.daysPresent || 0),
-            promotionStatus: String(row.promotionStatus || '').trim(),
-            sectorNotes: String(row.sectorNotes || '').trim(),
+            totalSchoolDays: row.totalSchoolDays !== undefined && row.totalSchoolDays !== '' ? Number(row.totalSchoolDays) || 0 : existingMatch?.totalSchoolDays || 0,
+            daysPresent: row.daysPresent !== undefined && row.daysPresent !== '' ? Number(row.daysPresent) || 0 : existingMatch?.daysPresent || 0,
+            promotionStatus: String(row.promotionStatus || existingMatch?.promotionStatus || '').trim(),
+            sectorNotes: String(row.sectorNotes || existingMatch?.sectorNotes || '').trim(),
             customValues: sanitizedCustom,
             subjectValues: sanitizedSubjectVals,
             examResults: sanitizedResults,
@@ -522,60 +635,101 @@ export const MarksheetView: React.FC = () => {
       }
 
       if (isAdmin) {
-        // Commit in chunks of 400 (Firestore batch limit is 500)
-        for (let i = 0; i < parsedStudents.length; i += 400) {
-          const chunk = parsedStudents.slice(i, i + 400);
-          const batch = writeBatch(instances.db);
-          for (const item of chunk) {
-            const existing = item.existingId
-              ? students.find((s) => s.id === item.existingId)
-              : undefined;
-            const payload = validateAndBuildStudentPayload(
-              { ...existing, ...item.data },
-              session.schoolId,
-              session.name,
-              existing?.createdAt
-            );
-            const targetRef = item.existingId
-              ? doc(instances.db, 'schools', session.schoolId, 'students', item.existingId)
-              : doc(collection(instances.db, 'schools', session.schoolId, 'students'));
-            batch.set(targetRef, payload, { merge: true });
-          }
-          await batch.commit();
-        }
+        await commitBatchesInChunks(instances.db, parsedStudents, (batch, item) => {
+          const existing = item.existingId
+            ? students.find((s) => s.id === item.existingId)
+            : undefined;
+          const payload = validateAndBuildStudentPayload(
+            { ...existing, ...item.data },
+            session.schoolId,
+            session.name,
+            existing?.createdAt
+          );
+          const targetRef = item.existingId
+            ? doc(instances.db, 'schools', session.schoolId, 'students', item.existingId)
+            : doc(collection(instances.db, 'schools', session.schoolId, 'students'));
+          batch.set(targetRef, payload, { merge: true });
+        });
         setImportBanner({
           type: 'success',
-          text: `${parsedStudents.length} ${lang === 'bn' ? 'জন শিক্ষার্থী ইম্পোর্ট হয়েছে।' : 'students imported successfully.'}`,
+          text: `${parsedStudents.length} ${lang === 'bn' ? 'জন শিক্ষার্থী ও নম্বর সফলভাবে ইম্পোর্ট হয়েছে।' : 'students/marks imported successfully.'}`,
         });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `import_${selectedAcademicYear}_${selectedClass}_${Date.now()}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Spreadsheet Import: ${parsedStudents.length} students (${selectedClass})`,
-          detailsText: `Imported from ${file.name}`,
-          payloadJson: JSON.stringify({
-            kind: 'ROSTER_IMPORT',
-            students: parsedStudents,
-          }),
-          status: 'PENDING',
-        });
-
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
+        // Non-admin teacher: send compact exam patches for marks-only existing rows,
+        // and chunked ROSTER_IMPORT (strictly <= 120 KB per doc, zero photoBase64) for creates/profile edits
+        const marksOnlyItems = parsedStudents.filter(
+          (item) => item.existingId && !item.hasNonExamChanges && Object.keys(item.marksPatch || {}).length > 0
         );
-        setImportBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+        const rosterItems = parsedStudents
+          .filter((item) => !item.existingId || item.hasNonExamChanges)
+          .map((item) => ({
+            existingId: item.existingId,
+            data: item.data,
+          }));
+
+        if (marksOnlyItems.length > 0) {
+          const examChunks = buildChunkedExamPatchPayloads(
+            marksOnlyItems.map((m) => ({
+              studentId: m.existingId!,
+              patch: m.marksPatch!,
+            }))
+          );
+          for (let idx = 0; idx < examChunks.length; idx++) {
+            const chunk = examChunks[idx];
+            const pendingDoc = buildPendingChangePayload({
+              schoolId: session.schoolId,
+              entityType: 'STUDENT_BATCH_UPDATE',
+              targetId: `import_marks_${selectedAcademicYear}_${selectedClass}_${Date.now()}_${idx + 1}`,
+              submittedByDeviceId: session.deviceId,
+              submittedByName: session.name,
+              summary: `Marks Import (${selectedClass})${examChunks.length > 1 ? ` [${idx + 1}/${examChunks.length}]` : ''}`,
+              detailsText: `${chunk.studentCount} students' marks imported from ${file.name}`,
+              payloadJson: chunk.payloadJson,
+              status: 'PENDING',
+            });
+            await withWriteTimeout(
+              addDoc(
+                collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+                pendingDoc
+              )
+            );
+          }
+        }
+
+        if (rosterItems.length > 0) {
+          const rosterChunks = buildChunkedArrayPendingPayloads('ROSTER_IMPORT', 'students', rosterItems);
+          for (let idx = 0; idx < rosterChunks.length; idx++) {
+            const chunk = rosterChunks[idx];
+            const pendingDoc = buildPendingChangePayload({
+              schoolId: session.schoolId,
+              entityType: 'STUDENT_BATCH_UPDATE',
+              targetId: `import_${selectedAcademicYear}_${selectedClass}_${Date.now()}_${idx + 1}`,
+              submittedByDeviceId: session.deviceId,
+              submittedByName: session.name,
+              summary: `Spreadsheet Import: ${chunk.itemCount} students (${selectedClass})${rosterChunks.length > 1 ? ` [${idx + 1}/${rosterChunks.length}]` : ''}`,
+              detailsText: `Imported from ${file.name}`,
+              payloadJson: chunk.payloadJson,
+              status: 'PENDING',
+            });
+            await withWriteTimeout(
+              addDoc(
+                collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+                pendingDoc
+              )
+            );
+          }
+        }
+
+        setImportBanner({ type: 'success', text: t(lang, 'marksSubmittedSuccess') });
       }
     } catch (err) {
       setImportBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setImporting(false);
+      setSyncing(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -757,6 +911,8 @@ export const MarksheetView: React.FC = () => {
                     <img
                       src={formatPhotoSrc(activeStudent.photoBase64)!}
                       alt={activeStudent.studentNameEn || activeStudent.studentNameBn}
+                      loading="lazy"
+                      decoding="async"
                       referrerPolicy="no-referrer"
                       className="w-14 h-14 rounded-lg object-cover border border-stone-300"
                     />
@@ -1020,68 +1176,76 @@ export const MarksheetView: React.FC = () => {
               {t(lang, 'noStudentsFound')}
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
-                <thead>
-                  <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                    <th className="py-3 px-4">{t(lang, 'rollNumber')}</th>
-                    <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}</th>
-                    <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
-                    <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
-                    <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
-                    <th className="py-3 px-4 text-right">GPA / Grade</th>
-                    <th className="py-3 px-4 text-right">{t(lang, 'meritPosition')}</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-stone-100">
-                  {classStudents.map((st) => {
-                    const t1 = computeStudentTermSummary(st, classSubjects, 'exam_1');
-                    const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
-                    const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
-                    const rank = meritMap.get(st.id);
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                  <thead>
+                    <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                      <th className="py-3 px-4">{t(lang, 'rollNumber')}</th>
+                      <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}</th>
+                      <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
+                      <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
+                      <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
+                      <th className="py-3 px-4 text-right">GPA / Grade</th>
+                      <th className="py-3 px-4 text-right">{t(lang, 'meritPosition')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-stone-100">
+                    {pagedTabStudents.map((st) => {
+                      const t1 = computeStudentTermSummary(st, classSubjects, 'exam_1');
+                      const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
+                      const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
+                      const rank = meritMap.get(st.id);
 
-                    return (
-                      <tr
-                        key={st.id}
-                        onClick={() => {
-                          setSelectedStudentId(st.id);
-                          setViewMode('card');
-                        }}
-                        className="hover:bg-stone-50 cursor-pointer"
-                      >
-                        <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
-                          {st.rollNumber}
-                        </td>
-                        <td className="py-2.5 px-4 font-medium text-slate-900">
-                          {st.studentNameBn || st.studentNameEn}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                          {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                          {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
-                          {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                          {t3.scoredSubjects > 0 ? (
-                            <span className={t3.passed ? 'text-emerald-700 font-semibold' : 'text-rose-600 font-semibold'}>
-                              {t3.gpa.toFixed(2)} ({t3.grade})
-                            </span>
-                          ) : (
-                            '—'
-                          )}
-                        </td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
-                          {rank ? `#${rank}` : '—'}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                      return (
+                        <tr
+                          key={st.id}
+                          onClick={() => {
+                            setSelectedStudentId(st.id);
+                            setViewMode('card');
+                          }}
+                          className="hover:bg-stone-50 cursor-pointer"
+                        >
+                          <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
+                            {st.rollNumber}
+                          </td>
+                          <td className="py-2.5 px-4 font-medium text-slate-900">
+                            {st.studentNameBn || st.studentNameEn}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                            {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                            {t3.scoredSubjects > 0 ? (
+                              <span className={t3.passed ? 'text-emerald-700 font-semibold' : 'text-rose-600 font-semibold'}>
+                                {t3.gpa.toFixed(2)} ({t3.grade})
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
+                            {rank ? `#${rank}` : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <PaginationBar
+                lang={lang}
+                page={tabPage}
+                totalItems={classStudents.length}
+                onPageChange={setTabPage}
+              />
+            </>
           )}
         </div>
       )}

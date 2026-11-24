@@ -1,13 +1,18 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { doc, setDoc, writeBatch } from 'firebase/firestore';
+import { doc, setDoc } from 'firebase/firestore';
 import { CheckCheck, Download, Save, X } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
-import { buildAttendancePayload } from '../lib/firestoreValidation';
+import {
+  buildAttendancePayload,
+  commitBatchesInChunks,
+  formatFirestoreError,
+  withWriteTimeout,
+} from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import { getAttendanceDocId, getTodayDateKey } from '../lib/schoolUtils';
 import type { AttendanceStatus } from '../types/school';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
 type AttendanceViewMode = 'daily' | 'weekly' | 'monthly' | 'yearly';
 
@@ -56,6 +61,7 @@ export const AttendanceView: React.FC = () => {
     attendanceLogs,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const [viewMode, setViewMode] = useState<AttendanceViewMode>('daily');
@@ -70,6 +76,7 @@ export const AttendanceView: React.FC = () => {
   const [dirtyDates, setDirtyDates] = useState<Set<string>>(new Set());
 
   const [saving, setSaving] = useState(false);
+  const [page, setPage] = useState(1);
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
   );
@@ -83,6 +90,15 @@ export const AttendanceView: React.FC = () => {
       ),
     [students, selectedAcademicYear, selectedClass]
   );
+
+  useEffect(() => {
+    setPage(1);
+  }, [selectedAcademicYear, selectedClass, viewMode]);
+
+  const pagedClassStudents = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return classStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [classStudents, page]);
 
   // Daily active doc
   const activeDocId = useMemo(
@@ -172,6 +188,7 @@ export const AttendanceView: React.FC = () => {
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
     try {
       const payload = buildAttendancePayload({
@@ -184,19 +201,22 @@ export const AttendanceView: React.FC = () => {
         existingCreatedAt: existingLog?.createdAt,
       });
 
-      await setDoc(
-        doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', activeDocId),
-        payload,
-        { merge: true }
+      await withWriteTimeout(
+        setDoc(
+          doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', activeDocId),
+          payload,
+          { merge: true }
+        )
       );
       setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -206,43 +226,40 @@ export const AttendanceView: React.FC = () => {
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
       const datesList = Array.from(dirtyDates);
-      for (let i = 0; i < datesList.length; i += 400) {
-        const chunk = datesList.slice(i, i + 400);
-        const batch = writeBatch(instances.db);
-        for (const dKey of chunk) {
-          const docId = getAttendanceDocId(selectedAcademicYear, selectedClass, dKey);
-          const existing = logsByDate.get(dKey);
-          const payload = buildAttendancePayload({
-            schoolId: session.schoolId,
-            academicYear: selectedAcademicYear,
-            classLevel: selectedClass,
-            dateKey: dKey,
-            statuses: matrixDrafts[dKey] || {},
-            markedByName: session.name,
-            existingCreatedAt: existing?.createdAt,
-          });
-          batch.set(
-            doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', docId),
-            payload,
-            { merge: true }
-          );
-        }
-        await batch.commit();
-      }
+      await commitBatchesInChunks(instances.db, datesList, (batch, dKey) => {
+        const docId = getAttendanceDocId(selectedAcademicYear, selectedClass, dKey);
+        const existing = logsByDate.get(dKey);
+        const payload = buildAttendancePayload({
+          schoolId: session.schoolId,
+          academicYear: selectedAcademicYear,
+          classLevel: selectedClass,
+          dateKey: dKey,
+          statuses: matrixDrafts[dKey] || {},
+          markedByName: session.name,
+          existingCreatedAt: existing?.createdAt,
+        });
+        batch.set(
+          doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', docId),
+          payload,
+          { merge: true }
+        );
+      });
       setDirtyDates(new Set());
       setMatrixDrafts({});
       setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -292,7 +309,13 @@ export const AttendanceView: React.FC = () => {
     return { months, rows };
   }, [attendanceLogs, classStudents, selectedAcademicYear, selectedClass]);
 
-  const exportYearlyAttendance = () => {
+  const pagedYearlyRows = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return yearlyBreakdown.rows.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [yearlyBreakdown.rows, page]);
+
+  const exportYearlyAttendance = async () => {
+    const XLSX = await import('xlsx');
     const data = yearlyBreakdown.rows.map((r) => {
       const row: Record<string, string | number> = {
         Roll: r.st.rollNumber,
@@ -437,6 +460,7 @@ export const AttendanceView: React.FC = () => {
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
+              <>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm text-left">
                   <thead>
@@ -449,7 +473,7 @@ export const AttendanceView: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st) => {
+                    {pagedClassStudents.map((st) => {
                       const current = statuses[st.id];
                       return (
                         <tr key={st.id} className="hover:bg-stone-50/60">
@@ -505,6 +529,13 @@ export const AttendanceView: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+              <PaginationBar
+                lang={lang}
+                page={page}
+                totalItems={classStudents.length}
+                onPageChange={setPage}
+              />
+              </>
             )}
           </div>
         </>
@@ -569,6 +600,7 @@ export const AttendanceView: React.FC = () => {
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
+              <>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left border-collapse">
                   <thead>
@@ -593,7 +625,7 @@ export const AttendanceView: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-stone-100">
-                    {classStudents.map((st) => {
+                    {pagedClassStudents.map((st) => {
                       const datesList = viewMode === 'weekly' ? weekDates : monthDates;
                       let p = 0;
                       let a = 0;
@@ -645,6 +677,13 @@ export const AttendanceView: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+              <PaginationBar
+                lang={lang}
+                page={page}
+                totalItems={classStudents.length}
+                onPageChange={setPage}
+              />
+            </>
             )}
           </div>
         </>
@@ -674,6 +713,7 @@ export const AttendanceView: React.FC = () => {
                 {t(lang, 'noStudentsFound')}
               </div>
             ) : (
+              <>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left">
                   <thead>
@@ -694,7 +734,7 @@ export const AttendanceView: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-stone-100">
-                    {yearlyBreakdown.rows.map((r) => (
+                    {pagedYearlyRows.map((r) => (
                       <tr key={r.st.id} className="hover:bg-stone-50/60">
                         <td className="py-2 px-3 font-mono tabular-nums font-semibold">
                           {r.st.rollNumber}
@@ -731,6 +771,13 @@ export const AttendanceView: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+              <PaginationBar
+                lang={lang}
+                page={page}
+                totalItems={yearlyBreakdown.rows.length}
+                onPageChange={setPage}
+              />
+            </>
             )}
           </div>
         </div>

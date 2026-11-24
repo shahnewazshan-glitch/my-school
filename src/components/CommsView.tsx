@@ -3,7 +3,13 @@ import { addDoc, collection, doc, serverTimestamp, updateDoc } from 'firebase/fi
 import { Bell, MessageSquare, Send } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
-import { buildParentNoticePayload } from '../lib/firestoreValidation';
+import {
+  buildParentNoticePayload,
+  clampText,
+  FIRESTORE_LIMITS,
+  formatFirestoreError,
+  withWriteTimeout,
+} from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import { formatTimestampDateTime } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
@@ -17,6 +23,7 @@ export const CommsView: React.FC = () => {
     messages,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'notices' | 'chat'>('notices');
@@ -36,6 +43,7 @@ export const CommsView: React.FC = () => {
     if (!instances) return;
 
     setPostingNotice(true);
+    setSyncing(true);
     setErrorText(null);
     try {
       const payload = buildParentNoticePayload({
@@ -48,16 +56,19 @@ export const CommsView: React.FC = () => {
         sentByRole: session.role,
       });
 
-      await addDoc(
-        collection(instances.db, 'schools', session.schoolId, 'parentNotices'),
-        payload
+      await withWriteTimeout(
+        addDoc(
+          collection(instances.db, 'schools', session.schoolId, 'parentNotices'),
+          payload
+        )
       );
       setNoticeTitle('');
       setNoticeMessage('');
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : String(err));
+      setErrorText(formatFirestoreError(err));
     } finally {
       setPostingNotice(false);
+      setSyncing(false);
     }
   };
 
@@ -68,21 +79,22 @@ export const CommsView: React.FC = () => {
     if (!instances) return;
 
     const text = chatInput.trim();
+    const safeName = clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS);
     setSendingChat(true);
+    setSyncing(true);
     setErrorText(null);
 
     try {
-      const msgRef = await addDoc(
-        collection(instances.db, 'schools', session.schoolId, 'messages'),
-        {
+      const msgRef = await withWriteTimeout(
+        addDoc(collection(instances.db, 'schools', session.schoolId, 'messages'), {
           schoolId: session.schoolId,
           text,
-          senderName: session.name,
+          senderName: safeName,
           senderDeviceId: session.deviceId,
           senderPhone: session.phoneNumber,
           senderRole: session.role,
           createdAt: serverTimestamp(),
-        }
+        })
       );
 
       // Update recentMessages (up to 30) on school document if permitted
@@ -94,26 +106,29 @@ export const CommsView: React.FC = () => {
           ...existingRecent,
           {
             messageId: msgRef.id,
-            senderName: session.name,
+            senderName: safeName,
             senderRole: session.role,
             text,
             createdAtMs: Date.now(),
           },
         ].slice(-30);
 
-        await updateDoc(doc(instances.db, 'schools', session.schoolId), {
-          recentMessages: nextRecent,
-          updatedAt: serverTimestamp(),
-        });
+        await withWriteTimeout(
+          updateDoc(doc(instances.db, 'schools', session.schoolId), {
+            recentMessages: nextRecent,
+            updatedAt: serverTimestamp(),
+          })
+        );
       } catch {
         // Assistant teachers may not have write access to root school doc depending on rules; ignore silently
       }
 
       setChatInput('');
     } catch (err) {
-      setErrorText(err instanceof Error ? err.message : String(err));
+      setErrorText(formatFirestoreError(err));
     } finally {
       setSendingChat(false);
+      setSyncing(false);
     }
   };
 

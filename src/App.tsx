@@ -3,40 +3,66 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
-import { AdminPanelView } from './components/AdminPanelView';
-import { AttendanceView } from './components/AttendanceView';
-import { BatchFieldsView } from './components/BatchFieldsView';
-import { BatchMarksView } from './components/BatchMarksView';
-import { CommsView } from './components/CommsView';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { ConfigMissingScreen } from './components/ConfigMissingScreen';
-import { DashboardView } from './components/DashboardView';
 import { LoginScreen } from './components/LoginScreen';
-import { MarksheetView } from './components/MarksheetView';
-import { PromotionManagerView } from './components/PromotionManagerView';
-import { StudentsView } from './components/StudentsView';
 import { WorkspaceLayout, type NavTab } from './components/WorkspaceLayout';
 import { AppProvider, useApp } from './contexts/AppContext';
 import { getFirebaseEnvStatus } from './lib/firebase';
 
+const DashboardView = lazy(() =>
+  import('./components/DashboardView').then((m) => ({ default: m.DashboardView }))
+);
+const StudentsView = lazy(() =>
+  import('./components/StudentsView').then((m) => ({ default: m.StudentsView }))
+);
+const BatchMarksView = lazy(() =>
+  import('./components/BatchMarksView').then((m) => ({ default: m.BatchMarksView }))
+);
+const AttendanceView = lazy(() =>
+  import('./components/AttendanceView').then((m) => ({ default: m.AttendanceView }))
+);
+const PromotionManagerView = lazy(() =>
+  import('./components/PromotionManagerView').then((m) => ({ default: m.PromotionManagerView }))
+);
+const BatchFieldsView = lazy(() =>
+  import('./components/BatchFieldsView').then((m) => ({ default: m.BatchFieldsView }))
+);
+const MarksheetView = lazy(() =>
+  import('./components/MarksheetView').then((m) => ({ default: m.MarksheetView }))
+);
+const CommsView = lazy(() =>
+  import('./components/CommsView').then((m) => ({ default: m.CommsView }))
+);
+const AdminPanelView = lazy(() =>
+  import('./components/AdminPanelView').then((m) => ({ default: m.AdminPanelView }))
+);
+
+const TabFallback: React.FC = () => (
+  <div className="bg-white border border-stone-200 rounded-xl p-8 text-center text-sm text-slate-500">
+    Loading...
+  </div>
+);
+
 const MainAppShell: React.FC = () => {
-  const { session, dataLoading } = useApp();
-  const [isUpdateDeepLink] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false;
-    return new URLSearchParams(window.location.search).get('update') === '1';
-  });
+  const { session, dataLoading, activateModule } = useApp();
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [adminInitialTab, setAdminInitialTab] = useState<
     'teachers' | 'approvals' | 'setup' | 'update'
   >('teachers');
 
-  // Ensure ?update=1 lands on Dashboard right after sign-in
+  // Activate lazy Firestore listeners only when their corresponding tab opens
   useEffect(() => {
-    if (session && isUpdateDeepLink) {
-      setActiveTab('dashboard');
+    if (!session) return;
+    if (activeTab === 'attendance' || activeTab === 'marksheet') {
+      activateModule('attendance');
+    } else if (activeTab === 'comms') {
+      activateModule('comms');
+    } else if (activeTab === 'admin' && session.role === 'ADMIN') {
+      activateModule('pending');
     }
-  }, [session, isUpdateDeepLink]);
+  }, [activeTab, session, activateModule]);
 
   // Ensure non-Admin users never remain on Admin tab if role downgrades live
   useEffect(() => {
@@ -64,7 +90,7 @@ const MainAppShell: React.FC = () => {
     setActiveTab('students');
   };
 
-  const handleOpenAppUpdatePublisher = () => {
+  const handleOpenApkCleanup = () => {
     setAdminInitialTab('update');
     setActiveTab('admin');
   };
@@ -76,31 +102,32 @@ const MainAppShell: React.FC = () => {
           Syncing school records...
         </div>
       )}
-      {activeTab === 'dashboard' && (
-        <DashboardView
-          onNavigate={handleSelectTab}
-          onOpenStudentProfile={handleOpenStudentProfile}
-          onOpenAppUpdatePublisher={handleOpenAppUpdatePublisher}
-          highlightAppUpdate={isUpdateDeepLink}
-        />
-      )}
-      {activeTab === 'students' && (
-        <StudentsView
-          selectedProfileId={selectedProfileId}
-          onSelectProfile={setSelectedProfileId}
-        />
-      )}
-      {activeTab === 'batch-marks' && (
-        <BatchMarksView onOpenStudentProfile={handleOpenStudentProfile} />
-      )}
-      {activeTab === 'attendance' && <AttendanceView />}
-      {activeTab === 'promotion' && <PromotionManagerView />}
-      {activeTab === 'batch-fields' && <BatchFieldsView />}
-      {activeTab === 'marksheet' && <MarksheetView />}
-      {activeTab === 'comms' && <CommsView />}
-      {activeTab === 'admin' && session.role === 'ADMIN' && (
-        <AdminPanelView initialTab={adminInitialTab} />
-      )}
+      <Suspense fallback={<TabFallback />}>
+        {activeTab === 'dashboard' && (
+          <DashboardView
+            onNavigate={handleSelectTab}
+            onOpenStudentProfile={handleOpenStudentProfile}
+            onOpenApkCleanup={handleOpenApkCleanup}
+          />
+        )}
+        {activeTab === 'students' && (
+          <StudentsView
+            selectedProfileId={selectedProfileId}
+            onSelectProfile={setSelectedProfileId}
+          />
+        )}
+        {activeTab === 'batch-marks' && (
+          <BatchMarksView onOpenStudentProfile={handleOpenStudentProfile} />
+        )}
+        {activeTab === 'attendance' && <AttendanceView />}
+        {activeTab === 'promotion' && <PromotionManagerView />}
+        {activeTab === 'batch-fields' && <BatchFieldsView />}
+        {activeTab === 'marksheet' && <MarksheetView />}
+        {activeTab === 'comms' && <CommsView />}
+        {activeTab === 'admin' && session.role === 'ADMIN' && (
+          <AdminPanelView initialTab={adminInitialTab} />
+        )}
+      </Suspense>
     </WorkspaceLayout>
   );
 };

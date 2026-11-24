@@ -1,11 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, doc, serverTimestamp, writeBatch } from 'firebase/firestore';
+import { addDoc, collection, doc, serverTimestamp } from 'firebase/firestore';
 import { ArrowUpRight, Sparkles, Save, Send, X } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
+  buildChunkedArrayPendingPayloads,
   buildPendingChangePayload,
+  clampText,
+  commitBatchesInChunks,
+  FIRESTORE_LIMITS,
+  formatFirestoreError,
   validateAndBuildStudentPayload,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
@@ -16,6 +22,7 @@ import {
   normalizeExamConfigs,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
+import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
 function getNextClassLevel(current: string): string {
   const idx = CLASS_LEVELS.indexOf(current as (typeof CLASS_LEVELS)[number]);
@@ -34,6 +41,7 @@ export const PromotionManagerView: React.FC = () => {
     customFields,
     selectedAcademicYear,
     selectedClass,
+    setSyncing,
   } = useApp();
 
   const isAdmin = session?.role === 'ADMIN';
@@ -41,10 +49,12 @@ export const PromotionManagerView: React.FC = () => {
   const [targetClass, setTargetClass] = useState<string>(() =>
     getNextClassLevel(selectedClass)
   );
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     setTargetClass(getNextClassLevel(selectedClass));
-  }, [selectedClass]);
+    setPage(1);
+  }, [selectedClass, selectedAcademicYear]);
 
   const classStudents = useMemo(
     () =>
@@ -57,6 +67,11 @@ export const PromotionManagerView: React.FC = () => {
         .sort(compareRollNumbers),
     [students, selectedAcademicYear, selectedClass]
   );
+
+  const pagedStudents = useMemo(() => {
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    return classStudents.slice(start, start + DEFAULT_PAGE_SIZE);
+  }, [classStudents, page]);
 
   const examConfigs = useMemo(
     () => normalizeExamConfigs(school?.examConfigs),
@@ -157,12 +172,13 @@ export const PromotionManagerView: React.FC = () => {
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
       const updates = classStudents.map((st) => ({
         studentId: st.id,
-        studentName: st.studentNameBn || st.studentNameEn,
+        studentName: clampText(st.studentNameBn || st.studentNameEn, 80),
         fieldsPatch: {
           promotionStatus: String(drafts[st.id]?.promotionStatus ?? '').trim(),
           nextYearRollNumber: String(drafts[st.id]?.nextYearRollNumber ?? '').trim(),
@@ -170,44 +186,47 @@ export const PromotionManagerView: React.FC = () => {
       }));
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const u of updates) {
+        const actorName = clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS);
+        await commitBatchesInChunks(instances.db, updates, (batch, u) => {
           batch.update(doc(instances.db, 'schools', session.schoolId, 'students', u.studentId), {
             ...u.fieldsPatch,
-            lastUpdatedByName: session.name,
+            lastUpdatedByName: actorName,
             updatedAt: serverTimestamp(),
           });
-        }
-        await batch.commit();
+        });
         setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `promo_status_${selectedAcademicYear}_${selectedClass}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Promotion & Next Rolls (${selectedClass} ${selectedAcademicYear})`,
-          detailsText: `${updates.length} student records updated`,
-          payloadJson: JSON.stringify({
-            kind: 'ROLL_PROMOTION',
-            updates,
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+        const chunks = buildChunkedArrayPendingPayloads('ROLL_PROMOTION', 'updates', updates);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const chunk = chunks[idx];
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `promo_status_${selectedAcademicYear}_${selectedClass}_${idx + 1}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Promotion & Next Rolls (${selectedClass} ${selectedAcademicYear})${chunks.length > 1 ? ` [${idx + 1}/${chunks.length}]` : ''}`,
+            detailsText: `${chunk.itemCount} student records updated`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -217,6 +236,7 @@ export const PromotionManagerView: React.FC = () => {
     if (!instances) return;
 
     setSaving(true);
+    setSyncing(true);
     setBanner(null);
 
     try {
@@ -244,7 +264,7 @@ export const PromotionManagerView: React.FC = () => {
           dateOfBirth: st.dateOfBirth,
           guardianPhone: st.guardianPhone,
           address: st.address,
-          photoBase64: st.photoBase64,
+          photoBase64: isAdmin ? st.photoBase64 : '',
           rollNumber: d.nextYearRollNumber || st.rollNumber,
           nextYearRollNumber: '',
           classLevel: targetClass,
@@ -265,26 +285,40 @@ export const PromotionManagerView: React.FC = () => {
       }
 
       if (isAdmin) {
-        const batch = writeBatch(instances.db);
-        for (const st of selectedStudents) {
-          const d = drafts[st.id];
-          batch.update(doc(instances.db, 'schools', session.schoolId, 'students', st.id), {
-            promotionStatus: String(d?.promotionStatus ?? 'Promoted').trim(),
-            nextYearRollNumber: String(d?.nextYearRollNumber ?? '').trim(),
-            lastUpdatedByName: session.name,
-            updatedAt: serverTimestamp(),
-          });
-        }
-        for (const rec of newRecords) {
-          const validated = validateAndBuildStudentPayload(
-            rec.data,
-            session.schoolId,
-            session.name
-          );
-          const newRef = doc(collection(instances.db, 'schools', session.schoolId, 'students'));
-          batch.set(newRef, validated);
-        }
-        await batch.commit();
+        const actorName = clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS);
+        type PromoOp =
+          | { kind: 'update'; studentId: string; promotionStatus: string; nextYearRollNumber: string }
+          | { kind: 'create'; payload: Record<string, unknown> };
+
+        const ops: PromoOp[] = [
+          ...selectedStudents.map((st) => {
+            const d = drafts[st.id];
+            return {
+              kind: 'update' as const,
+              studentId: st.id,
+              promotionStatus: String(d?.promotionStatus ?? 'Promoted').trim(),
+              nextYearRollNumber: String(d?.nextYearRollNumber ?? '').trim(),
+            };
+          }),
+          ...newRecords.map((rec) => ({
+            kind: 'create' as const,
+            payload: validateAndBuildStudentPayload(rec.data, session.schoolId, session.name),
+          })),
+        ];
+
+        await commitBatchesInChunks(instances.db, ops, (batch, op) => {
+          if (op.kind === 'update') {
+            batch.update(doc(instances.db, 'schools', session.schoolId, 'students', op.studentId), {
+              promotionStatus: op.promotionStatus,
+              nextYearRollNumber: op.nextYearRollNumber,
+              lastUpdatedByName: actorName,
+              updatedAt: serverTimestamp(),
+            });
+          } else {
+            const newRef = doc(collection(instances.db, 'schools', session.schoolId, 'students'));
+            batch.set(newRef, op.payload);
+          }
+        });
         setBanner({
           type: 'success',
           text:
@@ -293,33 +327,37 @@ export const PromotionManagerView: React.FC = () => {
               : `Promoted ${selectedStudents.length} students into ${targetClass} (${targetYear}).`,
         });
       } else {
-        const pendingDoc = buildPendingChangePayload({
-          schoolId: session.schoolId,
-          entityType: 'STUDENT_BATCH_UPDATE',
-          targetId: `promote_${selectedAcademicYear}_to_${targetYear}`,
-          submittedByDeviceId: session.deviceId,
-          submittedByName: session.name,
-          summary: `Promote ${selectedStudents.length} students from ${selectedClass} (${selectedAcademicYear}) → ${targetClass} (${targetYear})`,
-          detailsText: `${selectedStudents.length} new academic year student records`,
-          payloadJson: JSON.stringify({
-            kind: 'ROSTER_IMPORT',
-            students: newRecords,
-          }),
-          status: 'PENDING',
-        });
-        await addDoc(
-          collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-          pendingDoc
-        );
+        const chunks = buildChunkedArrayPendingPayloads('ROSTER_IMPORT', 'students', newRecords);
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const chunk = chunks[idx];
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `promote_${selectedAcademicYear}_to_${targetYear}_${idx + 1}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Promote ${selectedStudents.length} students (${selectedClass} ${selectedAcademicYear} → ${targetClass} ${targetYear})${chunks.length > 1 ? ` [${idx + 1}/${chunks.length}]` : ''}`,
+            detailsText: `${chunk.itemCount} new academic year student records`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
         setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
       }
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setSaving(false);
+      setSyncing(false);
     }
   };
 
@@ -407,6 +445,7 @@ export const PromotionManagerView: React.FC = () => {
             {t(lang, 'noStudentsFound')}
           </div>
         ) : (
+          <>
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left">
               <thead>
@@ -435,7 +474,7 @@ export const PromotionManagerView: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {classStudents.map((st) => {
+                {pagedStudents.map((st) => {
                   const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
                   const merit = meritMap.get(st.id);
                   const d = drafts[st.id] || { promotionStatus: '', nextYearRollNumber: '' };
@@ -508,6 +547,13 @@ export const PromotionManagerView: React.FC = () => {
               </tbody>
             </table>
           </div>
+          <PaginationBar
+            lang={lang}
+            page={page}
+            totalItems={classStudents.length}
+            onPageChange={setPage}
+          />
+          </>
         )}
       </div>
     </div>

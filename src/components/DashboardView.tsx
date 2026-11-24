@@ -1,23 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import {
-  AlertTriangle,
   ArrowRight,
   CalendarCheck2,
   ClipboardList,
-  Download,
   FileSpreadsheet,
   Search,
-  Settings2,
-  Smartphone,
+  Trash2,
   Users,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
-import {
-  type ApkDownloadProgress,
-  downloadPrivateApkRelease,
-  NoApkChunksError,
-} from '../lib/apkChunks';
-import { getFirebaseInstances } from '../lib/firebase';
+import { hasLegacyApkMetadata } from '../lib/apkChunks';
 import { getClassLabel, t } from '../lib/i18n';
 import {
   formatPhotoSrc,
@@ -31,15 +23,13 @@ import type { NavTab } from './WorkspaceLayout';
 interface DashboardViewProps {
   onNavigate: (tab: NavTab) => void;
   onOpenStudentProfile: (studentId: string) => void;
-  onOpenAppUpdatePublisher?: () => void;
-  highlightAppUpdate?: boolean;
+  onOpenApkCleanup?: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
   onOpenStudentProfile,
-  onOpenAppUpdatePublisher,
-  highlightAppUpdate = false,
+  onOpenApkCleanup,
 }) => {
   const {
     lang,
@@ -48,56 +38,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     students,
     attendanceLogs,
     pendingChanges,
+    loadedModules,
     selectedAcademicYear,
     selectedClass,
     setSelectedClass,
   } = useApp();
 
   const [quickQuery, setQuickQuery] = useState('');
-  const [downloadingApk, setDownloadingApk] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState<ApkDownloadProgress | null>(null);
-  const [apkDownloadError, setApkDownloadError] = useState<string | null>(null);
-  const [noChunksFound, setNoChunksFound] = useState(false);
 
-  const hasPublishedUpdateMeta = Boolean(
-    school?.latestAppVersionCode !== undefined || school?.appUpdateUrl
-  );
-
-  const handleDownloadPrivateApk = async () => {
-    const instances = getFirebaseInstances();
-    if (!instances || !session?.schoolId) return;
-
-    setDownloadingApk(true);
-    setApkDownloadError(null);
-    setNoChunksFound(false);
-    setDownloadProgress({ phase: 'fetching', currentChunk: 0, totalChunks: 1, percent: 5 });
-
-    try {
-      await downloadPrivateApkRelease({
-        db: instances.db,
-        schoolId: session.schoolId,
-        latestAppVersionCode: school?.latestAppVersionCode,
-        latestAppVersionName: school?.latestAppVersionName,
-        onProgress: setDownloadProgress,
-      });
-    } catch (err: unknown) {
-      if (err instanceof NoApkChunksError) {
-        setNoChunksFound(true);
-      } else {
-        const fbErr = err as { code?: string; message?: string };
-        setApkDownloadError(
-          fbErr?.code
-            ? `${fbErr.code}: ${fbErr.message || String(err)}`
-            : err instanceof Error
-            ? err.message
-            : String(err)
-        );
-      }
-    } finally {
-      setDownloadingApk(false);
-      setDownloadProgress(null);
-    }
-  };
+  const showLegacyApkCleanupBanner =
+    session?.role === 'ADMIN' && hasLegacyApkMetadata(school) && Boolean(onOpenApkCleanup);
 
   const yearStudents = useMemo(
     () => students.filter((s) => Number(s.academicYear) === Number(selectedAcademicYear)),
@@ -111,7 +61,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const todayKey = getTodayDateKey();
   const todayAttDocId = getAttendanceDocId(selectedAcademicYear, selectedClass, todayKey);
-  const todayAttendance = attendanceLogs.find((a) => a.id === todayAttDocId);
+  const todayAttendance = loadedModules.attendance
+    ? attendanceLogs.find((a) => a.id === todayAttDocId)
+    : undefined;
 
   const presentTodayCount = useMemo(() => {
     if (!todayAttendance?.statuses) return 0;
@@ -124,8 +76,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       : null;
 
   const pendingCount = useMemo(
-    () => pendingChanges.filter((c) => c.status === 'PENDING').length,
-    [pendingChanges]
+    () =>
+      loadedModules.pending
+        ? pendingChanges.filter((c) => c.status === 'PENDING').length
+        : null,
+    [loadedModules.pending, pendingChanges]
   );
 
   const classSubjects = useMemo(
@@ -151,165 +106,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return CLASS_LEVELS.map((cls) => {
       const count = yearStudents.filter((s) => s.classLevel === cls).length;
       const docId = getAttendanceDocId(selectedAcademicYear, cls, todayKey);
-      const log = attendanceLogs.find((a) => a.id === docId);
+      const log = loadedModules.attendance
+        ? attendanceLogs.find((a) => a.id === docId)
+        : undefined;
       const present = log?.statuses
         ? Object.values(log.statuses).filter((v) => v === 'P' || v === 'L').length
         : null;
       return { classLevel: cls, count, present };
     });
-  }, [yearStudents, attendanceLogs, selectedAcademicYear, todayKey]);
-
-  const showAppUpdateCard =
-    hasPublishedUpdateMeta || session?.role === 'ADMIN' || highlightAppUpdate;
-
-  const renderAppUpdateCard = () => {
-    if (!showAppUpdateCard) return null;
-    return (
-      <section
-        className={`border rounded-xl p-5 ${
-          highlightAppUpdate
-            ? 'bg-emerald-50 border-emerald-300 ring-2 ring-emerald-600 shadow-xs'
-            : 'bg-emerald-50/70 border-emerald-200'
-        }`}
-      >
-        {hasPublishedUpdateMeta ? (
-          <div className="space-y-3">
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-              <div className="flex items-start gap-3.5 min-w-0">
-                <div className="w-10 h-10 rounded-lg bg-emerald-700 text-white flex items-center justify-center shrink-0">
-                  <Smartphone className="w-5 h-5" />
-                </div>
-                <div className="min-w-0 space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-base font-semibold text-slate-900">
-                      {t(lang, 'androidAppUpdateTitle')}
-                    </h3>
-                    <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-white border border-emerald-200 px-2 py-0.5 rounded">
-                      {school?.latestAppVersionName
-                        ? `v${school.latestAppVersionName}`
-                        : 'v—'}{' '}
-                      {school?.latestAppVersionCode !== undefined
-                        ? `(#${school.latestAppVersionCode})`
-                        : ''}
-                    </span>
-                  </div>
-                  {school?.appUpdateNotes && (
-                    <p className="text-sm text-slate-700">{school.appUpdateNotes}</p>
-                  )}
-                  <p className="text-xs text-slate-700 leading-relaxed">
-                    {t(lang, 'appUpdateMobileHint')}
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-                <button
-                  type="button"
-                  disabled={downloadingApk}
-                  onClick={handleDownloadPrivateApk}
-                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white rounded-lg transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <Download className="w-4 h-4 shrink-0" />
-                  <span>
-                    {downloadingApk && downloadProgress
-                      ? `${t(lang, 'downloadingApkProgress')} ${downloadProgress.percent}%`
-                      : t(lang, 'downloadAndroidApp')}
-                  </span>
-                </button>
-                {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
-                  <button
-                    type="button"
-                    onClick={onOpenAppUpdatePublisher}
-                    className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-slate-700 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg cursor-pointer whitespace-nowrap"
-                  >
-                    <Settings2 className="w-3.5 h-3.5 text-emerald-700" />
-                    <span>{t(lang, 'configureAppUpdate')}</span>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {downloadingApk && downloadProgress && (
-              <div className="p-3 bg-white border border-emerald-200 rounded-lg space-y-1.5">
-                <div className="flex items-center justify-between text-xs font-medium text-emerald-900">
-                  <span>
-                    {downloadProgress.phase === 'fetching'
-                      ? t(lang, 'downloadingApkProgress')
-                      : `${t(lang, 'downloadingApkProgress')} (${downloadProgress.currentChunk}/${downloadProgress.totalChunks})`}
-                  </span>
-                  <span className="font-mono tabular-nums">{downloadProgress.percent}%</span>
-                </div>
-                <div className="w-full h-2 bg-emerald-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-emerald-700 transition-all duration-150"
-                    style={{ width: `${downloadProgress.percent}%` }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {noChunksFound && (
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 rounded-lg bg-amber-50 border border-amber-200">
-                <div className="flex items-start gap-2.5 text-xs text-amber-900">
-                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                  <span>{t(lang, 'noChunksUploadedNotice')}</span>
-                </div>
-                {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
-                  <button
-                    type="button"
-                    onClick={onOpenAppUpdatePublisher}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-700 hover:bg-amber-800 text-white rounded-lg cursor-pointer whitespace-nowrap shrink-0 self-start sm:self-auto"
-                  >
-                    <Settings2 className="w-3.5 h-3.5" />
-                    <span>{t(lang, 'uploadNewApkBtn')}</span>
-                  </button>
-                )}
-              </div>
-            )}
-
-            {apkDownloadError && (
-              <div
-                role="alert"
-                className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800"
-              >
-                {t(lang, 'errorPrefix')} {apkDownloadError}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-lg bg-white border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
-                <Smartphone className="w-4 h-4" />
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold text-slate-900">
-                  {t(lang, 'androidAppUpdateTitle')}
-                </h3>
-                <p className="text-xs text-slate-600">{t(lang, 'appUpdateNotConfigured')}</p>
-              </div>
-            </div>
-            {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
-              <button
-                type="button"
-                onClick={onOpenAppUpdatePublisher}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer whitespace-nowrap self-start sm:self-auto"
-              >
-                <Settings2 className="w-3.5 h-3.5" />
-                <span>{t(lang, 'publishAppUpdate')}</span>
-              </button>
-            )}
-          </div>
-        )}
-      </section>
-    );
-  };
+  }, [yearStudents, attendanceLogs, loadedModules.attendance, selectedAcademicYear, todayKey]);
 
   return (
     <div className="space-y-6">
-      {/* Highlighted at top when arriving from ?update=1 */}
-      {highlightAppUpdate && renderAppUpdateCard()}
-
       {/* School Identity Banner */}
       <section className="bg-white border border-stone-200 rounded-xl p-5 sm:p-6">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
@@ -319,13 +127,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </h2>
             <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-600">
               <span>
-                {t(lang, 'schoolIdLabel')}: <span className="font-mono font-medium text-slate-800">{session?.schoolId}</span>
+                {t(lang, 'schoolIdLabel')}:{' '}
+                <span className="font-mono font-medium text-slate-800">{session?.schoolId}</span>
               </span>
               {school?.emisCode && (
                 <>
                   <span aria-hidden="true">·</span>
                   <span>
-                    {t(lang, 'emisCode')}: <span className="font-mono tabular-nums text-slate-800">{school.emisCode}</span>
+                    {t(lang, 'emisCode')}:{' '}
+                    <span className="font-mono tabular-nums text-slate-800">{school.emisCode}</span>
                   </span>
                 </>
               )}
@@ -361,8 +171,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </section>
 
-      {/* Default position when not deep-linked with ?update=1 */}
-      {!highlightAppUpdate && renderAppUpdateCard()}
+      {/* One-time Admin Notice when legacy APK metadata/chunks remain on server */}
+      {showLegacyApkCleanupBanner && (
+        <section className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <h3 className="text-sm font-semibold text-amber-950">{t(lang, 'deleteApkTitle')}</h3>
+            <p className="text-xs text-amber-900/90 leading-relaxed">
+              {lang === 'bn'
+                ? 'সার্ভারে পুরোনো আপলোড করা APK ফাইল/মেটাডেটা রয়েছে। শিক্ষার্থী বা নম্বরের কোনো ক্ষতি না করেই এগুলো মুছে ফেলা যাবে।'
+                : 'Previously uploaded APK update chunks/metadata exist on the server. Remove them safely without affecting students or marks.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenApkCleanup}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-amber-700 hover:bg-amber-800 text-white rounded-lg cursor-pointer whitespace-nowrap shrink-0 self-start sm:self-auto"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>{t(lang, 'deleteApkBtn')}</span>
+          </button>
+        </section>
+      )}
 
       {/* 4 Summary Stat Cards */}
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -390,7 +219,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
 
-        <div className="bg-white border border-stone-200 rounded-xl p-5">
+        <div
+          onClick={() => onNavigate('attendance')}
+          className="bg-white border border-stone-200 rounded-xl p-5 cursor-pointer hover:border-emerald-300 transition-colors"
+        >
           <div className="text-xs font-medium text-slate-500">
             {t(lang, 'todayAttendance')} ({getClassLabel(selectedClass, lang)})
           </div>
@@ -400,7 +232,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="mt-1 text-xs text-slate-500 tabular-nums">
             {todayAttendance
               ? `${presentTodayCount} / ${classStudents.length} ${t(lang, 'present')}`
-              : todayKey}
+              : loadedModules.attendance
+              ? todayKey
+              : lang === 'bn'
+              ? 'উপস্থিতি দেখতে ক্লিক করুন'
+              : 'Click to open register'}
           </div>
         </div>
 
@@ -416,7 +252,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               : t(lang, 'activeSubjects')}
           </div>
           <div className="mt-2 text-3xl font-bold text-slate-900 tabular-nums">
-            {session?.role === 'ADMIN' ? pendingCount : classSubjects.length}
+            {session?.role === 'ADMIN'
+              ? pendingCount !== null
+                ? pendingCount
+                : '—'
+              : classSubjects.length}
           </div>
           <div className="mt-1 text-xs text-slate-500">
             {session?.role === 'ADMIN'
@@ -523,6 +363,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                             <img
                               src={photo}
                               alt={st.studentNameEn || st.studentNameBn}
+                              loading="lazy"
+                              decoding="async"
                               referrerPolicy="no-referrer"
                               className="w-8 h-8 rounded-full object-cover border border-stone-200 shrink-0"
                             />

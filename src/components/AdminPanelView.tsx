@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   collection,
   deleteDoc,
@@ -6,36 +6,35 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
-  writeBatch,
 } from 'firebase/firestore';
 import {
   Check,
-  FileArchive,
   KeyRound,
   Plus,
   ShieldAlert,
-  Smartphone,
+  ShieldCheck,
   Trash2,
-  Upload,
   UserX,
   X,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import {
-  APK_CHUNK_SIZE_BYTES,
-  MAX_APK_CHUNKS,
-  type ApkUploadProgress,
-  uploadPrivateApkRelease,
+  deleteUploadedApkChunksFromServer,
+  hasLegacyApkMetadata,
 } from '../lib/apkChunks';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildAttendancePayload,
   buildCustomFieldPayload,
   buildSubjectPayload,
+  clampText,
+  commitBatchesInChunks,
   FIRESTORE_LIMITS,
+  formatFirestoreError,
   sanitizeExamConfigs,
   sanitizeStringRecordMap,
   validateAndBuildStudentPayload,
+  withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
 import {
@@ -71,6 +70,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     subjects,
     customFields,
     pendingChanges,
+    setSyncing,
   } = useApp();
 
   const [adminTab, setAdminTab] = useState<'teachers' | 'approvals' | 'setup' | 'update'>(
@@ -109,19 +109,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [newCfType, setNewCfType] = useState<CustomFieldType>('TEXT');
   const [newCfResets, setNewCfResets] = useState(false);
 
-  // Private APK Uploader State
-  const [versionCode, setVersionCode] = useState(
-    school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
-      ? String(school.latestAppVersionCode)
-      : '13'
-  );
-  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '2.2');
-  const [apkFile, setApkFile] = useState<File | null>(null);
-  const apkInputRef = useRef<HTMLInputElement | null>(null);
-  const [updateNotes, setUpdateNotes] = useState(school?.appUpdateNotes || '');
-  const [updateAdminPassword, setUpdateAdminPassword] = useState('');
-  const [savingUpdate, setSavingUpdate] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<ApkUploadProgress | null>(null);
+  // Safe Server APK Cleanup State
+  const [cleanupPassword, setCleanupPassword] = useState('');
+  const [cleaningApk, setCleaningApk] = useState(false);
+  const [deletedSoFar, setDeletedSoFar] = useState(0);
+  const [lastDeletedResult, setLastDeletedResult] = useState<number | null>(null);
 
   useEffect(() => {
     setAdminTab(initialTab);
@@ -130,20 +122,6 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   useEffect(() => {
     setExamDrafts(normalizeExamConfigs(school?.examConfigs));
   }, [school?.examConfigs]);
-
-  useEffect(() => {
-    setVersionCode(
-      school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
-        ? String(school.latestAppVersionCode)
-        : '13'
-    );
-    setVersionName(school?.latestAppVersionName || '2.2');
-    setUpdateNotes(school?.appUpdateNotes || '');
-  }, [
-    school?.latestAppVersionCode,
-    school?.latestAppVersionName,
-    school?.appUpdateNotes,
-  ]);
 
   if (session?.role !== 'ADMIN') {
     return (
@@ -245,11 +223,16 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     if (!instances || !session) return;
 
     setProcessingChangeId(change.id);
+    setSyncing(true);
     setBanner(null);
 
     try {
       const payload = JSON.parse(change.payloadJson || '{}');
       const schoolId = session.schoolId;
+      const updatedBy = clampText(
+        change.submittedByName || session.name,
+        FIRESTORE_LIMITS.USER_NAME_MAX_CHARS
+      );
 
       if (change.entityType === 'STUDENT_CREATE' || change.entityType === 'STUDENT_UPDATE') {
         const stData = (payload.student || payload) as Partial<StudentDoc>;
@@ -263,32 +246,125 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         const validated = validateAndBuildStudentPayload(
           { ...existing, ...stData },
           schoolId,
-          change.submittedByName || session.name,
+          updatedBy,
           existing?.createdAt
         );
         const ref = targetStudentId
           ? doc(instances.db, 'schools', schoolId, 'students', targetStudentId)
           : doc(collection(instances.db, 'schools', schoolId, 'students'));
-        await setDoc(ref, validated, { merge: true });
+        await withWriteTimeout(setDoc(ref, validated, { merge: true }));
       } else if (change.entityType === 'STUDENT_DELETE') {
         const targetId = String(payload.studentId || change.targetId);
         if (targetId) {
-          await deleteDoc(doc(instances.db, 'schools', schoolId, 'students', targetId));
+          await withWriteTimeout(
+            deleteDoc(doc(instances.db, 'schools', schoolId, 'students', targetId))
+          );
         }
       } else if (change.entityType === 'STUDENT_BATCH_UPDATE') {
-        const items: Array<Record<string, unknown>> = Array.isArray(payload)
-          ? payload
-          : Array.isArray(payload.updates)
-          ? payload.updates
-          : Array.isArray(payload.students)
-          ? payload.students
-          : [];
+        const isRecordUpdatesMap =
+          payload &&
+          typeof payload === 'object' &&
+          payload.updates &&
+          typeof payload.updates === 'object' &&
+          !Array.isArray(payload.updates);
 
-        for (let i = 0; i < items.length; i += 400) {
-          const chunk = items.slice(i, i + 400);
-          const batch = writeBatch(instances.db);
-          for (const item of chunk) {
-            // Handle ROSTER_IMPORT items { existingId?, data }
+        if (isRecordUpdatesMap) {
+          // Compact patch format: { updates: { [studentId]: { "examResults.<key>": "<string>" } } }
+          const entries = Object.entries(
+            payload.updates as Record<string, Record<string, unknown>>
+          );
+
+          await commitBatchesInChunks(instances.db, entries, (batch, [studentId, patchObj]) => {
+            if (!studentId || !patchObj || typeof patchObj !== 'object') return;
+            const existing = students.find((s) => s.id === studentId);
+            if (!existing) return;
+
+            const mergedExam: Record<string, unknown> = { ...(existing.examResults || {}) };
+            const mergedSubj: Record<string, unknown> = { ...(existing.subjectValues || {}) };
+            const mergedCustom: Record<string, unknown> = { ...(existing.customValues || {}) };
+            let touchedExam = false;
+            let touchedSubj = false;
+            let touchedCustom = false;
+            const directFields: Record<string, unknown> = {};
+
+            for (const [k, v] of Object.entries(patchObj)) {
+              if (k.startsWith('examResults.')) {
+                touchedExam = true;
+                const subKey = k.slice('examResults.'.length);
+                const str = String(v ?? '').trim();
+                if (str === '') delete mergedExam[subKey];
+                else mergedExam[subKey] = str;
+              } else if (k.startsWith('subjectValues.')) {
+                touchedSubj = true;
+                const subKey = k.slice('subjectValues.'.length);
+                const str = String(v ?? '').trim();
+                if (str === '') delete mergedSubj[subKey];
+                else mergedSubj[subKey] = str;
+              } else if (k.startsWith('customValues.')) {
+                touchedCustom = true;
+                const subKey = k.slice('customValues.'.length);
+                const str = String(v ?? '').trim();
+                if (str === '') delete mergedCustom[subKey];
+                else mergedCustom[subKey] = str;
+              } else if (
+                [
+                  'rollNumber',
+                  'nextYearRollNumber',
+                  'guardianPhone',
+                  'sectorNotes',
+                  'section',
+                  'promotionStatus',
+                  'classLevel',
+                ].includes(k)
+              ) {
+                directFields[k] = String(v ?? '').trim();
+              } else if (k === 'totalSchoolDays' || k === 'daysPresent') {
+                const n = Number(v);
+                directFields[k] = Number.isFinite(n) && n >= 0 ? Math.trunc(n) : 0;
+              }
+            }
+
+            const docUpdate: Record<string, unknown> = {
+              ...directFields,
+              lastUpdatedByName: updatedBy,
+              updatedAt: serverTimestamp(),
+            };
+
+            if (touchedExam) {
+              const sanitized = sanitizeStringRecordMap(mergedExam);
+              if (Object.keys(sanitized).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
+                throw new Error('Exam results limit exceeded.');
+              }
+              docUpdate.examResults = sanitized;
+            }
+            if (touchedSubj) {
+              const sanitized = sanitizeStringRecordMap(mergedSubj);
+              if (Object.keys(sanitized).length > FIRESTORE_LIMITS.SUBJECT_VALUES_MAX_KEYS) {
+                throw new Error('Subject values limit exceeded.');
+              }
+              docUpdate.subjectValues = sanitized;
+            }
+            if (touchedCustom) {
+              const sanitized = sanitizeStringRecordMap(mergedCustom);
+              if (Object.keys(sanitized).length > FIRESTORE_LIMITS.CUSTOM_VALUES_MAX_KEYS) {
+                throw new Error('Custom values limit exceeded.');
+              }
+              docUpdate.customValues = sanitized;
+            }
+
+            batch.update(doc(instances.db, 'schools', schoolId, 'students', studentId), docUpdate);
+          });
+        } else {
+          // Legacy array formats: updates[] or students[]
+          const items: Array<Record<string, unknown>> = Array.isArray(payload)
+            ? payload
+            : Array.isArray(payload.updates)
+            ? payload.updates
+            : Array.isArray(payload.students)
+            ? payload.students
+            : [];
+
+          await commitBatchesInChunks(instances.db, items, (batch, item) => {
             if (item.data && typeof item.data === 'object') {
               const existingId = item.existingId ? String(item.existingId) : undefined;
               const existing = existingId
@@ -297,28 +373,25 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               const validated = validateAndBuildStudentPayload(
                 { ...existing, ...(item.data as Partial<StudentDoc>) },
                 schoolId,
-                change.submittedByName || session.name,
+                updatedBy,
                 existing?.createdAt
               );
               const ref = existingId
                 ? doc(instances.db, 'schools', schoolId, 'students', existingId)
                 : doc(collection(instances.db, 'schools', schoolId, 'students'));
               batch.set(ref, validated, { merge: true });
-              continue;
+              return;
             }
 
             const studentId = String(item.studentId || item.id || '');
-            if (!studentId) continue;
+            if (!studentId) return;
             const existing = students.find((s) => s.id === studentId);
-            if (!existing) continue;
+            if (!existing) return;
 
             const ref = doc(instances.db, 'schools', schoolId, 'students', studentId);
 
             if (item.examResultsPatch && typeof item.examResultsPatch === 'object') {
-              const merged = { ...(existing.examResults || {}) } as Record<
-                string,
-                unknown
-              >;
+              const merged = { ...(existing.examResults || {}) } as Record<string, unknown>;
               for (const [k, v] of Object.entries(
                 item.examResultsPatch as Record<string, number | string | null>
               )) {
@@ -334,7 +407,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               }
               batch.update(ref, {
                 examResults: sanitized,
-                lastUpdatedByName: change.submittedByName || session.name,
+                lastUpdatedByName: updatedBy,
                 updatedAt: serverTimestamp(),
               });
             } else if (item.customValues && typeof item.customValues === 'object') {
@@ -344,7 +417,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               });
               batch.update(ref, {
                 customValues: merged,
-                lastUpdatedByName: change.submittedByName || session.name,
+                lastUpdatedByName: updatedBy,
                 updatedAt: serverTimestamp(),
               });
             } else if (item.subjectValues && typeof item.subjectValues === 'object') {
@@ -354,7 +427,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               });
               batch.update(ref, {
                 subjectValues: merged,
-                lastUpdatedByName: change.submittedByName || session.name,
+                lastUpdatedByName: updatedBy,
                 updatedAt: serverTimestamp(),
               });
             } else if (item.fieldsPatch && typeof item.fieldsPatch === 'object') {
@@ -366,6 +439,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 'sectorNotes',
                 'section',
                 'promotionStatus',
+                'classLevel',
               ]) {
                 if (strKey in rawPatch) {
                   rawPatch[strKey] = String(rawPatch[strKey] ?? '').trim();
@@ -373,12 +447,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               }
               batch.update(ref, {
                 ...rawPatch,
-                lastUpdatedByName: change.submittedByName || session.name,
+                lastUpdatedByName: updatedBy,
                 updatedAt: serverTimestamp(),
               });
             }
-          }
-          await batch.commit();
+          });
         }
       } else if (change.entityType === 'SUBJECT_SAVE') {
         const existing = change.targetId
@@ -388,10 +461,12 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         const ref = change.targetId
           ? doc(instances.db, 'schools', schoolId, 'subjects', change.targetId)
           : doc(collection(instances.db, 'schools', schoolId, 'subjects'));
-        await setDoc(ref, subPayload, { merge: true });
+        await withWriteTimeout(setDoc(ref, subPayload, { merge: true }));
       } else if (change.entityType === 'SUBJECT_DELETE') {
         if (change.targetId) {
-          await deleteDoc(doc(instances.db, 'schools', schoolId, 'subjects', change.targetId));
+          await withWriteTimeout(
+            deleteDoc(doc(instances.db, 'schools', schoolId, 'subjects', change.targetId))
+          );
         }
       } else if (change.entityType === 'CUSTOM_FIELD_SAVE') {
         const existing = change.targetId
@@ -401,11 +476,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         const ref = change.targetId
           ? doc(instances.db, 'schools', schoolId, 'customFields', change.targetId)
           : doc(collection(instances.db, 'schools', schoolId, 'customFields'));
-        await setDoc(ref, cfPayload, { merge: true });
+        await withWriteTimeout(setDoc(ref, cfPayload, { merge: true }));
       } else if (change.entityType === 'CUSTOM_FIELD_DELETE') {
         if (change.targetId) {
-          await deleteDoc(
-            doc(instances.db, 'schools', schoolId, 'customFields', change.targetId)
+          await withWriteTimeout(
+            deleteDoc(doc(instances.db, 'schools', schoolId, 'customFields', change.targetId))
           );
         }
       } else if (change.entityType === 'ATTENDANCE_SAVE') {
@@ -422,40 +497,44 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           classLevel: String(payload.classLevel),
           dateKey: String(payload.dateKey),
           statuses: payload.statuses || {},
-          markedByName: change.submittedByName || session.name,
+          markedByName: updatedBy,
         });
-        await setDoc(
-          doc(instances.db, 'schools', schoolId, 'attendanceLogs', docId),
-          attPayload,
-          { merge: true }
+        await withWriteTimeout(
+          setDoc(
+            doc(instances.db, 'schools', schoolId, 'attendanceLogs', docId),
+            attPayload,
+            { merge: true }
+          )
         );
       } else if (change.entityType === 'EXAM_CONFIG_SAVE') {
         const configs = sanitizeExamConfigs(
           Array.isArray(payload.examConfigs) ? payload.examConfigs : payload
         );
-        await updateDoc(doc(instances.db, 'schools', schoolId), {
-          examConfigs: configs,
-          updatedAt: serverTimestamp(),
-        });
+        await withWriteTimeout(
+          updateDoc(doc(instances.db, 'schools', schoolId), {
+            examConfigs: configs,
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
 
-      await updateDoc(
-        doc(instances.db, 'schools', schoolId, 'pendingChanges', change.id),
-        {
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', schoolId, 'pendingChanges', change.id), {
           status: 'APPROVED',
-          reviewedByName: session.name,
+          reviewedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
           updatedAt: serverTimestamp(),
-        }
+        })
       );
 
       setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setProcessingChangeId(null);
+      setSyncing(false);
     }
   };
 
@@ -464,23 +543,24 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     if (!instances || !session) return;
 
     setProcessingChangeId(change.id);
+    setSyncing(true);
     try {
-      await updateDoc(
-        doc(instances.db, 'schools', session.schoolId, 'pendingChanges', change.id),
-        {
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', session.schoolId, 'pendingChanges', change.id), {
           status: 'REJECTED',
-          reviewedByName: session.name,
+          reviewedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
           updatedAt: serverTimestamp(),
-        }
+        })
       );
       setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
       setProcessingChangeId(null);
+      setSyncing(false);
     }
   };
 
@@ -634,59 +714,21 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id));
   };
 
-  // 4. Private Android APK Uploader (Admin-only + Admin Password Verified)
-  const selectedApkChunkCount = apkFile
-    ? Math.ceil(apkFile.size / APK_CHUNK_SIZE_BYTES)
-    : 0;
-
-  const handleSaveAppUpdate = async (e: React.FormEvent) => {
+  // 4. Delete ONLY Uploaded APK Chunks From Server (Preserves All Student/School Data)
+  const handleDeleteApkChunks = async (e: React.FormEvent) => {
     e.preventDefault();
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
 
-    const trimmedCodeStr = versionCode.trim();
-    const rawNum = Number(trimmedCodeStr);
-    const intVersionCode = Math.trunc(rawNum);
-    if (
-      trimmedCodeStr === '' ||
-      !Number.isFinite(rawNum) ||
-      !Number.isInteger(rawNum) ||
-      intVersionCode < 1 ||
-      intVersionCode > 999999
-    ) {
-      setBanner({ type: 'error', text: t(lang, 'invalidVersionCode') });
+    if (!cleanupPassword) {
+      setBanner({ type: 'error', text: t(lang, 'adminPasswordRequiredForCleanup') });
       return;
     }
 
-    const trimmedVersionName = String(versionName).trim().slice(0, 20);
-    if (!trimmedVersionName) {
-      setBanner({ type: 'error', text: t(lang, 'invalidVersionName') });
-      return;
-    }
-
-    if (!apkFile || apkFile.size <= 0) {
-      setBanner({ type: 'error', text: t(lang, 'apkFileRequired') });
-      return;
-    }
-
-    if (selectedApkChunkCount > MAX_APK_CHUNKS) {
-      setBanner({
-        type: 'error',
-        text: `APK size exceeds ${Math.floor((MAX_APK_CHUNKS * APK_CHUNK_SIZE_BYTES) / (1024 * 1024))} MB maximum (${selectedApkChunkCount} > ${MAX_APK_CHUNKS} chunks).`,
-      });
-      return;
-    }
-
-    const trimmedNotes = String(updateNotes || '').trim().slice(0, 300);
-
-    if (!updateAdminPassword) {
-      setBanner({ type: 'error', text: t(lang, 'adminPasswordRequiredForUpdate') });
-      return;
-    }
-
-    setSavingUpdate(true);
+    setCleaningApk(true);
+    setSyncing(true);
     setBanner(null);
-    setUploadProgress(null);
+    setDeletedSoFar(0);
 
     try {
       const currentAdminRecord = teachers.find(
@@ -696,47 +738,39 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       );
 
       if (!currentAdminRecord || !currentAdminRecord.passwordHash) {
-        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordCleanup') });
         return;
       }
 
-      const enteredHash = await sha256Hex(updateAdminPassword);
+      const enteredHash = await sha256Hex(cleanupPassword);
       if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
-        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordUpdate') });
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPasswordCleanup') });
         return;
       }
 
-      await uploadPrivateApkRelease({
+      const { deletedChunks } = await deleteUploadedApkChunksFromServer({
         db: instances.db,
         schoolId: session.schoolId,
-        file: apkFile,
-        versionCode: intVersionCode,
-        versionName: trimmedVersionName,
-        notes: trimmedNotes,
-        originUrl: window.location.origin,
-        onProgress: setUploadProgress,
+        onProgress: setDeletedSoFar,
       });
 
-      setApkFile(null);
-      if (apkInputRef.current) {
-        apkInputRef.current.value = '';
-      }
-      setUpdateAdminPassword('');
-      setBanner({ type: 'success', text: t(lang, 'appUpdatePublishedSuccess') });
-    } catch (err: unknown) {
-      const fbErr = err as { code?: string; message?: string };
-      const exactMessage = fbErr?.code
-        ? `${fbErr.code}: ${fbErr.message || String(err)}`
-        : err instanceof Error
-        ? err.message
-        : String(err);
+      setLastDeletedResult(deletedChunks);
+      setCleanupPassword('');
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `${deletedChunks} টি APK অংশ সার্ভার থেকে মুছে ফেলা হয়েছে। সকল শিক্ষার্থী ও নম্বর সম্পূর্ণ অক্ষত রয়েছে।`
+            : `Deleted ${deletedChunks} APK chunks. All student & marks data is untouched.`,
+      });
+    } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${exactMessage}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     } finally {
-      setSavingUpdate(false);
-      setUploadProgress(null);
+      setCleaningApk(false);
+      setSyncing(false);
     }
   };
 
@@ -1251,148 +1285,71 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         </div>
       )}
 
-      {/* TAB 4: Private In-Website Android APK Uploader (Admin-Only, Password-Protected) */}
+      {/* TAB 4: Safe Server APK Cleanup (Deletes ONLY appReleaseChunks & resets 5 APK metadata fields) */}
       {adminTab === 'update' && (
         <form
-          onSubmit={handleSaveAppUpdate}
-          className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-4"
+          onSubmit={handleDeleteApkChunks}
+          className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-5"
         >
-          <div className="flex items-start justify-between gap-3 pb-3 border-b border-stone-200">
+          <div className="flex items-start justify-between gap-3 pb-4 border-b border-stone-200">
             <div className="flex items-start gap-3">
-              <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
-                <Smartphone className="w-5 h-5" />
+              <div className="w-10 h-10 rounded-lg bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center shrink-0 mt-0.5">
+                <Trash2 className="w-5 h-5" />
               </div>
               <div>
                 <h3 className="text-base font-semibold text-slate-900">
-                  {t(lang, 'publishAppUpdate')}
+                  {t(lang, 'deleteApkTitle')}
                 </h3>
-                <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
-                  {t(lang, 'versionCodeHint')}
+                <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                  {t(lang, 'deleteApkDesc')}
                 </p>
               </div>
             </div>
-            {(school?.latestAppVersionName || school?.latestAppVersionCode !== undefined) && (
-              <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded shrink-0">
-                {school?.latestAppVersionName ? `v${school.latestAppVersionName}` : 'v—'}{' '}
-                {school?.latestAppVersionCode !== undefined
-                  ? `(#${school.latestAppVersionCode})`
-                  : ''}
-              </span>
-            )}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'versionCode')}
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={999999}
-                step={1}
-                required
-                disabled={savingUpdate}
-                value={versionCode}
-                onChange={(e) => setVersionCode(e.target.value)}
-                placeholder="13"
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'versionName')}
-              </label>
-              <input
-                type="text"
-                required
-                maxLength={20}
-                disabled={savingUpdate}
-                value={versionName}
-                onChange={(e) => setVersionName(e.target.value)}
-                placeholder="2.2"
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label
-              htmlFor="apk-file-picker"
-              className="block text-xs font-medium text-slate-700 mb-1"
-            >
-              {t(lang, 'apkFileLabel')}
-            </label>
-            <div className="border border-dashed border-stone-300 rounded-lg p-4 bg-stone-50/70 space-y-2.5">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                <input
-                  id="apk-file-picker"
-                  ref={apkInputRef}
-                  type="file"
-                  accept=".apk,application/vnd.android.package-archive"
-                  disabled={savingUpdate}
-                  onChange={(e) => {
-                    const chosen = e.target.files?.[0] || null;
-                    setApkFile(chosen);
-                  }}
-                  className="block w-full text-xs text-slate-700 file:mr-3 file:py-2 file:px-3.5 file:rounded-lg file:border file:border-emerald-200 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-900 hover:file:bg-emerald-100 file:cursor-pointer cursor-pointer"
-                />
+          <div className="p-4 rounded-lg bg-emerald-50/70 border border-emerald-200 flex items-start gap-3 text-xs text-emerald-950">
+            <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <div className="font-semibold">
+                {lang === 'bn'
+                  ? 'নিরাপদ ক্লিনআপ গ্যারান্টি'
+                  : 'Protected Collections (Never Modified or Deleted)'}
               </div>
-
-              {apkFile && (
-                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-white border border-stone-200 rounded-lg text-xs">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <FileArchive className="w-4 h-4 text-emerald-700 shrink-0" />
-                    <span className="font-mono font-medium text-slate-900 truncate">
-                      {apkFile.name}
-                    </span>
-                  </div>
-                  <div className="font-mono tabular-nums text-slate-600 shrink-0">
-                    {(apkFile.size / (1024 * 1024)).toFixed(2)} MB · {selectedApkChunkCount}/
-                    {MAX_APK_CHUNKS} chunks
-                  </div>
-                </div>
-              )}
-
-              {apkFile && selectedApkChunkCount > MAX_APK_CHUNKS && (
-                <p className="text-xs text-rose-700 font-medium">
-                  APK exceeds {Math.floor((MAX_APK_CHUNKS * APK_CHUNK_SIZE_BYTES) / (1024 * 1024))} MB limit ({selectedApkChunkCount} chunks).
-                </p>
-              )}
-
-              <p className="text-[11px] text-slate-500 leading-relaxed">
-                {t(lang, 'apkFileHint')}
+              <p className="text-emerald-900/90 leading-relaxed">
+                <code>students</code>, <code>subjects</code>, <code>customFields</code>,{' '}
+                <code>attendanceLogs</code>, <code>pendingChanges</code>,{' '}
+                <code>parentNotices</code>, <code>messages</code>, <code>teachers</code>
               </p>
             </div>
           </div>
 
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="block text-xs font-medium text-slate-700">
-                {t(lang, 'updateNotes')}
-              </label>
-              <span className="text-[11px] font-mono tabular-nums text-slate-400">
-                {updateNotes.length}/300
-              </span>
+          <div className="p-3.5 rounded-lg bg-stone-50 border border-stone-200 text-xs text-slate-700 space-y-1">
+            <div>
+              <span className="font-semibold text-slate-900">
+                {lang === 'bn' ? 'বর্তমান APK মেটাডেটা:' : 'Current APK Metadata on School Doc:'}
+              </span>{' '}
+              {hasLegacyApkMetadata(school) ? (
+                <span className="font-mono text-amber-800">
+                  v{school?.latestAppVersionName || '—'} (#{school?.latestAppVersionCode ?? 0})
+                </span>
+              ) : (
+                <span className="font-medium text-emerald-700">
+                  {lang === 'bn' ? 'পরিষ্কার (0 / খালি)' : 'Clean (0 / empty)'}
+                </span>
+              )}
             </div>
-            <textarea
-              rows={3}
-              maxLength={300}
-              disabled={savingUpdate}
-              value={updateNotes}
-              onChange={(e) => setUpdateNotes(e.target.value)}
-              placeholder={
-                lang === 'bn'
-                  ? 'যেমন: মার্কশিট উন্নতি ও দ্রুত সিঙ্ক যোগ করা হয়েছে'
-                  : 'e.g. Marksheet improvements and faster cloud sync.'
-              }
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
-            />
+            {lastDeletedResult !== null && (
+              <div className="text-emerald-800 font-medium">
+                {lang === 'bn'
+                  ? `সর্বশেষ ক্লিনআপে ${lastDeletedResult} টি APK অংশ মুছে ফেলা হয়েছে।`
+                  : `Last cleanup removed ${lastDeletedResult} APK chunk document(s).`}
+              </div>
+            )}
           </div>
 
-          <div className="pt-2 border-t border-stone-100">
+          <div>
             <label
-              htmlFor="update-admin-pw"
+              htmlFor="cleanup-admin-pw"
               className="block text-xs font-medium text-slate-700 mb-1"
             >
               {t(lang, 'adminPasswordLabel')}
@@ -1400,58 +1357,39 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             <div className="relative">
               <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
-                id="update-admin-pw"
+                id="cleanup-admin-pw"
                 type="password"
                 required
-                disabled={savingUpdate}
-                value={updateAdminPassword}
-                onChange={(e) => setUpdateAdminPassword(e.target.value)}
+                disabled={cleaningApk}
+                value={cleanupPassword}
+                onChange={(e) => setCleanupPassword(e.target.value)}
                 placeholder="••••••••"
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 disabled:bg-stone-50"
+                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-600 disabled:bg-stone-50"
               />
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
-              {t(lang, 'adminPasswordRequiredForUpdate')}
+              {t(lang, 'adminPasswordRequiredForCleanup')}
             </p>
           </div>
 
-          {savingUpdate && uploadProgress && (
-            <div className="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 space-y-2">
-              <div className="flex items-center justify-between text-xs font-medium text-emerald-900">
-                <span>
-                  {uploadProgress.phase === 'clearing'
-                    ? t(lang, 'clearingOldApkChunks')
-                    : uploadProgress.phase === 'finalizing'
-                    ? t(lang, 'finalizingApkPublish')
-                    : uploadProgress.phase === 'reading'
-                    ? t(lang, 'loading')
-                    : `${t(lang, 'uploadingApkProgress')} ${uploadProgress.currentChunk} of ${uploadProgress.totalChunks}...`}
-                </span>
-                <span className="font-mono tabular-nums">{uploadProgress.percent}%</span>
-              </div>
-              <div className="w-full h-2 bg-emerald-200/70 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-emerald-700 transition-all duration-200"
-                  style={{ width: `${uploadProgress.percent}%` }}
-                />
-              </div>
+          {cleaningApk && (
+            <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs font-medium text-amber-900">
+              {t(lang, 'deletingApkProgress')} ({deletedSoFar})
             </div>
           )}
 
-          <div className="flex flex-wrap items-center gap-3 pt-1">
-            <button
-              type="submit"
-              disabled={savingUpdate || !apkFile || selectedApkChunkCount > MAX_APK_CHUNKS}
-              className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
-            >
-              <Upload className="w-3.5 h-3.5" />
-              <span>
-                {savingUpdate && uploadProgress
-                  ? `${uploadProgress.percent}%`
-                  : t(lang, 'publishAppUpdate')}
-              </span>
-            </button>
-          </div>
+          <button
+            type="submit"
+            disabled={cleaningApk}
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>
+              {cleaningApk
+                ? `${t(lang, 'deletingApkProgress')} (${deletedSoFar})`
+                : t(lang, 'deleteApkBtn')}
+            </span>
+          </button>
         </form>
       )}
 
