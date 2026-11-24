@@ -10,6 +10,7 @@ import {
 } from 'firebase/firestore';
 import {
   Check,
+  ExternalLink,
   KeyRound,
   Plus,
   ShieldAlert,
@@ -33,9 +34,10 @@ import { t } from '../lib/i18n';
 import {
   formatTimestampDateTime,
   getAttendanceDocId,
-  isValidHttpUrl,
+  normalizeAppUpdateUrl,
   normalizeBdPhone,
   normalizeExamConfigs,
+  resolveDirectApkDownloadInfo,
   sha256Hex,
 } from '../lib/schoolUtils';
 import type {
@@ -102,17 +104,22 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [newCfType, setNewCfType] = useState<CustomFieldType>('TEXT');
   const [newCfResets, setNewCfResets] = useState(false);
 
-  // App Update Publisher State (baseline Android app is v1.8 / versionCode 9)
+  // App Update Publisher State (baseline Android app is v1.9 / versionCode 10)
   const [versionCode, setVersionCode] = useState(
     school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
       ? String(school.latestAppVersionCode)
-      : '10'
+      : '11'
   );
-  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '1.9');
+  const [versionName, setVersionName] = useState(school?.latestAppVersionName || '2.0');
   const [updateUrl, setUpdateUrl] = useState(school?.appUpdateUrl || '');
   const [updateNotes, setUpdateNotes] = useState(school?.appUpdateNotes || '');
   const [updateAdminPassword, setUpdateAdminPassword] = useState('');
   const [savingUpdate, setSavingUpdate] = useState(false);
+
+  const resolvedUpdatePreview = useMemo(
+    () => resolveDirectApkDownloadInfo(updateUrl),
+    [updateUrl]
+  );
 
   useEffect(() => {
     setAdminTab(initialTab);
@@ -126,9 +133,9 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     setVersionCode(
       school?.latestAppVersionCode !== undefined && school?.latestAppVersionCode !== null
         ? String(school.latestAppVersionCode)
-        : '10'
+        : '11'
     );
-    setVersionName(school?.latestAppVersionName || '1.9');
+    setVersionName(school?.latestAppVersionName || '2.0');
     setUpdateUrl(school?.appUpdateUrl || '');
     setUpdateNotes(school?.appUpdateNotes || '');
   }, [
@@ -627,38 +634,39 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id));
   };
 
-  // 4. Android App Update Publisher (Admin-only + Admin Password Verified)
+  // 4. Android App Update Publisher (Admin-only + Admin Password Verified, strict 5-field payload)
   const handleSaveAppUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
 
     const trimmedCodeStr = versionCode.trim();
-    const parsedCode = Number(trimmedCodeStr);
+    const rawNum = Number(trimmedCodeStr);
+    const intVersionCode = Math.trunc(rawNum);
     if (
       trimmedCodeStr === '' ||
-      !Number.isFinite(parsedCode) ||
-      !Number.isInteger(parsedCode) ||
-      parsedCode < 0 ||
-      parsedCode > 999999
+      !Number.isFinite(rawNum) ||
+      !Number.isInteger(rawNum) ||
+      intVersionCode < 1 ||
+      intVersionCode > 999999
     ) {
       setBanner({ type: 'error', text: t(lang, 'invalidVersionCode') });
       return;
     }
 
-    const trimmedVersionName = versionName.trim().slice(0, 20);
+    const trimmedVersionName = String(versionName).trim().slice(0, 20);
     if (!trimmedVersionName) {
       setBanner({ type: 'error', text: t(lang, 'invalidVersionName') });
       return;
     }
 
-    const trimmedUrl = updateUrl.trim();
-    if (!trimmedUrl || trimmedUrl.length > 500 || !isValidHttpUrl(trimmedUrl)) {
+    const normalizedUrl = normalizeAppUpdateUrl(updateUrl);
+    if (!normalizedUrl || normalizedUrl.length > 500) {
       setBanner({ type: 'error', text: t(lang, 'invalidUpdateUrl') });
       return;
     }
 
-    const trimmedNotes = updateNotes.trim().slice(0, 300);
+    const trimmedNotes = String(updateNotes || '').trim().slice(0, 300);
 
     if (!updateAdminPassword) {
       setBanner({ type: 'error', text: t(lang, 'adminPasswordRequiredForUpdate') });
@@ -687,20 +695,28 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         return;
       }
 
+      // Write ONLY the exact 5 allowed fields on schools/{schoolId}
       await updateDoc(doc(instances.db, 'schools', session.schoolId), {
-        latestAppVersionCode: Math.trunc(parsedCode),
+        latestAppVersionCode: intVersionCode,
         latestAppVersionName: trimmedVersionName,
-        appUpdateUrl: trimmedUrl,
+        appUpdateUrl: normalizedUrl,
         appUpdateNotes: trimmedNotes,
         updatedAt: serverTimestamp(),
       });
 
+      setUpdateUrl(normalizedUrl);
       setUpdateAdminPassword('');
       setBanner({ type: 'success', text: t(lang, 'appUpdatePublishedSuccess') });
-    } catch (err) {
+    } catch (err: unknown) {
+      const fbErr = err as { code?: string; message?: string };
+      const exactMessage = fbErr?.code
+        ? `${fbErr.code}: ${fbErr.message || String(err)}`
+        : err instanceof Error
+        ? err.message
+        : String(err);
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${exactMessage}`,
       });
     } finally {
       setSavingUpdate(false);
@@ -1224,15 +1240,17 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           onSubmit={handleSaveAppUpdate}
           className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-4"
         >
-          <div className="flex items-center gap-3 pb-3 border-b border-stone-200">
-            <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+          <div className="flex items-start gap-3 pb-3 border-b border-stone-200">
+            <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
               <Smartphone className="w-5 h-5" />
             </div>
             <div>
               <h3 className="text-base font-semibold text-slate-900">
                 {t(lang, 'publishAppUpdate')}
               </h3>
-              <p className="text-xs text-slate-500">{t(lang, 'versionCodeHint')}</p>
+              <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
+                {t(lang, 'versionCodeHint')}
+              </p>
             </div>
           </div>
 
@@ -1243,13 +1261,13 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </label>
               <input
                 type="number"
-                min={0}
+                min={1}
                 max={999999}
                 step={1}
                 required
                 value={versionCode}
                 onChange={(e) => setVersionCode(e.target.value)}
-                placeholder="10"
+                placeholder="11"
                 className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-600"
               />
             </div>
@@ -1263,7 +1281,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 maxLength={20}
                 value={versionName}
                 onChange={(e) => setVersionName(e.target.value)}
-                placeholder="1.9"
+                placeholder="2.0"
                 className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
               />
             </div>
@@ -1287,19 +1305,51 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </button>
             </div>
             <input
-              type="url"
+              type="text"
               required
               maxLength={500}
               value={updateUrl}
               onChange={(e) => setUpdateUrl(e.target.value)}
-              placeholder="https://github.com/.../releases/latest/download/my-school.apk"
+              placeholder="https://drive.google.com/file/d/.../view or GitHub Releases .apk URL"
               className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
             />
             <p className="text-[11px] text-slate-500 mt-1">
               {lang === 'bn'
-                ? 'Google Drive, GitHub Releases অথবা সরাসরি APK লিংক দিন (সর্বোচ্চ ৫০০ অক্ষর)।'
-                : 'Paste a Google Drive, GitHub Releases, or direct APK link (max 500 chars).'}
+                ? 'Google Drive (Anyone with the link), Dropbox অথবা GitHub Releases লিংক দিন। https:// না থাকলে স্বয়ংক্রিয়ভাবে যুক্ত হবে।'
+                : 'Paste a Google Drive, Dropbox, GitHub Releases, or direct APK link (max 500 chars; https:// added automatically if omitted).'}
             </p>
+
+            {/* Google Drive / Dropbox Direct Download Auto-Detection Helper */}
+            {resolvedUpdatePreview &&
+              (resolvedUpdatePreview.provider === 'gdrive' ||
+                resolvedUpdatePreview.provider === 'dropbox') && (
+                <div className="mt-2.5 p-3 rounded-lg bg-emerald-50/80 border border-emerald-200 text-xs space-y-1.5">
+                  <div className="font-semibold text-emerald-900">
+                    {resolvedUpdatePreview.provider === 'gdrive'
+                      ? lang === 'bn'
+                        ? 'Google Drive লিংক শনাক্ত হয়েছে — সরাসরি APK ডাউনলোড লিংক:'
+                        : 'Google Drive link detected — Direct APK download URL:'
+                      : lang === 'bn'
+                      ? 'Dropbox লিংক শনাক্ত হয়েছে — সরাসরি ডাউনলোড লিংক:'
+                      : 'Dropbox link detected — Direct APK download URL:'}
+                  </div>
+                  <div className="font-mono text-[11px] text-slate-800 bg-white border border-emerald-200 rounded px-2.5 py-1.5 break-all">
+                    {resolvedUpdatePreview.directDownloadUrl}
+                  </div>
+                  {resolvedUpdatePreview.normalizedUrl !==
+                    resolvedUpdatePreview.directDownloadUrl && (
+                    <button
+                      type="button"
+                      onClick={() => setUpdateUrl(resolvedUpdatePreview.directDownloadUrl)}
+                      className="text-xs font-semibold text-emerald-800 hover:underline cursor-pointer"
+                    >
+                      {lang === 'bn'
+                        ? 'সরাসরি ডাউনলোড URL উপরে বসান'
+                        : 'Use this direct download URL above'}
+                    </button>
+                  )}
+                </div>
+              )}
           </div>
 
           <div>
@@ -1349,13 +1399,33 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </p>
           </div>
 
-          <button
-            type="submit"
-            disabled={savingUpdate}
-            className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
-          >
-            {savingUpdate ? t(lang, 'loading') : t(lang, 'publishAppUpdate')}
-          </button>
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <button
+              type="submit"
+              disabled={savingUpdate}
+              className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+            >
+              {savingUpdate ? t(lang, 'loading') : t(lang, 'publishAppUpdate')}
+            </button>
+
+            {resolvedUpdatePreview ? (
+              <a
+                href={resolvedUpdatePreview.directDownloadUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-800 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg transition-colors whitespace-nowrap"
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-emerald-700" />
+                <span>{t(lang, 'testDownloadLink')}</span>
+              </a>
+            ) : (
+              <span className="text-xs text-slate-400">
+                {lang === 'bn'
+                  ? 'পরীক্ষা করার জন্য উপরে একটি বৈধ লিংক দিন'
+                  : 'Enter a valid URL above to enable link testing'}
+              </span>
+            )}
+          </div>
         </form>
       )}
 

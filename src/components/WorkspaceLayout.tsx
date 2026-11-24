@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getClassLabel, t } from '../lib/i18n';
-import { isValidHttpUrl } from '../lib/schoolUtils';
+import { resolveDirectApkDownloadInfo } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 
 export type NavTab =
@@ -65,8 +65,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const pendingCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
-  const appUpdateUrl = String(school?.appUpdateUrl || '').trim();
-  const hasAppUpdate = isValidHttpUrl(appUpdateUrl);
+  const apkDownloadInfo = resolveDirectApkDownloadInfo(school?.appUpdateUrl || '');
+  const appUpdateUrl = apkDownloadInfo?.directDownloadUrl || '';
+  const hasAppUpdate = Boolean(apkDownloadInfo);
   const appUpdateVersionLabel = school?.latestAppVersionName
     ? `v${school.latestAppVersionName}`
     : school?.latestAppVersionCode !== undefined

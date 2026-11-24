@@ -536,12 +536,116 @@ export function formatTimestampDateTime(ts: unknown): string {
   });
 }
 
-export function isValidHttpUrl(raw: string): boolean {
-  if (!raw || !raw.trim()) return false;
+export function normalizeAppUpdateUrl(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return '';
+  // Reject explicit non-http(s) schemes such as javascript:, data:, file:, ftp:
+  const schemeMatch = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+  if (schemeMatch) {
+    const scheme = schemeMatch[1].toLowerCase();
+    if (scheme !== 'http' && scheme !== 'https') {
+      return '';
+    }
+  }
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   try {
-    const parsed = new URL(raw.trim());
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    const parsed = new URL(withProtocol);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    if (!parsed.hostname || !parsed.hostname.includes('.')) {
+      // Allow localhost only in dev if needed, otherwise require valid domain dot
+      if (parsed.hostname !== 'localhost') return '';
+    }
+    return parsed.toString();
   } catch {
-    return false;
+    return '';
   }
 }
+
+export function isValidHttpUrl(raw: string): boolean {
+  return normalizeAppUpdateUrl(raw) !== '';
+}
+
+export function extractGoogleDriveFileId(rawUrl: string): string | null {
+  const normalized = normalizeAppUpdateUrl(rawUrl);
+  if (!normalized) return null;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host !== 'drive.google.com' &&
+      host !== 'docs.google.com' &&
+      host !== 'drive.usercontent.google.com'
+    ) {
+      return null;
+    }
+
+    // Match /file/d/<ID>/...
+    const filePathMatch = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]{10,})/);
+    if (filePathMatch) return filePathMatch[1];
+
+    // Match ?id=<ID> (used in /open?id=..., /uc?id=..., /uc?export=download&id=...)
+    const idParam = parsed.searchParams.get('id');
+    if (idParam && /^[a-zA-Z0-9_-]{10,}$/.test(idParam)) {
+      return idParam;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ResolvedApkDownloadInfo {
+  normalizedUrl: string;
+  directDownloadUrl: string;
+  backupUrl: string | null;
+  provider: 'gdrive' | 'dropbox' | 'direct';
+}
+
+export function resolveDirectApkDownloadInfo(rawUrl: string): ResolvedApkDownloadInfo | null {
+  const normalizedUrl = normalizeAppUpdateUrl(rawUrl);
+  if (!normalizedUrl) return null;
+
+  const driveId = extractGoogleDriveFileId(normalizedUrl);
+  if (driveId) {
+    const directDownloadUrl = `https://drive.google.com/uc?export=download&id=${driveId}`;
+    const backupUrl =
+      normalizedUrl === directDownloadUrl
+        ? `https://drive.google.com/file/d/${driveId}/view`
+        : normalizedUrl;
+    return {
+      normalizedUrl,
+      directDownloadUrl,
+      backupUrl,
+      provider: 'gdrive',
+    };
+  }
+
+  try {
+    const parsed = new URL(normalizedUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'dropbox.com' || host.endsWith('.dropbox.com')) {
+      const directParsed = new URL(normalizedUrl);
+      directParsed.searchParams.set('dl', '1');
+      const directDownloadUrl = directParsed.toString();
+      return {
+        normalizedUrl,
+        directDownloadUrl,
+        backupUrl: directDownloadUrl !== normalizedUrl ? normalizedUrl : null,
+        provider: 'dropbox',
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  return {
+    normalizedUrl,
+    directDownloadUrl: normalizedUrl,
+    backupUrl: null,
+    provider: 'direct',
+  };
+}
+
