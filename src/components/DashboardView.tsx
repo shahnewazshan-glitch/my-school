@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowRight,
   CalendarCheck2,
   ClipboardList,
@@ -18,7 +19,9 @@ import {
   getAttendanceDocId,
   getClassSubjectsForMarksheet,
   getTodayDateKey,
+  isSameHostnameUrl,
   resolveDirectApkDownloadInfo,
+  verifySelfHostedApkUrl,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 import type { NavTab } from './WorkspaceLayout';
@@ -47,6 +50,33 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   } = useApp();
 
   const [quickQuery, setQuickQuery] = useState('');
+  const apkInfo = useMemo(
+    () => resolveDirectApkDownloadInfo(school?.appUpdateUrl || ''),
+    [school?.appUpdateUrl]
+  );
+  const isSelfWebsiteApkUrl = Boolean(
+    apkInfo && isSameHostnameUrl(apkInfo.directDownloadUrl)
+  );
+  const [selfApkState, setSelfApkState] = useState<'idle' | 'checking' | 'valid' | 'invalid'>(
+    'idle'
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!apkInfo || !isSelfWebsiteApkUrl) {
+      setSelfApkState('idle');
+      return;
+    }
+    setSelfApkState('checking');
+    verifySelfHostedApkUrl(apkInfo.directDownloadUrl).then((ok) => {
+      if (!cancelled) {
+        setSelfApkState(ok ? 'valid' : 'invalid');
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [apkInfo, isSelfWebsiteApkUrl]);
 
   const yearStudents = useMemo(
     () => students.filter((s) => Number(s.academicYear) === Number(selectedAcademicYear)),
@@ -162,102 +192,131 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       </section>
 
       {/* Android App Update Download Card (Visible to All Teachers & Admin) */}
-      {(() => {
-        const apkInfo = resolveDirectApkDownloadInfo(school?.appUpdateUrl || '');
-        if (!apkInfo && session?.role !== 'ADMIN') return null;
-
-        return (
-          <section className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-5">
-            {apkInfo ? (
-              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                <div className="flex items-start gap-3.5 min-w-0">
-                  <div className="w-10 h-10 rounded-lg bg-emerald-700 text-white flex items-center justify-center shrink-0">
-                    <Smartphone className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0 space-y-1.5">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-base font-semibold text-slate-900">
-                        {t(lang, 'androidAppUpdateTitle')}
-                      </h3>
-                      <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-white border border-emerald-200 px-2 py-0.5 rounded">
-                        {school?.latestAppVersionName
-                          ? `v${school.latestAppVersionName}`
-                          : 'v—'}{' '}
-                        {school?.latestAppVersionCode !== undefined
-                          ? `(#${school.latestAppVersionCode})`
-                          : ''}
-                      </span>
-                    </div>
-                    {school?.appUpdateNotes && (
-                      <p className="text-sm text-slate-700">{school.appUpdateNotes}</p>
-                    )}
-                    <p className="text-xs text-slate-700 leading-relaxed">
-                      {t(lang, 'appUpdateMobileHint')}
-                    </p>
-                  </div>
+      {(apkInfo || session?.role === 'ADMIN') && (
+        <section
+          className={`border rounded-xl p-5 ${
+            apkInfo && isSelfWebsiteApkUrl && selfApkState !== 'valid'
+              ? 'bg-amber-50/80 border-amber-200'
+              : 'bg-emerald-50/70 border-emerald-200'
+          }`}
+        >
+          {apkInfo && (!isSelfWebsiteApkUrl || selfApkState === 'valid') ? (
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5 min-w-0">
+                <div className="w-10 h-10 rounded-lg bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                  <Smartphone className="w-5 h-5" />
                 </div>
-
-                <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-                  <a
-                    href={apkInfo.directDownloadUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors whitespace-nowrap"
-                  >
-                    <Download className="w-4 h-4 shrink-0" />
-                    <span>{t(lang, 'downloadAndroidApp')}</span>
-                  </a>
-                  {apkInfo.provider === 'gdrive' && apkInfo.backupUrl && (
-                    <a
-                      href={apkInfo.backupUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-emerald-900 bg-white hover:bg-stone-50 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                      <span>{t(lang, 'openInGoogleDrive')}</span>
-                    </a>
-                  )}
-                  {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
-                    <button
-                      type="button"
-                      onClick={onOpenAppUpdatePublisher}
-                      className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-slate-700 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg cursor-pointer whitespace-nowrap"
-                    >
-                      <Settings2 className="w-3.5 h-3.5 text-emerald-700" />
-                      <span>{t(lang, 'configureAppUpdate')}</span>
-                    </button>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 rounded-lg bg-white border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
-                    <Smartphone className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm font-semibold text-slate-900">
+                <div className="min-w-0 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-base font-semibold text-slate-900">
                       {t(lang, 'androidAppUpdateTitle')}
                     </h3>
-                    <p className="text-xs text-slate-600">{t(lang, 'appUpdateNotConfigured')}</p>
+                    <span className="text-xs font-mono font-semibold tabular-nums text-emerald-900 bg-white border border-emerald-200 px-2 py-0.5 rounded">
+                      {school?.latestAppVersionName
+                        ? `v${school.latestAppVersionName}`
+                        : 'v—'}{' '}
+                      {school?.latestAppVersionCode !== undefined
+                        ? `(#${school.latestAppVersionCode})`
+                        : ''}
+                    </span>
                   </div>
+                  {school?.appUpdateNotes && (
+                    <p className="text-sm text-slate-700">{school.appUpdateNotes}</p>
+                  )}
+                  <p className="text-xs text-slate-700 leading-relaxed">
+                    {t(lang, 'appUpdateMobileHint')}
+                  </p>
                 </div>
-                {onOpenAppUpdatePublisher && (
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                <a
+                  href={apkInfo.directDownloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors whitespace-nowrap"
+                >
+                  <Download className="w-4 h-4 shrink-0" />
+                  <span>{t(lang, 'downloadAndroidApp')}</span>
+                </a>
+                {apkInfo.provider === 'gdrive' && apkInfo.backupUrl && (
+                  <a
+                    href={apkInfo.backupUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-emerald-900 bg-white hover:bg-stone-50 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                    <span>{t(lang, 'openInGoogleDrive')}</span>
+                  </a>
+                )}
+                {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
                   <button
                     type="button"
                     onClick={onOpenAppUpdatePublisher}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer whitespace-nowrap self-start sm:self-auto"
+                    className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-slate-700 bg-white hover:bg-stone-50 border border-stone-300 rounded-lg cursor-pointer whitespace-nowrap"
                   >
-                    <Settings2 className="w-3.5 h-3.5" />
-                    <span>{t(lang, 'publishAppUpdate')}</span>
+                    <Settings2 className="w-3.5 h-3.5 text-emerald-700" />
+                    <span>{t(lang, 'configureAppUpdate')}</span>
                   </button>
                 )}
               </div>
-            )}
-          </section>
-        );
-      })()}
+            </div>
+          ) : apkInfo && isSelfWebsiteApkUrl ? (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-3 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-white border border-amber-300 text-amber-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <h3 className="text-sm font-semibold text-slate-900">
+                    {t(lang, 'androidAppUpdateTitle')}
+                  </h3>
+                  <p className="text-xs text-amber-900 leading-relaxed">
+                    {selfApkState === 'checking'
+                      ? t(lang, 'loading')
+                      : t(lang, 'selfUrlNoticeDashboard')}
+                  </p>
+                </div>
+              </div>
+              {session?.role === 'ADMIN' && onOpenAppUpdatePublisher && (
+                <button
+                  type="button"
+                  onClick={onOpenAppUpdatePublisher}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-amber-700 hover:bg-amber-800 text-white rounded-lg cursor-pointer whitespace-nowrap self-start sm:self-auto shrink-0"
+                >
+                  <Settings2 className="w-3.5 h-3.5" />
+                  <span>{t(lang, 'replaceUpdateUrl')}</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-lg bg-white border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                  <Smartphone className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900">
+                    {t(lang, 'androidAppUpdateTitle')}
+                  </h3>
+                  <p className="text-xs text-slate-600">{t(lang, 'appUpdateNotConfigured')}</p>
+                </div>
+              </div>
+              {onOpenAppUpdatePublisher && (
+                <button
+                  type="button"
+                  onClick={onOpenAppUpdatePublisher}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer whitespace-nowrap self-start sm:self-auto"
+                >
+                  <Settings2 className="w-3.5 h-3.5" />
+                  <span>{t(lang, 'publishAppUpdate')}</span>
+                </button>
+              )}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* 4 Summary Stat Cards */}
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">

@@ -649,3 +649,43 @@ export function resolveDirectApkDownloadInfo(rawUrl: string): ResolvedApkDownloa
   };
 }
 
+export function isSameHostnameUrl(
+  rawUrl: string,
+  currentHostname: string | undefined = typeof window !== 'undefined'
+    ? window.location.hostname
+    : undefined
+): boolean {
+  if (!currentHostname) return false;
+  const normalized = normalizeAppUpdateUrl(rawUrl);
+  if (!normalized) return false;
+  try {
+    const parsed = new URL(normalized);
+    const stripWww = (h: string) => h.trim().toLowerCase().replace(/^www\./, '');
+    return stripWww(parsed.hostname) === stripWww(currentHostname);
+  } catch {
+    return false;
+  }
+}
+
+export async function verifySelfHostedApkUrl(rawUrl: string): Promise<boolean> {
+  const normalized = normalizeAppUpdateUrl(rawUrl);
+  if (!normalized) return false;
+  try {
+    const res = await fetch(normalized, { method: 'HEAD', cache: 'no-store' });
+    if (!res.ok) return false;
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!contentType || contentType.includes('text/html') || contentType.includes('application/xhtml')) {
+      return false;
+    }
+    return (
+      contentType.includes('application/vnd.android.package-archive') ||
+      contentType.includes('application/octet-stream') ||
+      contentType.includes('application/zip') ||
+      contentType.includes('application/x-apk') ||
+      contentType.includes('binary/octet-stream')
+    );
+  } catch {
+    return false;
+  }
+}
+

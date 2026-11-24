@@ -239,7 +239,11 @@ const DICT = {
       '1. Tap Download APK -> 2. Open the downloaded .apk file -> 3. Allow \'Install unknown apps\' if asked -> 4. Tap Update (your school data stays safe).',
     appUpdateNotConfigured: 'No Android app update link has been published yet.',
     configureAppUpdate: 'Publish Update',
-    useWebsiteApkUrl: 'Use website /my-school.apk',
+    selfUrlBlockedError:
+      "This URL points back to the website itself and has no APK file. Upload your .apk to Google Drive ('Anyone with the link') or GitHub Releases and paste that link here.",
+    selfUrlNoticeDashboard:
+      'The saved Android App Update URL points back to this website instead of an .apk file. Please ask your School Admin to replace it with a real Google Drive or GitHub Releases APK link.',
+    replaceUpdateUrl: 'Replace Update URL',
     testDownloadLink: 'Test Download Link',
     versionCodeHint:
       'Upload your .apk to Google Drive (Anyone with the link) or GitHub Releases and paste the link below. Current Android app is v1.9 (versionCode 10) — enter 11 or higher.',
@@ -478,7 +482,11 @@ const DICT = {
       '১. Download APK চাপুন -> ২. ডাউনলোড হওয়া .apk ফাইল খুলুন -> ৩. চাইলে \'Install unknown apps\' অনুমতি দিন -> ৪. Update চাপুন (বিদ্যালয়ের সকল তথ্য সুরক্ষিত থাকবে)।',
     appUpdateNotConfigured: 'এখনো কোনো অ্যান্ড্রয়েড অ্যাপ আপডেট লিংক প্রকাশ করা হয়নি।',
     configureAppUpdate: 'আপডেট প্রকাশ করুন',
-    useWebsiteApkUrl: 'ওয়েবসাইটের /my-school.apk ব্যবহার করুন',
+    selfUrlBlockedError:
+      "এই লিংকটি ওয়েবসাইটেই ফিরে আসে এবং এতে কোনো .apk ফাইল নেই। আপনার .apk ফাইল Google Drive ('Anyone with the link') বা GitHub Releases-এ আপলোড করে সেই লিংক দিন।",
+    selfUrlNoticeDashboard:
+      'সংরক্ষিত অ্যান্ড্রয়েড অ্যাপ আপডেট লিংকটি কোনো .apk ফাইলের বদলে এই ওয়েবসাইটেই ফিরে আসছে। অনুগ্রহ করে স্কুল অ্যাডমিনকে একটি সঠিক Google Drive বা GitHub Releases APK লিংক যুক্ত করতে বলুন।',
+    replaceUpdateUrl: 'আপডেট লিংক পরিবর্তন করুন',
     testDownloadLink: 'ডাউনলোড লিংক পরীক্ষা করুন',
     versionCodeHint:
       'আপনার .apk ফাইল Google Drive (Anyone with the link) অথবা GitHub Releases-এ আপলোড করে নিচে লিংক দিন। বর্তমান অ্যান্ড্রয়েড অ্যাপ v1.9 (versionCode 10) — ফোনে আপডেট পেতে 11 বা তার বেশি দিন।',

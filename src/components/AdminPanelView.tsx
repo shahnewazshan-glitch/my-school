@@ -34,11 +34,13 @@ import { t } from '../lib/i18n';
 import {
   formatTimestampDateTime,
   getAttendanceDocId,
+  isSameHostnameUrl,
   normalizeAppUpdateUrl,
   normalizeBdPhone,
   normalizeExamConfigs,
   resolveDirectApkDownloadInfo,
   sha256Hex,
+  verifySelfHostedApkUrl,
 } from '../lib/schoolUtils';
 import type {
   CustomFieldType,
@@ -120,6 +122,24 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     () => resolveDirectApkDownloadInfo(updateUrl),
     [updateUrl]
   );
+  const isSelfUrlPreview = Boolean(
+    resolvedUpdatePreview && isSameHostnameUrl(resolvedUpdatePreview.directDownloadUrl)
+  );
+  const [selfUrlVerifiedApk, setSelfUrlVerifiedApk] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!resolvedUpdatePreview || !isSelfUrlPreview) {
+      setSelfUrlVerifiedApk(false);
+      return;
+    }
+    verifySelfHostedApkUrl(resolvedUpdatePreview.directDownloadUrl).then((ok) => {
+      if (!cancelled) setSelfUrlVerifiedApk(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedUpdatePreview, isSelfUrlPreview]);
 
   useEffect(() => {
     setAdminTab(initialTab);
@@ -676,6 +696,16 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     setSavingUpdate(true);
     setBanner(null);
     try {
+      // Block self-website URLs unless HEAD check verifies a real binary APK (not text/html)
+      if (isSameHostnameUrl(normalizedUrl)) {
+        const isRealApkBinary = await verifySelfHostedApkUrl(normalizedUrl);
+        if (!isRealApkBinary) {
+          setBanner({ type: 'error', text: t(lang, 'selfUrlBlockedError') });
+          setSavingUpdate(false);
+          return;
+        }
+      }
+
       const currentAdminRecord = teachers.find(
         (m) =>
           normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
@@ -1288,22 +1318,9 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           </div>
 
           <div>
-            <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-              <label className="block text-xs font-medium text-slate-700">
-                {t(lang, 'updateUrl')}
-              </label>
-              <button
-                type="button"
-                onClick={() => {
-                  if (typeof window !== 'undefined') {
-                    setUpdateUrl(`${window.location.origin}/my-school.apk`);
-                  }
-                }}
-                className="text-xs font-medium text-emerald-700 hover:text-emerald-800 hover:underline cursor-pointer"
-              >
-                {t(lang, 'useWebsiteApkUrl')}
-              </button>
-            </div>
+            <label className="block text-xs font-medium text-slate-700 mb-1">
+              {t(lang, 'updateUrl')}
+            </label>
             <input
               type="text"
               required
@@ -1313,6 +1330,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               placeholder="https://drive.google.com/file/d/.../view or GitHub Releases .apk URL"
               className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono focus:outline-none focus:ring-2 focus:ring-emerald-600"
             />
+            {isSelfUrlPreview && !selfUrlVerifiedApk && (
+              <p className="mt-2 p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800">
+                {t(lang, 'selfUrlBlockedError')}
+              </p>
+            )}
             <p className="text-[11px] text-slate-500 mt-1">
               {lang === 'bn'
                 ? 'Google Drive (Anyone with the link), Dropbox অথবা GitHub Releases লিংক দিন। https:// না থাকলে স্বয়ংক্রিয়ভাবে যুক্ত হবে।'
@@ -1408,7 +1430,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               {savingUpdate ? t(lang, 'loading') : t(lang, 'publishAppUpdate')}
             </button>
 
-            {resolvedUpdatePreview ? (
+            {resolvedUpdatePreview && (!isSelfUrlPreview || selfUrlVerifiedApk) ? (
               <a
                 href={resolvedUpdatePreview.directDownloadUrl}
                 target="_blank"
@@ -1420,9 +1442,13 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </a>
             ) : (
               <span className="text-xs text-slate-400">
-                {lang === 'bn'
+                {isSelfUrlPreview && !selfUrlVerifiedApk
+                  ? lang === 'bn'
+                    ? 'নিজস্ব ওয়েবসাইটের লিংক পরীক্ষা করা যাবে না'
+                    : 'Self-website URL cannot be tested as an APK download'
+                  : lang === 'bn'
                   ? 'পরীক্ষা করার জন্য উপরে একটি বৈধ লিংক দিন'
-                  : 'Enter a valid URL above to enable link testing'}
+                  : 'Enter a valid external URL above to enable link testing'}
               </span>
             )}
           </div>

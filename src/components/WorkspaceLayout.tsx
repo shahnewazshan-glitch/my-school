@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowUpRight,
   BookOpenCheck,
@@ -21,7 +21,11 @@ import {
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getClassLabel, t } from '../lib/i18n';
-import { resolveDirectApkDownloadInfo } from '../lib/schoolUtils';
+import {
+  isSameHostnameUrl,
+  resolveDirectApkDownloadInfo,
+  verifySelfHostedApkUrl,
+} from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 
 export type NavTab =
@@ -67,7 +71,28 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const pendingCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
   const apkDownloadInfo = resolveDirectApkDownloadInfo(school?.appUpdateUrl || '');
   const appUpdateUrl = apkDownloadInfo?.directDownloadUrl || '';
-  const hasAppUpdate = Boolean(apkDownloadInfo);
+  const isSelfUrl = Boolean(appUpdateUrl && isSameHostnameUrl(appUpdateUrl));
+  const [verifiedSelfApkUrl, setVerifiedSelfApkUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!appUpdateUrl || !isSelfUrl) {
+      setVerifiedSelfApkUrl(null);
+      return;
+    }
+    verifySelfHostedApkUrl(appUpdateUrl).then((ok) => {
+      if (!cancelled) {
+        setVerifiedSelfApkUrl(ok ? appUpdateUrl : null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [appUpdateUrl, isSelfUrl]);
+
+  const hasAppUpdate = Boolean(
+    apkDownloadInfo && (!isSelfUrl || verifiedSelfApkUrl === appUpdateUrl)
+  );
   const appUpdateVersionLabel = school?.latestAppVersionName
     ? `v${school.latestAppVersionName}`
     : school?.latestAppVersionCode !== undefined
