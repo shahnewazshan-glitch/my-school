@@ -205,8 +205,9 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             <div className="text-sm font-bold text-white truncate">
               {displaySchoolName}
             </div>
-            <div className="text-xs text-emerald-100 font-mono truncate">
-              Code: {schoolMeta.displaySchoolCode} · EMIS: {schoolMeta.emisCode}
+            <div className="text-[11px] text-emerald-100 font-mono tabular-nums leading-snug">
+              <div>Code: {schoolMeta.displaySchoolCode}</div>
+              <div>EMIS: {schoolMeta.emisCode}</div>
             </div>
           </div>
         </div>
@@ -373,11 +374,14 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
             </div>
           </div>
 
-          {/* Center Zone: Bold Centered Page Title */}
+          {/* Center Zone: Bold Centered Page Title + School Code & EMIS */}
           <div className="flex-1 min-w-0 text-center px-2">
-            <h1 className="text-base sm:text-lg font-bold text-slate-900 truncate tracking-tight">
+            <h1 className="text-base sm:text-lg font-bold text-slate-900 truncate tracking-tight leading-tight">
               {activeNavTitle}
             </h1>
+            <div className="text-[10px] sm:text-[11px] text-slate-500 font-mono tabular-nums whitespace-nowrap overflow-x-auto">
+              Code: {schoolMeta.displaySchoolCode} · EMIS: {schoolMeta.emisCode}
+            </div>
           </div>
 
           {/* Right Zone: Sync + Language + 3-dot Overflow Menu */}

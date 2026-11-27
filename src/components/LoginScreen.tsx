@@ -78,8 +78,8 @@ export const LoginScreen: React.FC = () => {
           <div className="bg-white border border-stone-200 rounded-xl p-5 space-y-3">
             <div className="text-xs font-semibold text-emerald-800 uppercase tracking-wide">
               {lang === 'bn'
-                ? 'শ্রীপুর মসজিদ বাড়ি সরকারি প্রাথমিক বিদ্যালয় · কোড: 139783 · EMIS: 91411 070 804'
-                : 'Sreepur Masjid Bari GPS · Code: 139783 · EMIS: 91411 070 804'}
+                ? 'শ্রীপুর মসজিদ বাড়ি সরকারি প্রাথমিক বিদ্যালয় · কোড: 139783 · EMIS: 91411070804'
+                : 'Sreepur Masjid Bari GPS · Code: 139783 · EMIS: 91411070804'}
             </div>
             <div className="flex items-start gap-3">
               <Lock className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />

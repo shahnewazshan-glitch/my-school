@@ -7,7 +7,7 @@ import type {
 
 export const OFFICIAL_SCHOOL_ID = '139783';
 export const OFFICIAL_DISPLAY_SCHOOL_CODE = '139783';
-export const OFFICIAL_EMIS_CODE = '91411 070 804';
+export const OFFICIAL_EMIS_CODE = '91411070804';
 export const OFFICIAL_SCHOOL_NAME_EN = 'Sreepur Masjid Bari GPS';
 export const OFFICIAL_SCHOOL_NAME_BN = 'শ্রীপুর মসজিদ বাড়ি সরকারি প্রাথমিক বিদ্যালয়';
 export const MANUAL_MERIT_KEY = '__manualMeritPos';
@@ -17,9 +17,20 @@ export function getSchoolDisplayMeta(
   school: { displaySchoolCode?: string; emisCode?: string; schoolName?: string } | null | undefined,
   lang: 'en' | 'bn' = 'en'
 ): { displaySchoolCode: string; emisCode: string; schoolName: string } {
+  const rawDisplayCode = school?.displaySchoolCode?.trim() || '';
+  const rawEmis = school?.emisCode?.trim() || '';
+  const compactEmis = rawEmis.replace(/\s+/g, '');
+
+  // If displaySchoolCode hasn't been configured yet on an older workspace doc,
+  // or if EMIS is blank / spaced "91411 070 804", show official EMIS 91411070804.
+  const resolvedEmis =
+    !rawEmis || !rawDisplayCode || compactEmis === OFFICIAL_EMIS_CODE
+      ? OFFICIAL_EMIS_CODE
+      : rawEmis;
+
   return {
-    displaySchoolCode: school?.displaySchoolCode?.trim() || OFFICIAL_DISPLAY_SCHOOL_CODE,
-    emisCode: school?.emisCode?.trim() || OFFICIAL_EMIS_CODE,
+    displaySchoolCode: rawDisplayCode || OFFICIAL_DISPLAY_SCHOOL_CODE,
+    emisCode: resolvedEmis,
     schoolName:
       school?.schoolName?.trim() ||
       (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN),

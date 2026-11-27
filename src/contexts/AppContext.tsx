@@ -13,11 +13,10 @@ import { getFirebaseInstances } from '../lib/firebase';
 import { t, type Language } from '../lib/i18n';
 import {
   compareRollNumbers,
+  getSchoolDisplayMeta,
   normalizeBdPhone,
   normalizeExamConfigs,
   normalizeSchoolId,
-  OFFICIAL_DISPLAY_SCHOOL_CODE,
-  OFFICIAL_EMIS_CODE,
   sha256Hex,
 } from '../lib/schoolUtils';
 import {
@@ -327,12 +326,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
         }
 
+        const meta = getSchoolDisplayMeta(data);
         const normalizedSchool: SchoolDoc = {
           ...data,
           schoolId: data.schoolId || schoolId,
-          displaySchoolCode:
-            data.displaySchoolCode?.trim() || OFFICIAL_DISPLAY_SCHOOL_CODE,
-          emisCode: data.emisCode?.trim() || OFFICIAL_EMIS_CODE,
+          displaySchoolCode: meta.displaySchoolCode,
+          emisCode: meta.emisCode,
           teachers,
           examConfigs: normalizeExamConfigs(data.examConfigs),
         };
