@@ -5,13 +5,34 @@ import type {
   StudentDoc,
 } from '../types/school';
 
+export const OFFICIAL_SCHOOL_ID = '139783';
+export const OFFICIAL_EMIS_CODE = '91411 070 804';
+export const OFFICIAL_SCHOOL_NAME_EN = 'Sreepur Masjid Bari GPS';
+export const OFFICIAL_SCHOOL_NAME_BN = 'শ্রীপুর মসজিদ বাড়ি সরকারি প্রাথমিক বিদ্যালয়';
+export const MANUAL_MERIT_KEY = '__manualMeritPos';
+
 export const TERM_ORDER: ExamTermId[] = ['exam_1', 'exam_2', 'exam_3'];
 
 export const DEFAULT_EXAM_TITLES: Record<ExamTermId, string> = {
-  exam_1: '1st Term Exam',
-  exam_2: '2nd Term Exam',
-  exam_3: 'Final / Annual Exam',
+  exam_1: 'প্রথম প্রান্তিক মূল্যায়ন পরীক্ষা',
+  exam_2: 'দ্বিতীয় প্রান্তিক মূল্যায়ন পরীক্ষা',
+  exam_3: 'তৃতীয় প্রান্তিক মূল্যায়ন পরীক্ষা',
 };
+
+export function getOfficialExamLabel(
+  examId: ExamTermId,
+  lang: 'en' | 'bn' = 'bn'
+): string {
+  if (lang === 'bn') return DEFAULT_EXAM_TITLES[examId];
+  switch (examId) {
+    case 'exam_1':
+      return '1st Term Evaluation (প্রথম প্রান্তিক)';
+    case 'exam_2':
+      return '2nd Term Evaluation (দ্বিতীয় প্রান্তিক)';
+    case 'exam_3':
+      return '3rd Term Evaluation (তৃতীয় প্রান্তিক)';
+  }
+}
 
 /**
  * Exact Android School ID normalization:
@@ -318,6 +339,23 @@ export function gpaToLetterGrade(gpa: number, passed: boolean): string {
   return 'F';
 }
 
+export function getExamAbsentKey(examId: string, subjectId: string): string {
+  return `${examId}__${subjectId}__absent`;
+}
+
+export function isAbsentMarkerValue(val: unknown): boolean {
+  if (val === true || val === 1) return true;
+  if (typeof val !== 'string') return false;
+  const norm = val.trim().toUpperCase();
+  return (
+    norm === '1' ||
+    norm === 'TRUE' ||
+    norm === 'AB' ||
+    norm === 'ABSENT' ||
+    norm === 'অনুপস্থিত'
+  );
+}
+
 export function readNumericMark(
   examResults: Record<string, number | string> | undefined | null,
   key: string
@@ -326,7 +364,16 @@ export function readNumericMark(
     return null;
   }
   const val = examResults[key];
-  if (val === undefined || val === null || val === '' || typeof val === 'object' || typeof val === 'boolean') {
+  if (
+    val === undefined ||
+    val === null ||
+    val === '' ||
+    typeof val === 'object' ||
+    typeof val === 'boolean'
+  ) {
+    return null;
+  }
+  if (typeof val === 'string' && isAbsentMarkerValue(val) && val.trim() !== '1') {
     return null;
   }
   const num = typeof val === 'number' ? val : Number(val);
@@ -338,6 +385,7 @@ export interface TermSubjectScore {
   sum: number | null;
   total: number | null;
   hasScore: boolean;
+  isAbsent: boolean;
 }
 
 export function getTermSubjectScore(
@@ -346,20 +394,67 @@ export function getTermSubjectScore(
   subjectId: string
 ): TermSubjectScore {
   if (!subjectId) {
-    return { cont: null, sum: null, total: null, hasScore: false };
+    return { cont: null, sum: null, total: null, hasScore: false, isAbsent: false };
   }
-  const cont = readNumericMark(examResults, `${examId}__${subjectId}__cont`);
-  const sum = readNumericMark(examResults, `${examId}__${subjectId}__sum`);
-  const storedTotal = readNumericMark(examResults, `${examId}__${subjectId}`);
+
+  const safeMap =
+    examResults && typeof examResults === 'object' && !Array.isArray(examResults)
+      ? examResults
+      : {};
+
+  const absentFlag = safeMap[getExamAbsentKey(examId, subjectId)];
+  const rawCont = safeMap[`${examId}__${subjectId}__cont`];
+  const rawSum = safeMap[`${examId}__${subjectId}__sum`];
+  const rawTotal = safeMap[`${examId}__${subjectId}`];
+
+  const isAbsent =
+    isAbsentMarkerValue(absentFlag) ||
+    (typeof rawCont === 'string' && rawCont.trim().toUpperCase() === 'AB') ||
+    (typeof rawSum === 'string' && rawSum.trim().toUpperCase() === 'AB') ||
+    (typeof rawTotal === 'string' && rawTotal.trim().toUpperCase() === 'AB') ||
+    (typeof rawCont === 'string' && rawCont.trim().toUpperCase() === 'ABSENT') ||
+    (typeof rawSum === 'string' && rawSum.trim().toUpperCase() === 'ABSENT') ||
+    (typeof rawTotal === 'string' && rawTotal.trim().toUpperCase() === 'ABSENT');
+
+  if (isAbsent) {
+    return { cont: null, sum: null, total: null, hasScore: false, isAbsent: true };
+  }
+
+  const cont = readNumericMark(safeMap, `${examId}__${subjectId}__cont`);
+  const sum = readNumericMark(safeMap, `${examId}__${subjectId}__sum`);
+  const storedTotal = readNumericMark(safeMap, `${examId}__${subjectId}`);
 
   if (cont !== null || sum !== null) {
     const total = (cont ?? 0) + (sum ?? 0);
-    return { cont, sum, total, hasScore: true };
+    return { cont, sum, total, hasScore: true, isAbsent: false };
   }
   if (storedTotal !== null) {
-    return { cont: null, sum: null, total: storedTotal, hasScore: true };
+    return { cont: null, sum: null, total: storedTotal, hasScore: true, isAbsent: false };
   }
-  return { cont: null, sum: null, total: null, hasScore: false };
+  return { cont: null, sum: null, total: null, hasScore: false, isAbsent: false };
+}
+
+/**
+ * Combined subject average strictly across exams the student actually attended
+ * (ignoring unscored and Absent terms).
+ */
+export function computeSubjectCombinedAverage(
+  examResults: Record<string, number | string> | undefined | null,
+  subjectId: string
+): { avg: number | null; attendedCount: number } {
+  let sum = 0;
+  let attendedCount = 0;
+  for (const termId of TERM_ORDER) {
+    const sc = getTermSubjectScore(examResults, termId, subjectId);
+    if (!sc.isAbsent && sc.hasScore && sc.total !== null) {
+      sum += sc.total;
+      attendedCount += 1;
+    }
+  }
+  return {
+    avg: attendedCount > 0 ? sum / attendedCount : null,
+    attendedCount,
+  };
 }
 
 export interface StudentTermSummary {
@@ -369,6 +464,8 @@ export interface StudentTermSummary {
   grade: string;
   passed: boolean;
   scoredSubjects: number;
+  absentSubjects: number;
+  fCount: number;
 }
 
 export function computeStudentTermSummary(
@@ -378,7 +475,9 @@ export function computeStudentTermSummary(
 ): StudentTermSummary {
   const safeSubjects = Array.isArray(subjects) ? subjects : [];
   const safeExamResults =
-    student?.examResults && typeof student.examResults === 'object' && !Array.isArray(student.examResults)
+    student?.examResults &&
+    typeof student.examResults === 'object' &&
+    !Array.isArray(student.examResults)
       ? student.examResults
       : {};
 
@@ -386,17 +485,26 @@ export function computeStudentTermSummary(
   let totalObtained = 0;
   let gpaSum = 0;
   let scoredSubjects = 0;
+  let absentSubjects = 0;
+  let fCount = 0;
   let allPassed = true;
 
   for (const subj of safeSubjects) {
     if (!subj || typeof subj !== 'object' || !subj.subjectId) continue;
     const fullMarks = Number(subj.fullMarks) > 0 ? Number(subj.fullMarks) : 100;
     const score = getTermSubjectScore(safeExamResults, examId, subj.subjectId);
+    if (score.isAbsent) {
+      absentSubjects += 1;
+      continue;
+    }
     if (score.hasScore && score.total !== null) {
       totalFullMarks += fullMarks;
       totalObtained += score.total;
       const g = calculateSubjectGrade(score.total, fullMarks);
-      if (!g.passed) allPassed = false;
+      if (!g.passed) {
+        allPassed = false;
+        fCount += 1;
+      }
       gpaSum += Number.isFinite(g.gpa) ? g.gpa : 0;
       scoredSubjects += 1;
     }
@@ -407,9 +515,11 @@ export function computeStudentTermSummary(
       totalFullMarks: 0,
       totalObtained: 0,
       gpa: 0,
-      grade: '-',
+      grade: absentSubjects > 0 ? 'Absent' : '-',
       passed: false,
       scoredSubjects: 0,
+      absentSubjects,
+      fCount: 0,
     };
   }
 
@@ -423,51 +533,263 @@ export function computeStudentTermSummary(
     grade,
     passed: allPassed,
     scoredSubjects,
+    absentSubjects,
+    fCount,
   };
 }
 
+export function readManualMeritPos(student: StudentDoc | null | undefined): number | null {
+  const raw = student?.examResults?.[MANUAL_MERIT_KEY];
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = Math.trunc(Number(raw));
+  return Number.isFinite(n) && n >= 1 ? n : null;
+}
+
+export interface StudentMeritDetail {
+  studentId: string;
+  rank: number;
+  autoRank: number;
+  manualPos: number | null;
+  fCount: number;
+  percentage: number;
+  avgGpa: number;
+  totalObtained: number;
+  totalFullMarks: number;
+  scoredCount: number;
+  rollNum: number;
+}
+
 /**
- * Compute Final/Annual Exam (exam_3) Merit Rank strictly for passers.
- * Returns Map<studentId, rankNumber (1-based)>.
+ * Computes class merit ranking across all attended (non-absent) exams & subjects:
+ * 1) Prioritize 0 F grades first, then 1 F, 2 F, ... (Absent never counts as F).
+ * 2) Break ties by total / average percentage across attended subjects (higher first),
+ *    then average GPA (higher first), then total obtained marks, then roll number.
+ * 3) Respect manual merit overrides (__manualMeritPos) by slotting pinned positions and
+ *    automatically shifting unpinned students around them with ZERO duplicates or gaps.
+ */
+export function computeClassMeritDetails(
+  students: StudentDoc[] | undefined | null,
+  subjects: ExamSubjectConfig[] | undefined | null
+): Map<string, StudentMeritDetail> {
+  const safeStudents = Array.isArray(students) ? students : [];
+  const safeSubjects = Array.isArray(subjects) ? subjects : [];
+
+  type RawEntry = Omit<StudentMeritDetail, 'rank' | 'autoRank'>;
+  const rawEntries: RawEntry[] = [];
+
+  for (const st of safeStudents) {
+    if (!st || !st.id) continue;
+    const examResults =
+      st.examResults && typeof st.examResults === 'object' && !Array.isArray(st.examResults)
+        ? st.examResults
+        : {};
+
+    let fCount = 0;
+    let totalObtained = 0;
+    let totalFullMarks = 0;
+    let gpaSum = 0;
+    let scoredCount = 0;
+
+    for (const termId of TERM_ORDER) {
+      for (const subj of safeSubjects) {
+        if (!subj || !subj.subjectId) continue;
+        const fm = Number(subj.fullMarks) > 0 ? Number(subj.fullMarks) : 100;
+        const score = getTermSubjectScore(examResults, termId, subj.subjectId);
+        if (score.isAbsent || !score.hasScore || score.total === null) continue;
+        scoredCount += 1;
+        totalObtained += score.total;
+        totalFullMarks += fm;
+        const g = calculateSubjectGrade(score.total, fm);
+        if (!g.passed) fCount += 1;
+        gpaSum += Number.isFinite(g.gpa) ? g.gpa : 0;
+      }
+    }
+
+    const manualPos = readManualMeritPos(st);
+    if (scoredCount === 0 && manualPos === null) {
+      continue;
+    }
+
+    const percentage = totalFullMarks > 0 ? (totalObtained / totalFullMarks) * 100 : 0;
+    const avgGpa = scoredCount > 0 ? gpaSum / scoredCount : 0;
+    const rollNum = Number(st.rollNumber);
+
+    rawEntries.push({
+      studentId: st.id,
+      manualPos,
+      fCount,
+      percentage,
+      avgGpa,
+      totalObtained,
+      totalFullMarks,
+      scoredCount,
+      rollNum: Number.isFinite(rollNum) ? rollNum : 999999,
+    });
+  }
+
+  // Natural auto-rank sorting
+  rawEntries.sort((a, b) => {
+    // Unscored students (only included if manually pinned) go after scored in natural order
+    if ((a.scoredCount > 0) !== (b.scoredCount > 0)) {
+      return a.scoredCount > 0 ? -1 : 1;
+    }
+    if (a.fCount !== b.fCount) return a.fCount - b.fCount;
+    if (Math.abs(b.percentage - a.percentage) > 1e-6) return b.percentage - a.percentage;
+    if (Math.abs(b.avgGpa - a.avgGpa) > 1e-6) return b.avgGpa - a.avgGpa;
+    if (b.totalObtained !== a.totalObtained) return b.totalObtained - a.totalObtained;
+    return a.rollNum - b.rollNum;
+  });
+
+  const withAutoRank: StudentMeritDetail[] = rawEntries.map((entry, idx) => ({
+    ...entry,
+    autoRank: idx + 1,
+    rank: idx + 1,
+  }));
+
+  const totalCount = withAutoRank.length;
+  if (totalCount === 0) return new Map();
+
+  const pinned = withAutoRank
+    .filter((e) => e.manualPos !== null)
+    .sort((a, b) => {
+      if ((a.manualPos || 0) !== (b.manualPos || 0)) {
+        return (a.manualPos || 0) - (b.manualPos || 0);
+      }
+      return a.autoRank - b.autoRank;
+    });
+
+  const unpinned = withAutoRank.filter((e) => e.manualPos === null);
+  const slots: Array<StudentMeritDetail | null> = new Array(totalCount).fill(null);
+
+  for (const p of pinned) {
+    let targetIdx = Math.max(0, Math.min(totalCount - 1, (p.manualPos || 1) - 1));
+    while (targetIdx < totalCount && slots[targetIdx] !== null) {
+      targetIdx += 1;
+    }
+    if (targetIdx >= totalCount) {
+      targetIdx = slots.findIndex((s) => s === null);
+    }
+    if (targetIdx >= 0) {
+      slots[targetIdx] = p;
+    }
+  }
+
+  let uIdx = 0;
+  for (let i = 0; i < totalCount; i++) {
+    if (slots[i] === null && uIdx < unpinned.length) {
+      slots[i] = unpinned[uIdx];
+      uIdx += 1;
+    }
+  }
+
+  const result = new Map<string, StudentMeritDetail>();
+  slots.forEach((entry, idx) => {
+    if (entry) {
+      result.set(entry.studentId, { ...entry, rank: idx + 1 });
+    }
+  });
+  return result;
+}
+
+/**
+ * Returns Map<studentId, rankNumber (1-based)> using 0-F priority + manual overrides.
  */
 export function computeFinalExamMeritMap(
   students: StudentDoc[] | undefined | null,
   subjects: ExamSubjectConfig[] | undefined | null
 ): Map<string, number> {
-  const safeStudents = Array.isArray(students) ? students : [];
-  const safeSubjects = Array.isArray(subjects) ? subjects : [];
-  const passers: Array<{
-    studentId: string;
-    totalObtained: number;
-    gpa: number;
-    rollNum: number;
-  }> = [];
+  const details = computeClassMeritDetails(students, subjects);
+  const out = new Map<string, number>();
+  for (const [id, detail] of details.entries()) {
+    out.set(id, detail.rank);
+  }
+  return out;
+}
 
-  for (const st of safeStudents) {
-    if (!st || !st.id) continue;
-    const summary = computeStudentTermSummary(st, safeSubjects, 'exam_3');
-    if (summary.scoredSubjects > 0 && summary.passed) {
-      const rollNum = Number(st.rollNumber);
-      passers.push({
-        studentId: st.id,
-        totalObtained: summary.totalObtained,
-        gpa: summary.gpa,
-        rollNum: Number.isFinite(rollNum) ? rollNum : 999999,
-      });
+/**
+ * Computes updated __manualMeritPos values when moving targetStudentId to desiredPos (1-based),
+ * automatically shifting other students in the same class with zero duplicates or gaps.
+ */
+export function applyManualMeritShift(
+  students: StudentDoc[],
+  subjects: ExamSubjectConfig[],
+  targetStudentId: string,
+  desiredPos: number
+): Array<{ student: StudentDoc; newRank: number }> {
+  const details = computeClassMeritDetails(students, subjects);
+  const byId = new Map(students.map((s) => [s.id, s]));
+
+  const rankedList = Array.from(details.values())
+    .sort((a, b) => a.rank - b.rank)
+    .map((d) => byId.get(d.studentId))
+    .filter((s): s is StudentDoc => Boolean(s));
+
+  const targetStudent = byId.get(targetStudentId);
+  if (!targetStudent) return [];
+
+  const filtered = rankedList.filter((s) => s.id !== targetStudentId);
+  const safeTargetIndex = Math.max(
+    0,
+    Math.min(filtered.length, Math.trunc(desiredPos) - 1)
+  );
+  filtered.splice(safeTargetIndex, 0, targetStudent);
+
+  return filtered.map((student, idx) => ({
+    student,
+    newRank: idx + 1,
+  }));
+}
+
+const PATH_CLASS_CODE_MAP: Record<string, string> = {
+  '0': 'Pre-Primary',
+  '00': 'Pre-Primary',
+  '1': 'Class 1',
+  '01': 'Class 1',
+  '2': 'Class 2',
+  '02': 'Class 2',
+  '3': 'Class 3',
+  '03': 'Class 3',
+  '4': 'Class 4',
+  '04': 'Class 4',
+  '5': 'Class 5',
+  '05': 'Class 5',
+};
+
+/**
+ * Supports path search like "04/01" (Class 4, Roll 1) or "00/01" (Pre-Primary, Roll 1),
+ * plus standard text search by name, roll number, guardian phone, or parents' names.
+ */
+export function matchesStudentSearch(student: StudentDoc, rawQuery: string): boolean {
+  const q = rawQuery.trim();
+  if (!q) return true;
+
+  const pathMatch = q.match(/^(\d{1,2})\s*\/\s*(\d+)$/);
+  if (pathMatch) {
+    const classCode = pathMatch[1];
+    const rollToken = pathMatch[2];
+    const targetClass =
+      PATH_CLASS_CODE_MAP[classCode] || PATH_CLASS_CODE_MAP[String(Number(classCode))];
+    if (targetClass) {
+      if (student.classLevel !== targetClass) return false;
+      const stRoll = String(student.rollNumber || '').trim();
+      const targetNum = Number(rollToken);
+      const stNum = Number(stRoll);
+      if (Number.isFinite(targetNum) && Number.isFinite(stNum) && stRoll !== '') {
+        return stNum === targetNum;
+      }
+      return stRoll === rollToken;
     }
   }
 
-  passers.sort((a, b) => {
-    if (b.totalObtained !== a.totalObtained) return b.totalObtained - a.totalObtained;
-    if (b.gpa !== a.gpa) return b.gpa - a.gpa;
-    return a.rollNum - b.rollNum;
-  });
-
-  const meritMap = new Map<string, number>();
-  passers.forEach((p, idx) => {
-    meritMap.set(p.studentId, idx + 1);
-  });
-  return meritMap;
+  const lower = q.toLowerCase();
+  return (
+    (student.studentNameBn || '').toLowerCase().includes(lower) ||
+    (student.studentNameEn || '').toLowerCase().includes(lower) ||
+    String(student.rollNumber || '').toLowerCase().includes(lower) ||
+    (student.guardianPhone || '').toLowerCase().includes(lower) ||
+    (student.fatherNameEn || '').toLowerCase().includes(lower) ||
+    (student.motherNameEn || '').toLowerCase().includes(lower)
+  );
 }
 
 export function getTodayDateKey(): string {

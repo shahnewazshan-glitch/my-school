@@ -22,6 +22,7 @@ import {
   compressImageToBase64,
   formatPhotoSrc,
   matchesClassScope,
+  matchesStudentSearch,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -36,13 +37,25 @@ interface StudentRowProps {
   lang: Language;
   showAllClasses: boolean;
   isAdmin: boolean;
+  activeFieldValue?: string;
+  showFieldCol: boolean;
   onSelect: (id: string) => void;
   onEdit: (student: StudentDoc) => void;
   onDelete: (student: StudentDoc) => void;
 }
 
 const StudentTableRow = React.memo<StudentRowProps>(
-  ({ student: st, lang, showAllClasses, isAdmin, onSelect, onEdit, onDelete }) => {
+  ({
+    student: st,
+    lang,
+    showAllClasses,
+    isAdmin,
+    activeFieldValue,
+    showFieldCol,
+    onSelect,
+    onEdit,
+    onDelete,
+  }) => {
     const photo = formatPhotoSrc(st.photoBase64);
     return (
       <tr
@@ -81,6 +94,11 @@ const StudentTableRow = React.memo<StudentRowProps>(
         {showAllClasses && (
           <td className="py-2.5 px-4 text-slate-700 whitespace-nowrap">
             {getClassLabel(st.classLevel, lang)}
+          </td>
+        )}
+        {showFieldCol && (
+          <td className="py-2.5 px-4 text-xs font-medium text-slate-800 whitespace-nowrap">
+            {activeFieldValue || '—'}
           </td>
         )}
         <td className="py-2.5 px-4 font-mono tabular-nums text-slate-600">
@@ -182,6 +200,8 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<'roll' | 'name'>('roll');
   const [showAllClasses, setShowAllClasses] = useState(false);
+  const [filterFieldKey, setFilterFieldKey] = useState<string>('');
+  const [filterFieldMode, setFilterFieldMode] = useState<'all' | 'able' | 'not_able'>('all');
   const [page, setPage] = useState(1);
   const [editingStudent, setEditingStudent] = useState<StudentFormState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -194,18 +214,110 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
 
   const isAdmin = session?.role === 'ADMIN';
 
+  const filterFieldOptions = useMemo(() => {
+    const opts: Array<{
+      key: string;
+      source: 'custom' | 'subject';
+      fieldKey: string;
+      label: string;
+      fieldType: string;
+      maxMarks?: number;
+    }> = [];
+
+    for (const cf of customFields) {
+      opts.push({
+        key: `custom:${cf.id}`,
+        source: 'custom',
+        fieldKey: cf.id,
+        label: `${cf.label} (${cf.category})`,
+        fieldType: cf.fieldType,
+      });
+    }
+    for (const subj of subjects) {
+      if (!showAllClasses && !matchesClassScope(subj.gradeScope, selectedClass)) continue;
+      if (!Array.isArray(subj.fields)) continue;
+      for (const fld of subj.fields) {
+        opts.push({
+          key: `subject:${subj.id}__${fld.fieldId}`,
+          source: 'subject',
+          fieldKey: `${subj.id}__${fld.fieldId}`,
+          label: `${subj.name} — ${fld.label}`,
+          fieldType: fld.fieldType,
+          maxMarks: fld.maxMarks,
+        });
+      }
+    }
+    return opts;
+  }, [customFields, subjects, showAllClasses, selectedClass]);
+
+  const activeFilterOption = useMemo(
+    () => filterFieldOptions.find((o) => o.key === filterFieldKey) || null,
+    [filterFieldOptions, filterFieldKey]
+  );
+
+  const getStudentFieldVal = useCallback(
+    (st: StudentDoc): string => {
+      if (!activeFilterOption) return '';
+      const raw =
+        activeFilterOption.source === 'custom'
+          ? st.customValues?.[activeFilterOption.fieldKey]
+          : st.subjectValues?.[activeFilterOption.fieldKey];
+      return raw === undefined || raw === null ? '' : String(raw).trim();
+    },
+    [activeFilterOption]
+  );
+
+  const isStudentAbleOnField = useCallback(
+    (st: StudentDoc): boolean | null => {
+      if (!activeFilterOption) return null;
+      const val = getStudentFieldVal(st);
+      if (!val) return false;
+      const lower = val.toLowerCase();
+      if (
+        lower === 'yes' ||
+        lower === 'true' ||
+        lower === 'able' ||
+        lower === 'good' ||
+        lower === 'পারে' ||
+        lower === 'হ্যাঁ' ||
+        lower === 'ভালো'
+      ) {
+        return true;
+      }
+      if (
+        lower === 'no' ||
+        lower === 'false' ||
+        lower === 'needs help' ||
+        lower === 'not able' ||
+        lower === 'পারে না' ||
+        lower === 'না'
+      ) {
+        return false;
+      }
+      const num = Number(val);
+      if (activeFilterOption.fieldType === 'NUMBER' && Number.isFinite(num)) {
+        const threshold =
+          activeFilterOption.maxMarks && activeFilterOption.maxMarks > 0
+            ? activeFilterOption.maxMarks * 0.5
+            : 5;
+        return num >= threshold;
+      }
+      return val.length > 0;
+    },
+    [activeFilterOption, getStudentFieldVal]
+  );
+
   const filteredStudents = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
     const list = students.filter((s) => {
       if (Number(s.academicYear) !== Number(selectedAcademicYear)) return false;
       if (!showAllClasses && s.classLevel !== selectedClass) return false;
-      if (!q) return true;
-      return (
-        (s.studentNameBn || '').toLowerCase().includes(q) ||
-        (s.studentNameEn || '').toLowerCase().includes(q) ||
-        String(s.rollNumber || '').toLowerCase().includes(q) ||
-        (s.guardianPhone || '').toLowerCase().includes(q)
-      );
+      if (!matchesStudentSearch(s, searchQuery)) return false;
+      if (activeFilterOption && filterFieldMode !== 'all') {
+        const able = isStudentAbleOnField(s);
+        if (filterFieldMode === 'able' && !able) return false;
+        if (filterFieldMode === 'not_able' && able) return false;
+      }
+      return true;
     });
 
     return [...list].sort((a, b) => {
@@ -216,11 +328,29 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       }
       return compareRollNumbers(a, b);
     });
-  }, [students, selectedAcademicYear, selectedClass, showAllClasses, searchQuery, sortBy]);
+  }, [
+    students,
+    selectedAcademicYear,
+    selectedClass,
+    showAllClasses,
+    searchQuery,
+    sortBy,
+    activeFilterOption,
+    filterFieldMode,
+    isStudentAbleOnField,
+  ]);
 
   useEffect(() => {
     setPage(1);
-  }, [selectedAcademicYear, selectedClass, showAllClasses, searchQuery, sortBy]);
+  }, [
+    selectedAcademicYear,
+    selectedClass,
+    showAllClasses,
+    searchQuery,
+    sortBy,
+    filterFieldKey,
+    filterFieldMode,
+  ]);
 
   const pagedStudents = useMemo(() => {
     const start = (page - 1) * DEFAULT_PAGE_SIZE;
@@ -510,119 +640,190 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           )}
 
           {/* Toolbar */}
-      <div className="bg-white border border-stone-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-        <div className="flex flex-1 flex-wrap items-center gap-3">
-          <div className="relative flex-1 min-w-[220px] max-w-md">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder={t(lang, 'searchStudents')}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:bg-white"
-            />
-          </div>
-
-          <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg">
-            <button
-              type="button"
-              onClick={() => setSortBy('roll')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
-                sortBy === 'roll'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t(lang, 'sortByRoll')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setSortBy('name')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
-                sortBy === 'name'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {t(lang, 'sortByName')}
-            </button>
-          </div>
-
-          <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={showAllClasses}
-              onChange={(e) => setShowAllClasses(e.target.checked)}
-              className="rounded border-stone-300 text-emerald-700 focus:ring-emerald-600"
-            />
-            <span>{t(lang, 'allClasses')}</span>
-          </label>
-        </div>
-
-        <button
-          type="button"
-          onClick={openCreateModal}
-          className="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
-        >
-          <Plus className="w-4 h-4" />
-          <span>{isAdmin ? t(lang, 'addStudent') : t(lang, 'proposeStudent')}</span>
-        </button>
-      </div>
-
-      {/* Students Table */}
-      <div className="bg-white border border-stone-200 rounded-xl overflow-hidden">
-        {filteredStudents.length === 0 ? (
-          <div className="p-10 text-center space-y-3">
-            <p className="text-sm text-slate-500">{t(lang, 'noStudentsFound')}</p>
-            <button
-              type="button"
-              onClick={openCreateModal}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>{isAdmin ? t(lang, 'addStudent') : t(lang, 'proposeStudent')}</span>
-            </button>
-          </div>
-        ) : (
-          <>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead>
-                <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                  <th className="py-3 px-4">{t(lang, 'rollNumber')}</th>
-                  <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
-                  {showAllClasses && <th className="py-3 px-4">{t(lang, 'classSelector')}</th>}
-                  <th className="py-3 px-4">{t(lang, 'guardianPhone')}</th>
-                  <th className="py-3 px-4 text-right">{t(lang, 'daysPresent')}</th>
-                  <th className="py-3 px-4">{t(lang, 'promotionStatus')}</th>
-                  <th className="py-3 px-4 text-right">{lang === 'bn' ? 'কার্যক্রম' : 'Actions'}</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-100">
-                {pagedStudents.map((st) => (
-                  <StudentTableRow
-                    key={st.id}
-                    student={st}
-                    lang={lang}
-                    showAllClasses={showAllClasses}
-                    isAdmin={isAdmin}
-                    onSelect={setActiveProfileId}
-                    onEdit={openEditModal}
-                    onDelete={setConfirmDeleteStudent}
+          <div className="bg-white border border-stone-200 rounded-xl p-4 space-y-3">
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+              <div className="flex flex-1 flex-wrap items-center gap-3">
+                <div className="relative flex-1 min-w-[220px] max-w-md">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder={t(lang, 'searchStudents')}
+                    className="w-full pl-9 pr-3 py-2 text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:bg-white"
                   />
-                ))}
-              </tbody>
-            </table>
+                </div>
+
+                <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setSortBy('roll')}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      sortBy === 'roll'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {t(lang, 'sortByRoll')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSortBy('name')}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      sortBy === 'name'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {t(lang, 'sortByName')}
+                  </button>
+                </div>
+
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showAllClasses}
+                    onChange={(e) => setShowAllClasses(e.target.checked)}
+                    className="rounded border-stone-300 text-emerald-700 focus:ring-emerald-600"
+                  />
+                  <span>{t(lang, 'allClasses')}</span>
+                </label>
+              </div>
+
+              <button
+                type="button"
+                onClick={openCreateModal}
+                className="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{isAdmin ? t(lang, 'addStudent') : t(lang, 'proposeStudent')}</span>
+              </button>
+            </div>
+
+            {/* Skill / Field Filter Bar */}
+            {filterFieldOptions.length > 0 && (
+              <div className="pt-2.5 border-t border-stone-100 flex flex-wrap items-center gap-2.5">
+                <span className="text-xs font-medium text-slate-500">
+                  {lang === 'bn' ? 'দক্ষতা / ফিল্ড ফিল্টার:' : 'Skill / Field Filter:'}
+                </span>
+                <select
+                  value={filterFieldKey}
+                  onChange={(e) => {
+                    setFilterFieldKey(e.target.value);
+                    if (!e.target.value) setFilterFieldMode('all');
+                  }}
+                  className="px-2.5 py-1.5 text-xs bg-stone-50 border border-stone-200 rounded-lg text-slate-800 max-w-xs"
+                >
+                  <option value="">
+                    {lang === 'bn' ? 'সকল ফিল্ড (ফিল্টার নেই)' : 'All Fields (No Filter)'}
+                  </option>
+                  {filterFieldOptions.map((opt) => (
+                    <option key={opt.key} value={opt.key}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+
+                {activeFilterOption && (
+                  <div className="flex items-center gap-1 p-0.5 bg-stone-100 rounded-lg">
+                    {(
+                      [
+                        {
+                          id: 'all',
+                          label: lang === 'bn' ? 'সকল' : 'All',
+                        },
+                        {
+                          id: 'able',
+                          label: lang === 'bn' ? 'পারে / হ্যাঁ' : 'Able / Yes',
+                        },
+                        {
+                          id: 'not_able',
+                          label: lang === 'bn' ? 'সহায়তা প্রয়োজন / না' : 'Needs Help / No',
+                        },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setFilterFieldMode(m.id)}
+                        className={`px-2.5 py-1 text-xs font-medium rounded-md cursor-pointer whitespace-nowrap ${
+                          filterFieldMode === m.id
+                            ? 'bg-emerald-700 text-white'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-          <PaginationBar
-            lang={lang}
-            page={page}
-            totalItems={filteredStudents.length}
-            onPageChange={setPage}
-          />
-          </>
-        )}
-      </div>
+
+          {/* Students Table */}
+          <div className="bg-white border border-stone-200 rounded-xl overflow-hidden">
+            {filteredStudents.length === 0 ? (
+              <div className="p-10 text-center space-y-3">
+                <p className="text-sm text-slate-500">{t(lang, 'noStudentsFound')}</p>
+                <button
+                  type="button"
+                  onClick={openCreateModal}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>{isAdmin ? t(lang, 'addStudent') : t(lang, 'proposeStudent')}</span>
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm text-left">
+                    <thead>
+                      <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
+                        <th className="py-3 px-4">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
+                        {showAllClasses && <th className="py-3 px-4">{t(lang, 'classSelector')}</th>}
+                        {activeFilterOption && (
+                          <th className="py-3 px-4 max-w-[160px] truncate">
+                            {activeFilterOption.label}
+                          </th>
+                        )}
+                        <th className="py-3 px-4">{t(lang, 'guardianPhone')}</th>
+                        <th className="py-3 px-4 text-right">{t(lang, 'daysPresent')}</th>
+                        <th className="py-3 px-4">{t(lang, 'promotionStatus')}</th>
+                        <th className="py-3 px-4 text-right">
+                          {lang === 'bn' ? 'কার্যক্রম' : 'Actions'}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {pagedStudents.map((st) => (
+                        <StudentTableRow
+                          key={st.id}
+                          student={st}
+                          lang={lang}
+                          showAllClasses={showAllClasses}
+                          isAdmin={isAdmin}
+                          showFieldCol={Boolean(activeFilterOption)}
+                          activeFieldValue={getStudentFieldVal(st)}
+                          onSelect={setActiveProfileId}
+                          onEdit={openEditModal}
+                          onDelete={setConfirmDeleteStudent}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <PaginationBar
+                  lang={lang}
+                  page={page}
+                  totalItems={filteredStudents.length}
+                  onPageChange={setPage}
+                />
+              </>
+            )}
+          </div>
         </>
       )}
 
@@ -834,19 +1035,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
                       setEditingStudent((p) => (p ? { ...p, rollNumber: e.target.value } : null))
                     }
                     className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">
-                    {t(lang, 'section')}
-                  </label>
-                  <input
-                    type="text"
-                    value={editingStudent.section}
-                    onChange={(e) =>
-                      setEditingStudent((p) => (p ? { ...p, section: e.target.value } : null))
-                    }
-                    className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
                   />
                 </div>
                 <div>

@@ -24,6 +24,7 @@ import {
   buildChunkedExamPatchPayloads,
   buildPendingChangePayload,
   clampText,
+  commitBatchesInChunks,
   FIRESTORE_LIMITS,
   formatFirestoreError,
   sanitizeStringRecordMap,
@@ -31,15 +32,23 @@ import {
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
+  applyManualMeritShift,
   calculateSubjectGrade,
   compareRollNumbers,
-  computeFinalExamMeritMap,
+  computeClassMeritDetails,
   computeStudentTermSummary,
+  computeSubjectCombinedAverage,
   formatPhotoSrc,
   getClassSubjectsForMarksheet,
+  getExamAbsentKey,
+  getOfficialExamLabel,
   getTermSubjectScore,
+  isAbsentMarkerValue,
+  MANUAL_MERIT_KEY,
   matchesClassScope,
   normalizeExamConfigs,
+  OFFICIAL_SCHOOL_NAME_BN,
+  OFFICIAL_SCHOOL_NAME_EN,
   TERM_ORDER,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type ExamTermId, type StudentDoc } from '../types/school';
@@ -118,6 +127,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   const [showExamSetupModal, setShowExamSetupModal] = useState(false);
   const [copiedWhatsapp, setCopiedWhatsapp] = useState(false);
 
+  // Dossier Overview Comment State
+  const [editingComment, setEditingComment] = useState(false);
+  const [commentDraft, setCommentDraft] = useState('');
+  const [savingComment, setSavingComment] = useState(false);
+
   // Yearly & Promotion Tab State
   const [yearlyDraft, setYearlyDraft] = useState({
     rollNumber: '',
@@ -128,6 +142,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     totalSchoolDays: '0',
     daysPresent: '0',
   });
+  const [manualRankInput, setManualRankInput] = useState('');
+  const [savingRank, setSavingRank] = useState(false);
   const [savingYearly, setSavingYearly] = useState(false);
 
   // Attendance Log Month State
@@ -183,6 +199,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     setEditMode('none');
     setDraftMarks({});
     setBanner(null);
+    setEditingComment(false);
+    setCommentDraft(safeSectorNotesText);
     setYearlyDraft({
       rollNumber: String(student.rollNumber ?? ''),
       nextYearRollNumber: String(student.nextYearRollNumber ?? ''),
@@ -196,6 +214,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     studentId,
     student,
     safeClassLevel,
+    safeSectorNotesText,
     student?.rollNumber,
     student?.nextYearRollNumber,
     student?.section,
@@ -233,7 +252,19 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         if (!subj?.subjectId) continue;
         const contKey = `${termId}__${subj.subjectId}__cont`;
         const sumKey = `${termId}__${subj.subjectId}__sum`;
+        const absentKey = getExamAbsentKey(termId, subj.subjectId);
         const totalKey = `${termId}__${subj.subjectId}`;
+
+        const isAbsent = isAbsentMarkerValue(draftMarks[absentKey]);
+        if (isAbsent) {
+          base[absentKey] = '1';
+          delete base[contKey];
+          delete base[sumKey];
+          delete base[totalKey];
+          continue;
+        } else {
+          delete base[absentKey];
+        }
 
         const contStr = draftMarks[contKey] ?? '';
         const sumStr = draftMarks[sumKey] ?? '';
@@ -247,9 +278,10 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         if (contStr !== '' || sumStr !== '') {
           base[totalKey] =
             (contStr !== '' ? Number(contStr) : 0) + (sumStr !== '' ? Number(sumStr) : 0);
-        } else if (safeExamResults[contKey] !== undefined || safeExamResults[sumKey] !== undefined) {
-          // Only delete totalKey if user cleared previously existing cont/sum marks;
-          // preserve legacy storedTotal if cont & sum were never set.
+        } else if (
+          safeExamResults[contKey] !== undefined ||
+          safeExamResults[sumKey] !== undefined
+        ) {
           delete base[totalKey];
         }
       }
@@ -264,10 +296,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       for (const subj of classSubjects) {
         if (!subj?.subjectId) continue;
         const score = getTermSubjectScore(safeExamResults, termId, subj.subjectId);
+        nextDraft[getExamAbsentKey(termId, subj.subjectId)] = score.isAbsent ? '1' : '';
         nextDraft[`${termId}__${subj.subjectId}__cont`] =
-          score.cont !== null ? String(score.cont) : '';
+          !score.isAbsent && score.cont !== null ? String(score.cont) : '';
         nextDraft[`${termId}__${subj.subjectId}__sum`] =
-          score.sum !== null ? String(score.sum) : '';
+          !score.isAbsent && score.sum !== null ? String(score.sum) : '';
       }
     }
     setDraftMarks(nextDraft);
@@ -278,6 +311,20 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   const handleMarkInputChange = (key: string, raw: string) => {
     if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
     setDraftMarks((prev) => ({ ...prev, [key]: raw }));
+  };
+
+  const handleToggleAbsent = (termId: ExamTermId, subjectId: string) => {
+    const absentKey = getExamAbsentKey(termId, subjectId);
+    const contKey = `${termId}__${subjectId}__cont`;
+    const sumKey = `${termId}__${subjectId}__sum`;
+    setDraftMarks((prev) => {
+      const nextAbsent = !isAbsentMarkerValue(prev[absentKey]);
+      return {
+        ...prev,
+        [absentKey]: nextAbsent ? '1' : '',
+        ...(nextAbsent ? { [contKey]: '', [sumKey]: '' } : {}),
+      };
+    });
   };
 
   // Compute live Student with liveExamResults for summary strip & merit rank
@@ -291,14 +338,29 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     return classSiblings.map((s) => (s.id === liveStudentForCalc.id ? liveStudentForCalc : s));
   }, [classSiblings, liveStudentForCalc]);
 
-  const meritMap = useMemo(
-    () => computeFinalExamMeritMap(liveSiblingsForMerit, classSubjects),
+  const meritDetailsMap = useMemo(
+    () => computeClassMeritDetails(liveSiblingsForMerit, classSubjects),
     [liveSiblingsForMerit, classSubjects]
   );
 
+  const studentMeritDetail = student ? meritDetailsMap.get(student.id) || null : null;
+
+  useEffect(() => {
+    setManualRankInput(studentMeritDetail ? String(studentMeritDetail.rank) : '');
+  }, [studentMeritDetail?.rank, studentId]);
+
   const activeTermSummary = useMemo(() => {
     if (!liveStudentForCalc) {
-      return { totalFullMarks: 0, totalObtained: 0, gpa: 0, grade: '-', passed: false, scoredSubjects: 0 };
+      return {
+        totalFullMarks: 0,
+        totalObtained: 0,
+        gpa: 0,
+        grade: '-',
+        passed: false,
+        scoredSubjects: 0,
+        absentSubjects: 0,
+        fCount: 0,
+      };
     }
     return computeStudentTermSummary(liveStudentForCalc, classSubjects, activeExamId);
   }, [liveStudentForCalc, classSubjects, activeExamId]);
@@ -310,9 +372,10 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         )
       : 0;
 
-  const finalMeritRank = student ? meritMap.get(student.id) || null : null;
+  const finalMeritRank = studentMeritDetail?.rank || null;
+  const isCombinedView = activeExamId === 'exam_3' || editMode === 'allTerms';
 
-  // Build 3-Term Marksheet rows + Bottom Totals from liveExamResults
+  // Build marksheet rows + totals (combined average strictly over attended non-absent exams)
   const marksheetGrid = useMemo(() => {
     let fullMarksSum = 0;
     let t1ContSum = 0;
@@ -333,34 +396,29 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       const s2 = getTermSubjectScore(liveExamResults, 'exam_2', subj.subjectId);
       const s3 = getTermSubjectScore(liveExamResults, 'exam_3', subj.subjectId);
 
-      const termTotals = [s1, s2, s3]
-        .filter((s) => s.hasScore && s.total !== null && Number.isFinite(s.total))
-        .map((s) => s.total as number);
-
-      const rowAvg =
-        termTotals.length > 0
-          ? Number((termTotals.reduce((a, b) => a + b, 0) / termTotals.length).toFixed(1))
-          : null;
+      const { avg: rawAvg } = computeSubjectCombinedAverage(liveExamResults, subj.subjectId);
+      const rowAvg = rawAvg !== null ? Number(rawAvg.toFixed(1)) : null;
 
       const activeScore =
         activeExamId === 'exam_1' ? s1 : activeExamId === 'exam_2' ? s2 : s3;
-      const activeGrade =
-        activeScore.hasScore && activeScore.total !== null
-          ? calculateSubjectGrade(activeScore.total, safeFullMarks)
-          : null;
+      const activeGrade = activeScore.isAbsent
+        ? { grade: 'Absent', gpa: 0, passed: true }
+        : activeScore.hasScore && activeScore.total !== null
+        ? calculateSubjectGrade(activeScore.total, safeFullMarks)
+        : null;
 
       fullMarksSum += safeFullMarks;
-      if (s1.cont !== null) t1ContSum += s1.cont;
-      if (s1.sum !== null) t1SumSum += s1.sum;
-      if (s1.total !== null) t1TotalSum += s1.total;
+      if (!s1.isAbsent && s1.cont !== null) t1ContSum += s1.cont;
+      if (!s1.isAbsent && s1.sum !== null) t1SumSum += s1.sum;
+      if (!s1.isAbsent && s1.total !== null) t1TotalSum += s1.total;
 
-      if (s2.cont !== null) t2ContSum += s2.cont;
-      if (s2.sum !== null) t2SumSum += s2.sum;
-      if (s2.total !== null) t2TotalSum += s2.total;
+      if (!s2.isAbsent && s2.cont !== null) t2ContSum += s2.cont;
+      if (!s2.isAbsent && s2.sum !== null) t2SumSum += s2.sum;
+      if (!s2.isAbsent && s2.total !== null) t2TotalSum += s2.total;
 
-      if (s3.cont !== null) t3ContSum += s3.cont;
-      if (s3.sum !== null) t3SumSum += s3.sum;
-      if (s3.total !== null) t3TotalSum += s3.total;
+      if (!s3.isAbsent && s3.cont !== null) t3ContSum += s3.cont;
+      if (!s3.isAbsent && s3.sum !== null) t3SumSum += s3.sum;
+      if (!s3.isAbsent && s3.total !== null) t3TotalSum += s3.total;
 
       if (rowAvg !== null) {
         avgSum += rowAvg;
@@ -420,13 +478,12 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         setDraftMarks({});
         setBanner({ type: 'success', text: t(lang, 'marksSavedSuccess') });
       } else {
-        // Send ONLY compact examResults key patch (NO full student object, NO photoBase64)
         const patch: Record<string, string> = {};
         const editableTerms = editMode === 'allTerms' ? TERM_ORDER : [activeExamId];
         for (const termId of editableTerms) {
           for (const subj of classSubjects) {
             if (!subj?.subjectId) continue;
-            for (const suffix of ['__cont', '__sum', '']) {
+            for (const suffix of ['__cont', '__sum', '__absent', '']) {
               const k = `${termId}__${subj.subjectId}${suffix}`;
               const nextVal = sanitizedExamResults[k];
               const hadOld = safeExamResults[k] !== undefined && safeExamResults[k] !== '';
@@ -482,19 +539,132 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     }
   };
 
+  const handleSaveOverviewComment = async () => {
+    if (!student || !session) return;
+    const instances = getFirebaseInstances();
+    if (!instances) return;
+
+    setSavingComment(true);
+    setSyncing(true);
+    setBanner(null);
+    const trimmedComment = commentDraft.trim();
+
+    try {
+      if (isAdmin) {
+        await withWriteTimeout(
+          updateDoc(
+            doc(instances.db, 'schools', session.schoolId, 'students', student.id),
+            {
+              sectorNotes: trimmedComment,
+              lastUpdatedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
+              updatedAt: serverTimestamp(),
+            }
+          )
+        );
+        setEditingComment(false);
+        setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+      } else {
+        const pendingDoc = buildPendingChangePayload({
+          schoolId: session.schoolId,
+          entityType: 'STUDENT_BATCH_UPDATE',
+          targetId: `${student.id}_comment_${Date.now()}`,
+          submittedByDeviceId: session.deviceId,
+          submittedByName: session.name,
+          summary: `Comment Update: ${student.studentNameBn || student.studentNameEn}`,
+          detailsText: `Class ${student.classLevel} (Roll ${student.rollNumber})`,
+          payloadJson: JSON.stringify({
+            kind: 'ROLL_PROMOTION',
+            updates: [
+              {
+                studentId: student.id,
+                studentName: clampText(student.studentNameBn || student.studentNameEn, 80),
+                fieldsPatch: { sectorNotes: trimmedComment },
+              },
+            ],
+          }),
+          status: 'PENDING',
+        });
+        await withWriteTimeout(
+          addDoc(
+            collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+            pendingDoc
+          )
+        );
+        setEditingComment(false);
+        setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+      }
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingComment(false);
+      setSyncing(false);
+    }
+  };
+
+  const handleApplyManualMeritRank = async () => {
+    if (!student || !session || !isAdmin) return;
+    const desired = Math.trunc(Number(manualRankInput));
+    if (!Number.isFinite(desired) || desired < 1) return;
+    const instances = getFirebaseInstances();
+    if (!instances) return;
+
+    setSavingRank(true);
+    setSyncing(true);
+    setBanner(null);
+    try {
+      const shifted = applyManualMeritShift(
+        classSiblings,
+        classSubjects,
+        student.id,
+        desired
+      );
+      const actorName = clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS);
+      await commitBatchesInChunks(instances.db, shifted, (batch, item) => {
+        const nextExamResults = sanitizeStringRecordMap({
+          ...(item.student.examResults || {}),
+          [MANUAL_MERIT_KEY]: String(item.newRank),
+        });
+        batch.update(
+          doc(instances.db, 'schools', session.schoolId, 'students', item.student.id),
+          {
+            examResults: nextExamResults,
+            lastUpdatedByName: actorName,
+            updatedAt: serverTimestamp(),
+          }
+        );
+      });
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `মেধাক্রম #${desired} নির্ধারণ ও সহপাঠীদের ক্রম সমন্বয় করা হয়েছে।`
+            : `Merit position set to #${desired} and class ranks shifted cleanly.`,
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingRank(false);
+      setSyncing(false);
+    }
+  };
+
   const handleCopyWhatsAppSummary = async () => {
     if (!student) return;
-    const termTitle =
-      activeExamId === 'exam_1'
-        ? t(lang, 'term1')
-        : activeExamId === 'exam_2'
-        ? t(lang, 'term2')
-        : t(lang, 'term3');
+    const termTitle = getOfficialExamLabel(activeExamId, lang);
 
     const subjectLines = marksheetGrid.rows
       .map((r) => {
         const score =
           activeExamId === 'exam_1' ? r.s1 : activeExamId === 'exam_2' ? r.s2 : r.s3;
+        if (score.isAbsent) {
+          return `• ${r.subj.subjectName}: ${t(lang, 'absentLabel')}`;
+        }
         if (!score.hasScore) return null;
         return `• ${r.subj.subjectName}: ${score.total}/${r.subj.fullMarks} (${r.activeGrade?.grade || '-'})`;
       })
@@ -505,13 +675,23 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       ? activeTermSummary.gpa.toFixed(2)
       : '0.00';
 
+    const schoolNameLine =
+      school?.schoolName?.trim() ||
+      (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+
     const summaryText = [
-      `*${school?.schoolName || 'My School'}*`,
+      `*${schoolNameLine}*`,
       `${student.studentNameBn || student.studentNameEn || 'Student'} (Roll: ${student.rollNumber ?? '-'}, ${getClassLabel(safeClassLevel, lang)} ${student.academicYear || ''})`,
-      `Exam: ${termTitle}`,
+      `${termTitle}`,
       subjectLines,
-      `Total: ${activeTermSummary.totalObtained}/${activeTermSummary.totalFullMarks} (${activeTermPercentage}%)`,
-      `GPA: ${gpaLabel} | Grade: ${activeTermSummary.grade} | ${activeTermSummary.passed ? 'PASSED' : 'FAILED'}`,
+      activeTermSummary.scoredSubjects > 0
+        ? `Total: ${activeTermSummary.totalObtained}/${activeTermSummary.totalFullMarks} (${activeTermPercentage}%)`
+        : '',
+      activeTermSummary.scoredSubjects > 0
+        ? `GPA: ${gpaLabel} | Grade: ${activeTermSummary.grade} | ${activeTermSummary.passed ? 'PASSED' : 'FAILED'}`
+        : activeTermSummary.absentSubjects > 0
+        ? `Status: ${t(lang, 'absentLabel')}`
+        : '',
       activeExamId === 'exam_3' && finalMeritRank ? `Merit Rank: #${finalMeritRank}` : '',
     ]
       .filter(Boolean)
@@ -529,19 +709,74 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   const handleExportStudentExcel = async () => {
     if (!student) return;
     const XLSX = await import('xlsx');
+    const schoolTitle =
+      school?.schoolName?.trim() ||
+      (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+    const safeClassFile = safeClassLevel.replace(/\s+/g, '_');
+    const safeRollFile = String(student.rollNumber ?? 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    if (activeExamId !== 'exam_3') {
+      const examLabel = getOfficialExamLabel(activeExamId, lang);
+      const headerRow = [
+        'Subject',
+        'Full Marks',
+        'Continuous',
+        'Summative',
+        'Total',
+        'Grade / Status',
+      ];
+      const rows = marksheetGrid.rows.map((r) => {
+        const sc = activeExamId === 'exam_1' ? r.s1 : r.s2;
+        return [
+          r.subj.subjectName,
+          r.subj.fullMarks,
+          sc.isAbsent ? 'Absent' : sc.cont ?? '',
+          sc.isAbsent ? 'Absent' : sc.sum ?? '',
+          sc.isAbsent ? 'Absent' : sc.total ?? '',
+          sc.isAbsent ? 'Absent' : r.activeGrade?.grade || '',
+        ];
+      });
+      const totalsRow = [
+        'Totals',
+        marksheetGrid.totals.fullMarksSum,
+        activeExamId === 'exam_1' ? marksheetGrid.totals.t1ContSum : marksheetGrid.totals.t2ContSum,
+        activeExamId === 'exam_1' ? marksheetGrid.totals.t1SumSum : marksheetGrid.totals.t2SumSum,
+        activeExamId === 'exam_1' ? marksheetGrid.totals.t1TotalSum : marksheetGrid.totals.t2TotalSum,
+        activeTermSummary.grade,
+      ];
+      const aoa = [
+        [`${schoolTitle} — ${examLabel}`],
+        [
+          `Student: ${student.studentNameBn || student.studentNameEn}`,
+          `Roll: ${student.rollNumber}`,
+          `Class: ${student.classLevel}`,
+          `Year: ${student.academicYear}`,
+        ],
+        [],
+        headerRow,
+        ...rows,
+        totalsRow,
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Marksheet');
+      XLSX.writeFile(wb, `Marksheet_${activeExamId}_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
+      return;
+    }
+
     const headerRow1 = [
       'Subject',
       'Full Marks',
-      '1st Term',
+      getOfficialExamLabel('exam_1', lang),
       '',
       '',
-      '2nd Term',
+      getOfficialExamLabel('exam_2', lang),
       '',
       '',
-      'Final Term',
+      getOfficialExamLabel('exam_3', lang),
       '',
       '',
-      '3-Term Average',
+      'Combined Average',
     ];
     const headerRow2 = [
       '',
@@ -560,15 +795,15 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     const rows = marksheetGrid.rows.map((r) => [
       r.subj.subjectName,
       r.subj.fullMarks,
-      r.s1.cont ?? '',
-      r.s1.sum ?? '',
-      r.s1.total ?? '',
-      r.s2.cont ?? '',
-      r.s2.sum ?? '',
-      r.s2.total ?? '',
-      r.s3.cont ?? '',
-      r.s3.sum ?? '',
-      r.s3.total ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.cont ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.sum ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.total ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.cont ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.sum ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.total ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.cont ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.sum ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.total ?? '',
       r.rowAvg ?? '',
     ]);
     const totalsRow = [
@@ -587,7 +822,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     ];
 
     const aoa = [
-      [`${school?.schoolName || 'My School'} — 3-Term Marksheet`],
+      [`${schoolTitle} — ${getOfficialExamLabel('exam_3', lang)}`],
       [
         `Student: ${student.studentNameBn || student.studentNameEn}`,
         `Roll: ${student.rollNumber}`,
@@ -611,8 +846,6 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Marksheet');
-    const safeClassFile = safeClassLevel.replace(/\s+/g, '_');
-    const safeRollFile = String(student.rollNumber ?? 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
     XLSX.writeFile(wb, `Marksheet_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
   };
 
@@ -873,16 +1106,16 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <span className="font-mono tabular-nums font-semibold text-slate-800">
                 {t(lang, 'rollNumber')} {student.rollNumber}
               </span>
-              {student.section && (
+              <span aria-hidden="true">·</span>
+              <span className="tabular-nums">{student.academicYear}</span>
+              {finalMeritRank && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span>
-                    {t(lang, 'section')} {student.section}
+                  <span className="font-semibold text-emerald-800">
+                    {t(lang, 'meritPosition')}: #{finalMeritRank}
                   </span>
                 </>
               )}
-              <span aria-hidden="true">·</span>
-              <span className="tabular-nums">{student.academicYear}</span>
             </div>
           </div>
         </div>
@@ -975,12 +1208,70 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               </div>
             </dl>
 
-            <div className="pt-4 border-t border-stone-100">
-              <div className="text-xs text-slate-500 mb-1">{t(lang, 'sectorNotes')}</div>
-              <p className="text-sm text-slate-800 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-lg p-3">
-                {safeSectorNotesText ||
-                  (lang === 'bn' ? 'কোনো মন্তব্য নেই।' : 'No teacher notes recorded.')}
-              </p>
+            <div className="pt-4 border-t border-stone-100 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-xs font-semibold text-slate-700">{t(lang, 'sectorNotes')}</div>
+                {!editingComment ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCommentDraft(safeSectorNotesText);
+                      setEditingComment(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 hover:text-emerald-800 cursor-pointer"
+                  >
+                    <Edit3 className="w-3 h-3" />
+                    <span>{lang === 'bn' ? 'মন্তব্য লিখুন' : 'Edit Comment'}</span>
+                  </button>
+                ) : null}
+              </div>
+
+              {editingComment ? (
+                <div className="space-y-2">
+                  <textarea
+                    rows={3}
+                    value={commentDraft}
+                    onChange={(e) => setCommentDraft(e.target.value)}
+                    placeholder={
+                      lang === 'bn'
+                        ? 'শিক্ষার্থীর সার্বিক পারফরম্যান্স, পাঠাভ্যাস ও আচরণ সম্পর্কে মন্তব্য লিখুন...'
+                        : 'Write overview & performance comment for this student...'
+                    }
+                    className="w-full px-3 py-2 text-sm border border-emerald-400 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                  />
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditingComment(false)}
+                      className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-stone-300 rounded-lg hover:bg-stone-50 cursor-pointer"
+                    >
+                      {t(lang, 'cancel')}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={savingComment}
+                      onClick={handleSaveOverviewComment}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white rounded-lg cursor-pointer"
+                    >
+                      <Save className="w-3 h-3" />
+                      <span>
+                        {savingComment
+                          ? t(lang, 'loading')
+                          : isAdmin
+                          ? t(lang, 'saveChanges')
+                          : t(lang, 'submitForApproval')}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-800 whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-lg p-3">
+                  {safeSectorNotesText ||
+                    (lang === 'bn'
+                      ? 'কোনো মন্তব্য লেখা হয়নি।'
+                      : 'No overview or performance comment recorded yet.')}
+                </p>
+              )}
             </div>
           </div>
 
@@ -1062,7 +1353,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         </div>
       )}
 
-      {/* TAB 2: Interactive 3-Term Marksheet wrapped in ErrorBoundary */}
+      {/* TAB 2: Interactive Academic Marksheet wrapped in ErrorBoundary */}
       {activeTab === 'marksheet' && (
         <ErrorBoundary
           onBackToList={onBack}
@@ -1072,16 +1363,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         <div className="space-y-4">
           {/* Top Controls inside Marksheet Tab */}
           <div className="bg-white border border-stone-200 rounded-xl p-4 flex flex-col xl:flex-row xl:items-center justify-between gap-4 no-print">
-            {/* 3-Exam Selector */}
+            {/* Exam Selector */}
             <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg">
+              <div className="flex flex-wrap items-center gap-1 p-1 bg-stone-100 rounded-lg">
                 {TERM_ORDER.map((termId) => {
-                  const label =
-                    termId === 'exam_1'
-                      ? t(lang, 'term1')
-                      : termId === 'exam_2'
-                      ? t(lang, 'term2')
-                      : t(lang, 'term3');
+                  const label = getOfficialExamLabel(termId, lang);
                   return (
                     <button
                       key={termId}
@@ -1089,7 +1375,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                       onClick={() => setActiveExamId(termId)}
                       className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                         activeExamId === termId
-                          ? 'bg-white text-slate-900 shadow-xs'
+                          ? 'bg-emerald-700 text-white shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
@@ -1111,7 +1397,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               )}
             </div>
 
-            {/* Action Buttons: Enter/Edit Marks, Inline Edit All 3 Terms, Print, WhatsApp */}
+            {/* Action Buttons */}
             <div className="flex flex-wrap items-center gap-2">
               {editMode === 'none' ? (
                 <>
@@ -1220,6 +1506,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <div className="mt-1 text-lg font-bold font-mono tabular-nums text-slate-900">
                 {activeTermSummary.scoredSubjects > 0
                   ? `${Number.isFinite(activeTermSummary.gpa) ? activeTermSummary.gpa.toFixed(2) : '0.00'} (${activeTermSummary.grade})`
+                  : activeTermSummary.absentSubjects > 0
+                  ? t(lang, 'absentLabel')
                   : '—'}
               </div>
             </div>
@@ -1227,7 +1515,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
               <div className="text-xs text-slate-500">Result Status</div>
               <div className="mt-1 text-sm font-semibold flex items-center gap-1.5">
                 {activeTermSummary.scoredSubjects === 0 ? (
-                  <span className="text-slate-500">{t(lang, 'notScoredLabel')}</span>
+                  <span className="text-slate-500">
+                    {activeTermSummary.absentSubjects > 0
+                      ? t(lang, 'absentLabel')
+                      : t(lang, 'notScoredLabel')}
+                  </span>
                 ) : activeTermSummary.passed ? (
                   <span className="inline-flex items-center gap-1 text-emerald-700">
                     <CheckCircle2 className="w-4 h-4" />
@@ -1249,15 +1541,21 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             </div>
           </div>
 
-          {/* Printable & Interactive 3-Term Marksheet Card */}
+          {/* Printable & Interactive Marksheet Card */}
           <div className="bg-white border border-stone-200 rounded-xl p-5 sm:p-7 print-card space-y-5">
-            {/* Print-only Header */}
-            <div className="hidden print:block text-center border-b-2 border-slate-800 pb-3 space-y-1">
-              <h2 className="text-xl font-bold">{school?.schoolName || 'My School'}</h2>
+            {/* Screen + Print Card Header */}
+            <div className="text-center border-b border-stone-200 print:border-b-2 print:border-slate-800 pb-3 space-y-1">
+              <h2 className="text-lg sm:text-xl font-bold text-slate-900">
+                {school?.schoolName?.trim() ||
+                  (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN)}
+              </h2>
+              <div className="text-xs font-semibold text-emerald-800">
+                {getOfficialExamLabel(activeExamId, lang)}
+              </div>
               <p className="text-xs text-slate-600">
                 {student.studentNameBn || student.studentNameEn || 'Student'} ·{' '}
-                {getClassLabel(safeClassLevel, lang)} · Roll {student.rollNumber ?? '—'} ·{' '}
-                {student.academicYear || ''}
+                {getClassLabel(safeClassLevel, lang)} · {t(lang, 'rollNumber')}{' '}
+                {student.rollNumber ?? '—'} · {student.academicYear || ''}
               </p>
             </div>
 
@@ -1279,7 +1577,175 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                   </button>
                 )}
               </div>
+            ) : !isCombinedView ? (
+              /* SINGLE EXAM VIEW (1st Term or 2nd Term selected) */
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs sm:text-sm border-collapse border border-stone-300">
+                  <thead>
+                    <tr className="bg-emerald-50/70 text-slate-800 font-semibold">
+                      <th className="border border-stone-300 py-2.5 px-3 text-left min-w-[150px]">
+                        {t(lang, 'subject')}
+                      </th>
+                      <th className="border border-stone-300 py-2.5 px-2 text-center w-20">
+                        {t(lang, 'fullMarks')}
+                      </th>
+                      <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                        {t(lang, 'contShort')}
+                      </th>
+                      <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                        {t(lang, 'sumShort')}
+                      </th>
+                      <th className="border border-stone-300 py-2.5 px-2 text-center w-24 font-bold">
+                        {t(lang, 'totalShort')}
+                      </th>
+                      <th className="border border-stone-300 py-2.5 px-2 text-center w-28">
+                        {editMode === 'activeTerm'
+                          ? `${t(lang, 'gradeInternal')} / ${t(lang, 'absentLabel')}`
+                          : t(lang, 'gradeInternal')}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {marksheetGrid.rows.map(({ subj, s1, s2, activeGrade }, idx) => {
+                      const score = activeExamId === 'exam_1' ? s1 : s2;
+                      const isEditable = editMode === 'activeTerm';
+                      const contKey = `${activeExamId}__${subj.subjectId}__cont`;
+                      const sumKey = `${activeExamId}__${subj.subjectId}__sum`;
+                      const absentKey = getExamAbsentKey(activeExamId, subj.subjectId);
+                      const isDraftAbsent = isEditable
+                        ? isAbsentMarkerValue(draftMarks[absentKey])
+                        : score.isAbsent;
+
+                      return (
+                        <tr key={`${subj.subjectId}_${idx}`} className="hover:bg-stone-50/50">
+                          <td className="border border-stone-300 py-2 px-3 font-medium text-slate-900">
+                            {subj.subjectName}
+                          </td>
+                          <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                            {subj.fullMarks}
+                          </td>
+                          <td className="border border-stone-300 p-1.5 text-center font-mono tabular-nums">
+                            {isEditable ? (
+                              isDraftAbsent ? (
+                                <span className="text-xs font-semibold text-amber-800">
+                                  {t(lang, 'absentLabel')}
+                                </span>
+                              ) : (
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={draftMarks[contKey] ?? ''}
+                                  onChange={(e) => handleMarkInputChange(contKey, e.target.value)}
+                                  placeholder="0"
+                                  className="w-16 px-1.5 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                                />
+                              )
+                            ) : score.isAbsent ? (
+                              <span className="text-xs font-semibold text-amber-800">
+                                {t(lang, 'absentLabel')}
+                              </span>
+                            ) : (
+                              score.cont ?? '—'
+                            )}
+                          </td>
+                          <td className="border border-stone-300 p-1.5 text-center font-mono tabular-nums">
+                            {isEditable ? (
+                              isDraftAbsent ? (
+                                <span className="text-xs font-semibold text-amber-800">
+                                  {t(lang, 'absentLabel')}
+                                </span>
+                              ) : (
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={draftMarks[sumKey] ?? ''}
+                                  onChange={(e) => handleMarkInputChange(sumKey, e.target.value)}
+                                  placeholder="0"
+                                  className="w-16 px-1.5 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                                />
+                              )
+                            ) : score.isAbsent ? (
+                              <span className="text-xs font-semibold text-amber-800">
+                                {t(lang, 'absentLabel')}
+                              </span>
+                            ) : (
+                              score.sum ?? '—'
+                            )}
+                          </td>
+                          <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-stone-50/50">
+                            {score.isAbsent ? (
+                              <span className="text-xs font-semibold text-amber-800">
+                                {t(lang, 'absentLabel')}
+                              </span>
+                            ) : (
+                              score.total ?? '—'
+                            )}
+                          </td>
+                          <td className="border border-stone-300 py-2 px-2 text-center">
+                            {isEditable ? (
+                              <label className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-900 cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  checked={isDraftAbsent}
+                                  onChange={() =>
+                                    handleToggleAbsent(activeExamId, subj.subjectId)
+                                  }
+                                  className="rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                                />
+                                <span>{t(lang, 'absentLabel')}</span>
+                              </label>
+                            ) : score.isAbsent ? (
+                              <span className="text-xs font-semibold text-amber-800">
+                                {t(lang, 'absentLabel')}
+                              </span>
+                            ) : activeGrade ? (
+                              <span
+                                className={`font-mono font-semibold ${
+                                  activeGrade.passed ? 'text-emerald-700' : 'text-rose-600'
+                                }`}
+                              >
+                                {activeGrade.grade}
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-stone-100 font-bold text-slate-900">
+                      <td className="border border-stone-300 py-2.5 px-3">
+                        {t(lang, 'totalsRow')}
+                      </td>
+                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                        {marksheetGrid.totals.fullMarksSum}
+                      </td>
+                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                        {activeExamId === 'exam_1'
+                          ? marksheetGrid.totals.t1ContSum
+                          : marksheetGrid.totals.t2ContSum}
+                      </td>
+                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                        {activeExamId === 'exam_1'
+                          ? marksheetGrid.totals.t1SumSum
+                          : marksheetGrid.totals.t2SumSum}
+                      </td>
+                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                        {activeExamId === 'exam_1'
+                          ? marksheetGrid.totals.t1TotalSum
+                          : marksheetGrid.totals.t2TotalSum}
+                      </td>
+                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono">
+                        {activeTermSummary.grade}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
             ) : (
+              /* COMBINED FULL ACADEMIC YEAR VIEW (3rd Term / Final Evaluation or Inline Edit All Terms) */
               <div className="overflow-x-auto">
                 <table className="w-full text-xs sm:text-sm border-collapse border border-stone-300">
                   <thead>
@@ -1298,27 +1764,21 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                       </th>
                       <th
                         colSpan={3}
-                        className={`border border-stone-300 py-2 px-2 text-center ${
-                          activeExamId === 'exam_1' ? 'bg-emerald-100/80' : 'bg-emerald-50/50'
-                        }`}
+                        className="border border-stone-300 py-2 px-2 text-center bg-emerald-50/70"
                       >
-                        {t(lang, 'term1')}
+                        {getOfficialExamLabel('exam_1', lang)}
                       </th>
                       <th
                         colSpan={3}
-                        className={`border border-stone-300 py-2 px-2 text-center ${
-                          activeExamId === 'exam_2' ? 'bg-sky-100/80' : 'bg-sky-50/40'
-                        }`}
+                        className="border border-stone-300 py-2 px-2 text-center bg-sky-50/50"
                       >
-                        {t(lang, 'term2')}
+                        {getOfficialExamLabel('exam_2', lang)}
                       </th>
                       <th
                         colSpan={3}
-                        className={`border border-stone-300 py-2 px-2 text-center ${
-                          activeExamId === 'exam_3' ? 'bg-amber-100/80' : 'bg-amber-50/40'
-                        }`}
+                        className="border border-stone-300 py-2 px-2 text-center bg-amber-50/70"
                       >
-                        {t(lang, 'term3')}
+                        {getOfficialExamLabel('exam_3', lang)}
                       </th>
                       <th
                         rowSpan={2}
@@ -1347,43 +1807,95 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                     {marksheetGrid.rows.map(({ subj, s1, s2, s3, rowAvg, activeGrade }, idx) => {
                       const renderTermCells = (
                         termId: ExamTermId,
-                        score: { cont: number | null; sum: number | null; total: number | null }
+                        score: {
+                          cont: number | null;
+                          sum: number | null;
+                          total: number | null;
+                          isAbsent: boolean;
+                        }
                       ) => {
                         const isEditable =
                           editMode === 'allTerms' ||
                           (editMode === 'activeTerm' && termId === activeExamId);
                         const contKey = `${termId}__${subj.subjectId}__cont`;
                         const sumKey = `${termId}__${subj.subjectId}__sum`;
+                        const absentKey = getExamAbsentKey(termId, subj.subjectId);
+                        const isDraftAbsent = isEditable
+                          ? isAbsentMarkerValue(draftMarks[absentKey])
+                          : score.isAbsent;
+
+                        if (isEditable) {
+                          return (
+                            <React.Fragment key={termId}>
+                              <td className="border border-stone-300 p-1 text-center font-mono tabular-nums">
+                                {isDraftAbsent ? (
+                                  <span className="text-[11px] font-semibold text-amber-800">
+                                    {t(lang, 'absentLabel')}
+                                  </span>
+                                ) : (
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={draftMarks[contKey] ?? ''}
+                                    onChange={(e) => handleMarkInputChange(contKey, e.target.value)}
+                                    placeholder="0"
+                                    className="w-12 px-1 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                                  />
+                                )}
+                              </td>
+                              <td className="border border-stone-300 p-1 text-center font-mono tabular-nums">
+                                {isDraftAbsent ? (
+                                  <span className="text-[11px] font-semibold text-amber-800">
+                                    AB
+                                  </span>
+                                ) : (
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={draftMarks[sumKey] ?? ''}
+                                    onChange={(e) => handleMarkInputChange(sumKey, e.target.value)}
+                                    placeholder="0"
+                                    className="w-12 px-1 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                                  />
+                                )}
+                              </td>
+                              <td className="border border-stone-300 py-1 px-1 text-center bg-stone-50/50">
+                                <label
+                                  className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-900 cursor-pointer select-none"
+                                  title={t(lang, 'absentLabel')}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={isDraftAbsent}
+                                    onChange={() => handleToggleAbsent(termId, subj.subjectId)}
+                                    className="rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                                  />
+                                  <span>AB</span>
+                                </label>
+                              </td>
+                            </React.Fragment>
+                          );
+                        }
+
+                        if (score.isAbsent) {
+                          return (
+                            <td
+                              key={termId}
+                              colSpan={3}
+                              className="border border-stone-300 py-2 px-1.5 text-center text-xs font-semibold text-amber-800 bg-amber-50/40"
+                            >
+                              {t(lang, 'absentLabel')}
+                            </td>
+                          );
+                        }
 
                         return (
                           <React.Fragment key={termId}>
-                            <td className="border border-stone-300 p-1 text-center font-mono tabular-nums">
-                              {isEditable ? (
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={draftMarks[contKey] ?? ''}
-                                  onChange={(e) => handleMarkInputChange(contKey, e.target.value)}
-                                  placeholder="0"
-                                  className="w-14 px-1 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
-                                />
-                              ) : (
-                                <span className="text-slate-700">{score.cont ?? '—'}</span>
-                              )}
+                            <td className="border border-stone-300 p-1 text-center font-mono tabular-nums text-slate-700">
+                              {score.cont ?? '—'}
                             </td>
-                            <td className="border border-stone-300 p-1 text-center font-mono tabular-nums">
-                              {isEditable ? (
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={draftMarks[sumKey] ?? ''}
-                                  onChange={(e) => handleMarkInputChange(sumKey, e.target.value)}
-                                  placeholder="0"
-                                  className="w-14 px-1 py-1 text-center text-xs bg-white border border-emerald-400 rounded focus:outline-none focus:ring-2 focus:ring-emerald-600"
-                                />
-                              ) : (
-                                <span className="text-slate-700">{score.sum ?? '—'}</span>
-                              )}
+                            <td className="border border-stone-300 p-1 text-center font-mono tabular-nums text-slate-700">
+                              {score.sum ?? '—'}
                             </td>
                             <td className="border border-stone-300 py-2 px-1.5 text-center font-mono tabular-nums font-semibold text-slate-900 bg-stone-50/50">
                               {score.total ?? '—'}
@@ -1400,10 +1912,14 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                               {activeGrade && (
                                 <span
                                   className={`text-[11px] font-mono font-semibold ${
-                                    activeGrade.passed ? 'text-emerald-700' : 'text-rose-600'
+                                    s3.isAbsent
+                                      ? 'text-amber-700'
+                                      : activeGrade.passed
+                                      ? 'text-emerald-700'
+                                      : 'text-rose-600'
                                   }`}
                                 >
-                                  {activeGrade.grade}
+                                  {s3.isAbsent ? 'AB' : activeGrade.grade}
                                 </span>
                               )}
                             </div>
@@ -1483,142 +1999,178 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         </ErrorBoundary>
       )}
 
-      {/* TAB 3: Yearly & Promotion */}
+      {/* TAB 3: Yearly & Promotion + Manual Merit Rank Shift */}
       {activeTab === 'yearly' && (
-        <form
-          onSubmit={handleSaveYearly}
-          className="bg-white border border-stone-200 rounded-xl p-6 max-w-3xl space-y-5"
-        >
-          <div className="flex items-center justify-between pb-3 border-b border-stone-100">
-            <h3 className="text-base font-semibold text-slate-900">
-              {t(lang, 'tabYearlyPromotion')} ({student.academicYear})
-            </h3>
-            <span className="text-sm font-mono tabular-nums font-semibold text-emerald-800">
-              {t(lang, 'attendancePct')}: {yearlyAttPct}%
-            </span>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'rollNumber')}
-              </label>
-              <input
-                type="text"
-                value={yearlyDraft.rollNumber}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, rollNumber: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'nextYearRollNumber')}
-              </label>
-              <input
-                type="text"
-                value={yearlyDraft.nextYearRollNumber}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, nextYearRollNumber: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'classSelector')}
-              </label>
-              <select
-                value={yearlyDraft.classLevel}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, classLevel: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white"
-              >
-                {CLASS_LEVELS.map((cls) => (
-                  <option key={cls} value={cls}>
-                    {getClassLabel(cls, lang)}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'section')}
-              </label>
-              <input
-                type="text"
-                value={yearlyDraft.section}
-                onChange={(e) => setYearlyDraft((p) => ({ ...p, section: e.target.value }))}
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'totalSchoolDays')}
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={yearlyDraft.totalSchoolDays}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, totalSchoolDays: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'daysPresent')}
-              </label>
-              <input
-                type="number"
-                min={0}
-                value={yearlyDraft.daysPresent}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, daysPresent: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
-              />
-            </div>
-            <div className="sm:col-span-3">
-              <label className="block text-xs font-medium text-slate-700 mb-1">
-                {t(lang, 'promotionStatus')}
-              </label>
-              <select
-                value={yearlyDraft.promotionStatus}
-                onChange={(e) =>
-                  setYearlyDraft((p) => ({ ...p, promotionStatus: e.target.value }))
-                }
-                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white"
-              >
-                <option value="">—</option>
-                <option value="Promoted">Promoted / উত্তীর্ণ</option>
-                <option value="Retained">Retained / পুনঃপঠন</option>
-                <option value="Graduated">Graduated / সমাপনী উত্তীর্ণ</option>
-                <option value="Transferred">Transferred / ছাড়পত্র</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="pt-2 flex justify-end">
-            <button
-              type="submit"
-              disabled={savingYearly}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
-            >
-              <Save className="w-3.5 h-3.5" />
-              <span>
-                {savingYearly
-                  ? t(lang, 'loading')
-                  : isAdmin
-                  ? t(lang, 'saveChanges')
-                  : t(lang, 'submitForApproval')}
+        <div className="space-y-5 max-w-3xl">
+          <form
+            onSubmit={handleSaveYearly}
+            className="bg-white border border-stone-200 rounded-xl p-6 space-y-5"
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-stone-100">
+              <h3 className="text-base font-semibold text-slate-900">
+                {t(lang, 'tabYearlyPromotion')} ({student.academicYear})
+              </h3>
+              <span className="text-sm font-mono tabular-nums font-semibold text-emerald-800">
+                {t(lang, 'attendancePct')}: {yearlyAttPct}%
               </span>
-            </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'rollNumber')}
+                </label>
+                <input
+                  type="text"
+                  value={yearlyDraft.rollNumber}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, rollNumber: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'nextYearRollNumber')}
+                </label>
+                <input
+                  type="text"
+                  value={yearlyDraft.nextYearRollNumber}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, nextYearRollNumber: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'classSelector')}
+                </label>
+                <select
+                  value={yearlyDraft.classLevel}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, classLevel: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white"
+                >
+                  {CLASS_LEVELS.map((cls) => (
+                    <option key={cls} value={cls}>
+                      {getClassLabel(cls, lang)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'totalSchoolDays')}
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={yearlyDraft.totalSchoolDays}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, totalSchoolDays: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'daysPresent')}
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={yearlyDraft.daysPresent}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, daysPresent: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'promotionStatus')}
+                </label>
+                <select
+                  value={yearlyDraft.promotionStatus}
+                  onChange={(e) =>
+                    setYearlyDraft((p) => ({ ...p, promotionStatus: e.target.value }))
+                  }
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg bg-white"
+                >
+                  <option value="">—</option>
+                  <option value="Promoted">Promoted / উত্তীর্ণ</option>
+                  <option value="Retained">Retained / পুনঃপঠন</option>
+                  <option value="Graduated">Graduated / সমাপনী উত্তীর্ণ</option>
+                  <option value="Transferred">Transferred / ছাড়পত্র</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="pt-2 flex justify-end">
+              <button
+                type="submit"
+                disabled={savingYearly}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>
+                  {savingYearly
+                    ? t(lang, 'loading')
+                    : isAdmin
+                    ? t(lang, 'saveChanges')
+                    : t(lang, 'submitForApproval')}
+                </span>
+              </button>
+            </div>
+          </form>
+
+          {/* Manual Merit Position Card */}
+          <div className="bg-white border border-stone-200 rounded-xl p-6 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h4 className="text-sm font-bold text-slate-900">
+                  {t(lang, 'meritPosition')}
+                </h4>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {studentMeritDetail
+                    ? lang === 'bn'
+                      ? `বর্তমান মেধাক্রম: #${studentMeritDetail.rank} (স্বয়ংক্রিয়: #${studentMeritDetail.autoRank}, F সংখ্যা: ${studentMeritDetail.fCount}, মোট: ${studentMeritDetail.percentage.toFixed(1)}%)`
+                      : `Current Rank: #${studentMeritDetail.rank} (Auto Rank: #${studentMeritDetail.autoRank}, F Count: ${studentMeritDetail.fCount}, Avg: ${studentMeritDetail.percentage.toFixed(1)}%)`
+                    : lang === 'bn'
+                    ? 'এখনো পরীক্ষার নম্বর দেওয়া হয়নি।'
+                    : 'No scored exams yet.'}
+                </p>
+              </div>
+              {isAdmin && (
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={Math.max(1, classSiblings.length)}
+                    value={manualRankInput}
+                    onChange={(e) => setManualRankInput(e.target.value)}
+                    placeholder="#"
+                    className="w-20 px-2.5 py-1.5 text-sm border border-stone-300 rounded-lg font-mono tabular-nums"
+                  />
+                  <button
+                    type="button"
+                    disabled={savingRank || !manualRankInput}
+                    onClick={handleApplyManualMeritRank}
+                    className="px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white rounded-lg cursor-pointer whitespace-nowrap"
+                  >
+                    {savingRank
+                      ? t(lang, 'loading')
+                      : lang === 'bn'
+                      ? 'মেধাক্রম নির্ধারণ ও শিফট'
+                      : 'Set & Shift Rank'}
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-        </form>
+        </div>
       )}
 
       {/* TAB 4: Attendance Log */}

@@ -24,11 +24,15 @@ import {
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
+  applyManualMeritShift,
   calculateSubjectGrade,
-  computeFinalExamMeritMap,
+  computeClassMeritDetails,
   computeStudentTermSummary,
   getClassSubjectsForMarksheet,
+  getExamAbsentKey,
+  getOfficialExamLabel,
   getTermSubjectScore,
+  MANUAL_MERIT_KEY,
   matchesClassScope,
   normalizeExamConfigs,
   TERM_ORDER,
@@ -47,11 +51,14 @@ interface MarkEntryRowProps {
   localIdx: number;
   cont: string;
   sum: string;
+  isAbsent: boolean;
+  absentLabel: string;
   isDirty: boolean;
   otherSum: number;
   otherCount: number;
   fullMarks: number;
   onCellChange: (studentId: string, field: 'cont' | 'sum', value: string) => void;
+  onToggleAbsent: (studentId: string) => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>, localIdx: number, col: 'cont' | 'sum') => void;
   registerInputRef: (key: string, el: HTMLInputElement | null) => void;
 }
@@ -62,27 +69,38 @@ const MarkEntryRow = memo<MarkEntryRowProps>(
     localIdx,
     cont,
     sum,
+    isAbsent,
+    absentLabel,
     isDirty,
     otherSum,
     otherCount,
     fullMarks,
     onCellChange,
+    onToggleAbsent,
     onKeyDown,
     registerInputRef,
   }) => {
-    const contNum = cont !== '' ? Number(cont) : null;
-    const sumNum = sum !== '' ? Number(sum) : null;
-    const hasCurrent = contNum !== null || sumNum !== null;
+    const contNum = !isAbsent && cont !== '' ? Number(cont) : null;
+    const sumNum = !isAbsent && sum !== '' ? Number(sum) : null;
+    const hasCurrent = !isAbsent && (contNum !== null || sumNum !== null);
     const currentTotal = hasCurrent ? (contNum ?? 0) + (sumNum ?? 0) : null;
 
     const totalSum = otherSum + (currentTotal !== null ? currentTotal : 0);
     const totalCount = otherCount + (currentTotal !== null ? 1 : 0);
-    const avg3Term = totalCount > 0 ? Number((totalSum / totalCount).toFixed(1)) : null;
+    const avgCombined = totalCount > 0 ? Number((totalSum / totalCount).toFixed(1)) : null;
     const grade = currentTotal !== null ? calculateSubjectGrade(currentTotal, fullMarks) : null;
     const exceedsMax = currentTotal !== null && currentTotal > fullMarks;
 
     return (
-      <tr className={isDirty ? 'bg-amber-50/50' : 'hover:bg-stone-50/60'}>
+      <tr
+        className={
+          isAbsent
+            ? 'bg-amber-50/40'
+            : isDirty
+            ? 'bg-emerald-50/40'
+            : 'hover:bg-stone-50/60'
+        }
+      >
         <td className="py-2 px-4 font-mono tabular-nums font-semibold text-slate-900">
           {student.rollNumber}
         </td>
@@ -94,16 +112,30 @@ const MarkEntryRow = memo<MarkEntryRowProps>(
             <div className="text-xs text-slate-500">{student.studentNameEn}</div>
           )}
         </td>
+        <td className="py-1.5 px-3 text-center">
+          <button
+            type="button"
+            onClick={() => onToggleAbsent(student.id)}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md border transition-colors cursor-pointer ${
+              isAbsent
+                ? 'bg-amber-100 border-amber-300 text-amber-900'
+                : 'bg-white border-stone-300 text-slate-500 hover:text-slate-800 hover:bg-stone-50'
+            }`}
+          >
+            {isAbsent ? absentLabel : '—'}
+          </button>
+        </td>
         <td className="py-1.5 px-3">
           <input
             ref={(el) => registerInputRef(`${student.id}_cont`, el)}
             type="text"
             inputMode="decimal"
-            value={cont}
+            disabled={isAbsent}
+            value={isAbsent ? '' : cont}
             onChange={(e) => onCellChange(student.id, 'cont', e.target.value)}
             onKeyDown={(e) => onKeyDown(e, localIdx, 'cont')}
-            placeholder="0"
-            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
+            placeholder={isAbsent ? 'AB' : '0'}
+            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600 disabled:bg-stone-100 disabled:text-amber-700"
           />
         </td>
         <td className="py-1.5 px-3">
@@ -111,25 +143,28 @@ const MarkEntryRow = memo<MarkEntryRowProps>(
             ref={(el) => registerInputRef(`${student.id}_sum`, el)}
             type="text"
             inputMode="decimal"
-            value={sum}
+            disabled={isAbsent}
+            value={isAbsent ? '' : sum}
             onChange={(e) => onCellChange(student.id, 'sum', e.target.value)}
             onKeyDown={(e) => onKeyDown(e, localIdx, 'sum')}
-            placeholder="0"
-            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600"
+            placeholder={isAbsent ? 'AB' : '0'}
+            className="w-full px-2.5 py-1.5 text-center font-mono tabular-nums text-sm bg-white border border-stone-300 rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600 disabled:bg-stone-100 disabled:text-amber-700"
           />
         </td>
         <td
           className={`py-2 px-4 text-right font-mono tabular-nums font-semibold ${
-            exceedsMax ? 'text-rose-600' : 'text-slate-900'
+            isAbsent ? 'text-amber-700' : exceedsMax ? 'text-rose-600' : 'text-slate-900'
           }`}
         >
-          {currentTotal !== null ? currentTotal : '—'}
+          {isAbsent ? absentLabel : currentTotal !== null ? currentTotal : '—'}
         </td>
         <td className="py-2 px-4 text-right font-mono tabular-nums text-slate-700">
-          {avg3Term !== null ? avg3Term : '—'}
+          {avgCombined !== null ? avgCombined : '—'}
         </td>
         <td className="py-2 px-4 text-center font-mono font-semibold">
-          {grade ? (
+          {isAbsent ? (
+            <span className="text-xs font-semibold text-amber-700">{absentLabel}</span>
+          ) : grade ? (
             <span className={grade.passed ? 'text-emerald-700' : 'text-rose-600'}>
               {grade.grade}
             </span>
@@ -212,9 +247,9 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     [classSubjects, selectedSubjectId]
   );
 
-  const [marksDrafts, setMarksDrafts] = useState<Record<string, { cont: string; sum: string }>>(
-    {}
-  );
+  const [marksDrafts, setMarksDrafts] = useState<
+    Record<string, { cont: string; sum: string; absent: boolean }>
+  >({});
   const [dirtyMarkIds, setDirtyMarkIds] = useState<Set<string>>(new Set());
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
@@ -224,12 +259,13 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
       setDirtyMarkIds(new Set());
       return;
     }
-    const nextDrafts: Record<string, { cont: string; sum: string }> = {};
+    const nextDrafts: Record<string, { cont: string; sum: string; absent: boolean }> = {};
     for (const st of classStudents) {
       const score = getTermSubjectScore(st.examResults, selectedTerm, selectedSubjectId);
       nextDrafts[st.id] = {
-        cont: score.cont !== null ? String(score.cont) : '',
-        sum: score.sum !== null ? String(score.sum) : '',
+        cont: score.isAbsent ? '' : score.cont !== null ? String(score.cont) : '',
+        sum: score.isAbsent ? '' : score.sum !== null ? String(score.sum) : '',
+        absent: score.isAbsent,
       };
     }
     setMarksDrafts(nextDrafts);
@@ -248,6 +284,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         [studentId]: {
           cont: field === 'cont' ? value : prev[studentId]?.cont ?? '',
           sum: field === 'sum' ? value : prev[studentId]?.sum ?? '',
+          absent: false,
         },
       }));
       setDirtyMarkIds((prev) => {
@@ -258,6 +295,26 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     },
     []
   );
+
+  const handleToggleAbsent = useCallback((studentId: string) => {
+    setMarksDrafts((prev) => {
+      const cur = prev[studentId] || { cont: '', sum: '', absent: false };
+      const nextAbsent = !cur.absent;
+      return {
+        ...prev,
+        [studentId]: {
+          cont: nextAbsent ? '' : cur.cont,
+          sum: nextAbsent ? '' : cur.sum,
+          absent: nextAbsent,
+        },
+      };
+    });
+    setDirtyMarkIds((prev) => {
+      const next = new Set(prev);
+      next.add(studentId);
+      return next;
+    });
+  }, []);
 
   const handleMarkKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>, rowIdx: number, col: 'cont' | 'sum') => {
@@ -325,37 +382,47 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
 
       for (const st of classStudents) {
         if (!dirtyMarkIds.has(st.id)) continue;
-        const d = marksDrafts[st.id] || { cont: '', sum: '' };
+        const d = marksDrafts[st.id] || { cont: '', sum: '', absent: false };
         const contKey = `${selectedTerm}__${selectedSubjectId}__cont`;
         const sumKey = `${selectedTerm}__${selectedSubjectId}__sum`;
         const totalKey = `${selectedTerm}__${selectedSubjectId}`;
+        const absentKey = getExamAbsentKey(selectedTerm, selectedSubjectId);
 
         const nextResults: Record<string, number | string> = { ...(st.examResults || {}) };
-        const contVal = d.cont !== '' ? Number(d.cont) : null;
-        const sumVal = d.sum !== '' ? Number(d.sum) : null;
 
-        if (contVal !== null && !Number.isNaN(contVal)) {
-          nextResults[contKey] = String(contVal).trim();
-        } else {
+        if (d.absent) {
+          nextResults[absentKey] = '1';
           delete nextResults[contKey];
-        }
-
-        if (sumVal !== null && !Number.isNaN(sumVal)) {
-          nextResults[sumKey] = String(sumVal).trim();
-        } else {
           delete nextResults[sumKey];
-        }
-
-        if (
-          (contVal !== null && !Number.isNaN(contVal)) ||
-          (sumVal !== null && !Number.isNaN(sumVal))
-        ) {
-          nextResults[totalKey] = String(
-            (contVal !== null && !Number.isNaN(contVal) ? contVal : 0) +
-              (sumVal !== null && !Number.isNaN(sumVal) ? sumVal : 0)
-          ).trim();
-        } else {
           delete nextResults[totalKey];
+        } else {
+          delete nextResults[absentKey];
+          const contVal = d.cont !== '' ? Number(d.cont) : null;
+          const sumVal = d.sum !== '' ? Number(d.sum) : null;
+
+          if (contVal !== null && !Number.isNaN(contVal)) {
+            nextResults[contKey] = String(contVal).trim();
+          } else {
+            delete nextResults[contKey];
+          }
+
+          if (sumVal !== null && !Number.isNaN(sumVal)) {
+            nextResults[sumKey] = String(sumVal).trim();
+          } else {
+            delete nextResults[sumKey];
+          }
+
+          if (
+            (contVal !== null && !Number.isNaN(contVal)) ||
+            (sumVal !== null && !Number.isNaN(sumVal))
+          ) {
+            nextResults[totalKey] = String(
+              (contVal !== null && !Number.isNaN(contVal) ? contVal : 0) +
+                (sumVal !== null && !Number.isNaN(sumVal) ? sumVal : 0)
+            ).trim();
+          } else {
+            delete nextResults[totalKey];
+          }
         }
 
         const sanitized = sanitizeStringRecordMap(nextResults);
@@ -366,6 +433,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         }
 
         const patchStrings: Record<string, string> = {};
+        patchStrings[`examResults.${absentKey}`] = sanitized[absentKey] ?? '';
         patchStrings[`examResults.${contKey}`] = sanitized[contKey] ?? '';
         patchStrings[`examResults.${sumKey}`] = sanitized[sumKey] ?? '';
         patchStrings[`examResults.${totalKey}`] = sanitized[totalKey] ?? '';
@@ -858,17 +926,28 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
   };
 
   // =========================================================================
-  // MODE 5: CLASS RESULTS & MERIT LIST
+  // MODE 5: CLASS RESULTS & MERIT LIST (0-F Priority + Inline Auto-Shifting Manual Rank)
   // =========================================================================
   const allClassSubjects = useMemo(
     () => getClassSubjectsForMarksheet(examConfigs, selectedClass),
     [examConfigs, selectedClass]
   );
 
-  const meritMap = useMemo(
-    () => computeFinalExamMeritMap(classStudents, allClassSubjects),
+  const meritDetailsMap = useMemo(
+    () => computeClassMeritDetails(classStudents, allClassSubjects),
     [classStudents, allClassSubjects]
   );
+
+  const [manualRankDrafts, setManualRankDrafts] = useState<Record<string, string>>({});
+  const [savingRankId, setSavingRankId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const next: Record<string, string> = {};
+    for (const [id, detail] of meritDetailsMap.entries()) {
+      next[id] = String(detail.rank);
+    }
+    setManualRankDrafts(next);
+  }, [meritDetailsMap]);
 
   const meritSortedRows = useMemo(() => {
     return classStudents
@@ -876,16 +955,21 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
         const t1 = computeStudentTermSummary(st, allClassSubjects, 'exam_1');
         const t2 = computeStudentTermSummary(st, allClassSubjects, 'exam_2');
         const t3 = computeStudentTermSummary(st, allClassSubjects, 'exam_3');
-        const merit = meritMap.get(st.id) || null;
-        return { st, t1, t2, t3, merit };
+        const detail = meritDetailsMap.get(st.id) || null;
+        return { st, t1, t2, t3, detail };
       })
       .sort((a, b) => {
-        if (a.merit && b.merit) return a.merit - b.merit;
-        if (a.merit) return -1;
-        if (b.merit) return 1;
+        if (a.detail && b.detail) return a.detail.rank - b.detail.rank;
+        if (a.detail) return -1;
+        if (b.detail) return 1;
         return (Number(a.st.rollNumber) || 9999) - (Number(b.st.rollNumber) || 9999);
       });
-  }, [classStudents, allClassSubjects, meritMap]);
+  }, [classStudents, allClassSubjects, meritDetailsMap]);
+
+  const hasAnyManualPin = useMemo(
+    () => Array.from(meritDetailsMap.values()).some((d) => d.manualPos !== null),
+    [meritDetailsMap]
+  );
 
   const pagedMeritRows = useMemo(() => {
     const start = (page - 1) * DEFAULT_PAGE_SIZE;
@@ -896,20 +980,204 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     setPage(1);
   }, [selectedAcademicYear, selectedClass, batchMode, selectedTerm, selectedSubjectId, subjFieldId]);
 
+  const handleApplyManualRank = async (studentId: string) => {
+    if (!session) return;
+    const desiredPos = Math.trunc(Number(manualRankDrafts[studentId]));
+    if (!Number.isFinite(desiredPos) || desiredPos < 1) {
+      setBanner({
+        type: 'error',
+        text: lang === 'bn' ? 'সঠিক মেধাক্রম সংখ্যা (১ বা তার বেশি) দিন।' : 'Enter a valid merit rank (1 or higher).',
+      });
+      return;
+    }
+
+    const instances = getFirebaseInstances();
+    if (!instances) return;
+
+    setSavingRankId(studentId);
+    setSyncing(true);
+    setBanner(null);
+
+    try {
+      const shifted = applyManualMeritShift(
+        classStudents,
+        allClassSubjects,
+        studentId,
+        desiredPos
+      );
+      if (shifted.length === 0) return;
+
+      const updates = shifted.map(({ student: st, newRank }) => {
+        const nextResults: Record<string, string | number> = {
+          ...(st.examResults || {}),
+          [MANUAL_MERIT_KEY]: String(newRank),
+        };
+        const sanitized = sanitizeStringRecordMap(nextResults);
+        return {
+          studentId: st.id,
+          examResults: sanitized,
+          patch: { [`examResults.${MANUAL_MERIT_KEY}`]: String(newRank) },
+        };
+      });
+
+      if (isAdmin) {
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  examResults: u.examResults,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
+        );
+        setBanner({
+          type: 'success',
+          text:
+            lang === 'bn'
+              ? 'মেধাক্রম সংরক্ষিত হয়েছে এবং অন্যান্য শিক্ষার্থীর অবস্থান স্বয়ংক্রিয়ভাবে সমন্বয় হয়েছে।'
+              : 'Merit rank updated and classmates automatically shifted without duplicates.',
+        });
+      } else {
+        const chunks = buildChunkedExamPatchPayloads(
+          updates.map((u) => ({ studentId: u.studentId, patch: u.patch }))
+        );
+        for (const chunk of chunks) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `merit_shift_${selectedAcademicYear}_${selectedClass}_${Date.now()}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Merit Rank Adjustment (${selectedClass})`,
+            detailsText: `${chunk.studentCount} students shifted cleanly`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
+        setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+      }
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingRankId(null);
+      setSyncing(false);
+    }
+  };
+
+  const handleResetAutoRanks = async () => {
+    if (!session || !hasAnyManualPin) return;
+    const instances = getFirebaseInstances();
+    if (!instances) return;
+
+    setSaving(true);
+    setSyncing(true);
+    setBanner(null);
+
+    try {
+      const pinnedStudents = classStudents.filter(
+        (st) => st.examResults && st.examResults[MANUAL_MERIT_KEY] !== undefined
+      );
+      const updates = pinnedStudents.map((st) => {
+        const nextResults: Record<string, string | number> = { ...(st.examResults || {}) };
+        delete nextResults[MANUAL_MERIT_KEY];
+        return {
+          studentId: st.id,
+          examResults: sanitizeStringRecordMap(nextResults),
+          patch: { [`examResults.${MANUAL_MERIT_KEY}`]: '' },
+        };
+      });
+
+      if (isAdmin) {
+        await withWriteTimeout(
+          commitBatchesInChunks(
+            instances.db,
+            updates,
+            (batch, u) => {
+              batch.update(
+                doc(instances.db, 'schools', session.schoolId, 'students', u.studentId),
+                {
+                  examResults: u.examResults,
+                  lastUpdatedByName: clampText(session.name, 100),
+                  updatedAt: serverTimestamp(),
+                }
+              );
+            },
+            200
+          )
+        );
+        setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+      } else {
+        const chunks = buildChunkedExamPatchPayloads(
+          updates.map((u) => ({ studentId: u.studentId, patch: u.patch }))
+        );
+        for (const chunk of chunks) {
+          const pendingDoc = buildPendingChangePayload({
+            schoolId: session.schoolId,
+            entityType: 'STUDENT_BATCH_UPDATE',
+            targetId: `merit_reset_${selectedAcademicYear}_${selectedClass}_${Date.now()}`,
+            submittedByDeviceId: session.deviceId,
+            submittedByName: session.name,
+            summary: `Reset Auto Merit Ranks (${selectedClass})`,
+            detailsText: `${chunk.studentCount} students cleared`,
+            payloadJson: chunk.payloadJson,
+            status: 'PENDING',
+          });
+          await withWriteTimeout(
+            addDoc(
+              collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
+              pendingDoc
+            )
+          );
+        }
+        setBanner({ type: 'success', text: t(lang, 'submittedApprovalSuccess') });
+      }
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSaving(false);
+      setSyncing(false);
+    }
+  };
+
   const exportMeritExcel = async () => {
     const XLSX = await import('xlsx');
     const rows = meritSortedRows.map((r) => ({
-      MeritRank: r.merit ?? '',
+      MeritRank: r.detail?.rank ?? '',
       Roll: r.st.rollNumber,
       NameBn: r.st.studentNameBn || '',
       NameEn: r.st.studentNameEn || '',
-      Term1Total: r.t1.scoredSubjects > 0 ? r.t1.totalObtained : '',
-      Term2Total: r.t2.scoredSubjects > 0 ? r.t2.totalObtained : '',
-      FinalTotal: r.t3.scoredSubjects > 0 ? r.t3.totalObtained : '',
-      FinalFullMarks: r.t3.scoredSubjects > 0 ? r.t3.totalFullMarks : '',
+      FCount: r.detail ? r.detail.fCount : '',
+      CombinedPct: r.detail && r.detail.scoredCount > 0 ? `${r.detail.percentage.toFixed(1)}%` : '',
+      Term1Total: r.t1.scoredSubjects > 0 ? r.t1.totalObtained : r.t1.absentSubjects > 0 ? 'Absent' : '',
+      Term2Total: r.t2.scoredSubjects > 0 ? r.t2.totalObtained : r.t2.absentSubjects > 0 ? 'Absent' : '',
+      FinalTotal: r.t3.scoredSubjects > 0 ? r.t3.totalObtained : r.t3.absentSubjects > 0 ? 'Absent' : '',
       FinalGPA: r.t3.scoredSubjects > 0 ? r.t3.gpa.toFixed(2) : '',
       FinalGrade: r.t3.grade,
-      Status: r.t3.scoredSubjects === 0 ? 'Not Scored' : r.t3.passed ? 'Passed' : 'Failed',
+      Status: !r.detail || r.detail.scoredCount === 0
+        ? 'Not Scored'
+        : r.detail.fCount === 0
+        ? 'Passed'
+        : `${r.detail.fCount} F`,
     }));
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
@@ -976,14 +1244,9 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                 <label className="block text-xs font-medium text-slate-600 mb-1">
                   {t(lang, 'selectTerm')}
                 </label>
-                <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg">
+                <div className="flex flex-wrap items-center gap-1 p-1 bg-stone-100 rounded-lg">
                   {TERM_ORDER.map((termId) => {
-                    const label =
-                      termId === 'exam_1'
-                        ? t(lang, 'term1')
-                        : termId === 'exam_2'
-                        ? t(lang, 'term2')
-                        : t(lang, 'term3');
+                    const label = getOfficialExamLabel(termId, lang);
                     return (
                       <button
                         key={termId}
@@ -1066,6 +1329,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                         <th className="py-3 px-4">
                           {lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}
                         </th>
+                        <th className="py-3 px-3 text-center w-24">{t(lang, 'absentLabel')}</th>
                         <th className="py-3 px-3 text-center w-32">{t(lang, 'contShort')}</th>
                         <th className="py-3 px-3 text-center w-32">{t(lang, 'sumShort')}</th>
                         <th className="py-3 px-4 text-right w-28">
@@ -1077,7 +1341,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                     </thead>
                     <tbody className="divide-y divide-stone-100">
                       {pagedClassStudents.map((st, localIdx) => {
-                        const d = marksDrafts[st.id] || { cont: '', sum: '' };
+                        const d = marksDrafts[st.id] || { cont: '', sum: '', absent: false };
                         const other = otherTermsSumMap.get(st.id) || { sum: 0, count: 0 };
                         return (
                           <MarkEntryRow
@@ -1086,11 +1350,14 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                             localIdx={localIdx}
                             cont={d.cont}
                             sum={d.sum}
+                            isAbsent={d.absent}
+                            absentLabel={t(lang, 'absentLabel')}
                             isDirty={dirtyMarkIds.has(st.id)}
                             otherSum={other.sum}
                             otherCount={other.count}
                             fullMarks={activeSubject?.fullMarks || 100}
                             onCellChange={handleMarkCellChange}
+                            onToggleAbsent={handleToggleAbsent}
                             onKeyDown={handleMarkKeyDown}
                             registerInputRef={registerInputRef}
                           />
@@ -1268,7 +1535,6 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                         <th className="py-3 px-3 w-24">{t(lang, 'rollNumber')}</th>
                         <th className="py-3 px-3 w-28">{t(lang, 'nextYearRollNumber')}</th>
                         <th className="py-3 px-3 w-36">{t(lang, 'classSelector')}</th>
-                        <th className="py-3 px-3 w-28">{t(lang, 'section')}</th>
                         <th className="py-3 px-3 w-40">{t(lang, 'promotionStatus')}</th>
                       </tr>
                     </thead>
@@ -1278,7 +1544,7 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                           rollNumber: '',
                           nextYearRollNumber: '',
                           classLevel: selectedClass,
-                          section: '',
+                          section: st.section || '',
                           promotionStatus: '',
                         };
                         return (
@@ -1325,16 +1591,6 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                                   </option>
                                 ))}
                               </select>
-                            </td>
-                            <td className="py-1.5 px-3">
-                              <input
-                                type="text"
-                                value={d.section}
-                                onChange={(e) =>
-                                  handleRollFieldChange(st.id, 'section', e.target.value)
-                                }
-                                className="w-full px-2.5 py-1.5 border border-stone-300 rounded-md"
-                              />
                             </td>
                             <td className="py-1.5 px-3">
                               <select
@@ -1498,19 +1754,31 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
               </h3>
               <p className="text-xs text-slate-500">
                 {lang === 'bn'
-                  ? 'বার্ষিক পরীক্ষায় (Final Exam) উত্তীর্ণ শিক্ষার্থীদের মোট নম্বরের ভিত্তিতে মেধাক্রম নির্ধারিত হয়েছে।'
-                  : 'Merit Rank computed strictly for Final Exam (exam_3) passers sorted by total marks and GPA.'}
+                  ? '০ F গ্রেডধারীদের সর্বাগ্রে রেখে (অনুপস্থিত বিষয় F হিসেবে গণ্য নয়) মোট শতকরা নম্বরের ভিত্তিতে মেধাক্রম নির্ধারিত; প্রয়োজনে সরাসরি অবস্থান পরিবর্তন করলে অন্যদের মেধাক্রম স্বয়ংক্রিয়ভাবে সরে যাবে।'
+                  : 'Ranked with 0-F priority first (Absent excluded from F), then combined % across attended exams. Changing any rank auto-shifts classmates with zero duplicates.'}
               </p>
             </div>
-            <button
-              type="button"
-              disabled={classStudents.length === 0}
-              onClick={exportMeritExcel}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer whitespace-nowrap"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>{t(lang, 'exportExcel')}</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              {hasAnyManualPin && (
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={handleResetAutoRanks}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg cursor-pointer whitespace-nowrap"
+                >
+                  <span>{lang === 'bn' ? 'অটো র‍্যাংক রিসেট' : 'Reset Auto Ranks'}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={classStudents.length === 0}
+                onClick={exportMeritExcel}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer whitespace-nowrap"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{t(lang, 'exportExcel')}</span>
+              </button>
+            </div>
           </div>
 
           <div className="bg-white border border-stone-200 rounded-xl overflow-hidden">
@@ -1524,55 +1792,119 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
                   <table className="w-full text-sm text-left">
                     <thead>
                       <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
-                        <th className="py-3 px-4 w-24">{t(lang, 'meritPosition')}</th>
-                        <th className="py-3 px-4 w-20">{t(lang, 'rollNumber')}</th>
+                        <th className="py-3 px-4 w-28">{t(lang, 'meritPosition')}</th>
+                        <th className="py-3 px-3 w-36">
+                          {lang === 'bn' ? 'র‍্যাংক পরিবর্তন' : 'Shift Rank'}
+                        </th>
+                        <th className="py-3 px-3 w-16">{t(lang, 'rollNumber')}</th>
                         <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
-                        <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
-                        <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
-                        <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
-                        <th className="py-3 px-4 text-right">GPA / Grade</th>
-                        <th className="py-3 px-4 text-center">Status</th>
-                        <th className="py-3 px-4 text-right"></th>
+                        <th className="py-3 px-3 text-right">{getOfficialExamLabel('exam_1', lang)}</th>
+                        <th className="py-3 px-3 text-right">{getOfficialExamLabel('exam_2', lang)}</th>
+                        <th className="py-3 px-3 text-right">{getOfficialExamLabel('exam_3', lang)}</th>
+                        <th className="py-3 px-3 text-right">{t(lang, 'percentageLabel')}</th>
+                        <th className="py-3 px-3 text-center">F</th>
+                        <th className="py-3 px-3 text-right"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-stone-100">
-                      {pagedMeritRows.map(({ st, t1, t2, t3, merit }) => (
+                      {pagedMeritRows.map(({ st, t1, t2, t3, detail }) => (
                         <tr
                           key={st.id}
                           onClick={() => onOpenStudentProfile?.(st.id)}
                           className="hover:bg-stone-50 cursor-pointer"
                         >
-                          <td className="py-2.5 px-4 font-mono tabular-nums font-bold text-emerald-800">
-                            {merit ? `#${merit}` : '—'}
+                          <td className="py-2.5 px-4 font-mono tabular-nums font-bold text-emerald-800 whitespace-nowrap">
+                            {detail ? (
+                              <span>
+                                #{detail.rank}
+                                {detail.manualPos !== null && (
+                                  <span className="ml-1.5 text-[10px] font-sans font-semibold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                                    Pin
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              '—'
+                            )}
                           </td>
-                          <td className="py-2.5 px-4 font-mono tabular-nums font-semibold text-slate-900">
+                          <td
+                            className="py-1.5 px-3"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {detail ? (
+                              <div className="inline-flex items-center gap-1">
+                                <input
+                                  type="number"
+                                  min={1}
+                                  max={meritDetailsMap.size || 999}
+                                  value={manualRankDrafts[st.id] ?? String(detail.rank)}
+                                  onChange={(e) =>
+                                    setManualRankDrafts((p) => ({
+                                      ...p,
+                                      [st.id]: e.target.value,
+                                    }))
+                                  }
+                                  className="w-14 px-2 py-1 text-xs font-mono tabular-nums border border-stone-300 rounded"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={savingRankId === st.id}
+                                  onClick={() => handleApplyManualRank(st.id)}
+                                  className="px-2 py-1 text-[11px] font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 rounded cursor-pointer disabled:opacity-50"
+                                >
+                                  {savingRankId === st.id ? '...' : lang === 'bn' ? 'সেট' : 'Set'}
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-xs text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono tabular-nums font-semibold text-slate-900">
                             {st.rollNumber}
                           </td>
                           <td className="py-2.5 px-4 font-medium text-slate-900">
                             {st.studentNameBn || st.studentNameEn}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700">
+                            {t1.scoredSubjects > 0
+                              ? t1.totalObtained
+                              : t1.absentSubjects > 0
+                              ? t(lang, 'absentLabel')
+                              : '—'}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700">
+                            {t2.scoredSubjects > 0
+                              ? t2.totalObtained
+                              : t2.absentSubjects > 0
+                              ? t(lang, 'absentLabel')
+                              : '—'}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
-                            {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-900">
+                            {t3.scoredSubjects > 0
+                              ? t3.totalObtained
+                              : t3.absentSubjects > 0
+                              ? t(lang, 'absentLabel')
+                              : '—'}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                            {t3.scoredSubjects > 0 ? `${t3.gpa.toFixed(2)} (${t3.grade})` : '—'}
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-800">
+                            {detail && detail.scoredCount > 0
+                              ? `${detail.percentage.toFixed(1)}%`
+                              : '—'}
                           </td>
-                          <td className="py-2.5 px-4 text-center text-xs font-semibold">
-                            {t3.scoredSubjects === 0 ? (
-                              <span className="text-slate-400">—</span>
-                            ) : t3.passed ? (
-                              <span className="text-emerald-700">{t(lang, 'passedLabel')}</span>
+                          <td className="py-2.5 px-3 text-center font-mono tabular-nums text-xs font-semibold">
+                            {detail && detail.scoredCount > 0 ? (
+                              <span
+                                className={
+                                  detail.fCount === 0 ? 'text-emerald-700' : 'text-rose-600'
+                                }
+                              >
+                                {detail.fCount}
+                              </span>
                             ) : (
-                              <span className="text-rose-600">{t(lang, 'failedLabel')}</span>
+                              '—'
                             )}
                           </td>
-                          <td className="py-2.5 px-4 text-right text-emerald-700">
+                          <td className="py-2.5 px-3 text-right text-emerald-700">
                             <ExternalLink className="w-4 h-4 inline" />
                           </td>
                         </tr>

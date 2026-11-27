@@ -31,6 +31,9 @@ const BatchFieldsView = lazy(() =>
 const MarksheetView = lazy(() =>
   import('./components/MarksheetView').then((m) => ({ default: m.MarksheetView }))
 );
+const AnalyticsView = lazy(() =>
+  import('./components/AnalyticsView').then((m) => ({ default: m.AnalyticsView }))
+);
 const CommsView = lazy(() =>
   import('./components/CommsView').then((m) => ({ default: m.CommsView }))
 );
@@ -55,9 +58,10 @@ const MainAppShell: React.FC = () => {
   // Activate lazy Firestore listeners only when their corresponding tab opens
   useEffect(() => {
     if (!session) return;
-    if (activeTab === 'attendance' || activeTab === 'marksheet') {
+    if (activeTab === 'attendance' || activeTab === 'marksheet' || activeTab === 'comms') {
       activateModule('attendance');
-    } else if (activeTab === 'comms') {
+    }
+    if (activeTab === 'comms') {
       activateModule('comms');
     } else if (activeTab === 'admin' && session.role === 'ADMIN') {
       activateModule('pending');
@@ -90,13 +94,17 @@ const MainAppShell: React.FC = () => {
     setActiveTab('students');
   };
 
-  const handleOpenApkCleanup = () => {
-    setAdminInitialTab('update');
+  const handleOpenAdminSubTab = (sub: 'teachers' | 'approvals' | 'setup' | 'update') => {
+    setAdminInitialTab(sub);
     setActiveTab('admin');
   };
 
   return (
-    <WorkspaceLayout activeTab={activeTab} onSelectTab={handleSelectTab}>
+    <WorkspaceLayout
+      activeTab={activeTab}
+      onSelectTab={handleSelectTab}
+      onOpenAdminSubTab={handleOpenAdminSubTab}
+    >
       {dataLoading && (
         <div className="mb-4 px-4 py-2.5 bg-white border border-stone-200 rounded-lg text-xs text-slate-600 no-print">
           Syncing school records...
@@ -107,7 +115,7 @@ const MainAppShell: React.FC = () => {
           <DashboardView
             onNavigate={handleSelectTab}
             onOpenStudentProfile={handleOpenStudentProfile}
-            onOpenApkCleanup={handleOpenApkCleanup}
+            onOpenApkCleanup={() => handleOpenAdminSubTab('update')}
           />
         )}
         {activeTab === 'students' && (
@@ -123,6 +131,9 @@ const MainAppShell: React.FC = () => {
         {activeTab === 'promotion' && <PromotionManagerView />}
         {activeTab === 'batch-fields' && <BatchFieldsView />}
         {activeTab === 'marksheet' && <MarksheetView />}
+        {activeTab === 'analytics' && (
+          <AnalyticsView onOpenStudentProfile={handleOpenStudentProfile} />
+        )}
         {activeTab === 'comms' && <CommsView />}
         {activeTab === 'admin' && session.role === 'ADMIN' && (
           <AdminPanelView initialTab={adminInitialTab} />

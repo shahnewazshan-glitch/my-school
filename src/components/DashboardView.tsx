@@ -1,12 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import {
   ArrowRight,
-  CalendarCheck2,
-  ClipboardList,
-  FileSpreadsheet,
+  ChevronDown,
   Search,
   Trash2,
-  Users,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { hasLegacyApkMetadata } from '../lib/apkChunks';
@@ -16,6 +13,10 @@ import {
   getAttendanceDocId,
   getClassSubjectsForMarksheet,
   getTodayDateKey,
+  matchesStudentSearch,
+  OFFICIAL_EMIS_CODE,
+  OFFICIAL_SCHOOL_NAME_BN,
+  OFFICIAL_SCHOOL_NAME_EN,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 import type { NavTab } from './WorkspaceLayout';
@@ -45,6 +46,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   } = useApp();
 
   const [quickQuery, setQuickQuery] = useState('');
+  const [actionMenuValue, setActionMenuValue] = useState('');
 
   const showLegacyApkCleanupBanner =
     session?.role === 'ADMIN' && hasLegacyApkMetadata(school) && Boolean(onOpenApkCleanup);
@@ -89,17 +91,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   );
 
   const quickSearchResults = useMemo(() => {
-    const q = quickQuery.trim().toLowerCase();
+    const q = quickQuery.trim();
     if (!q) return [];
-    return yearStudents
-      .filter((s) => {
-        const nameEn = (s.studentNameEn || '').toLowerCase();
-        const nameBn = (s.studentNameBn || '').toLowerCase();
-        const roll = String(s.rollNumber || '').toLowerCase();
-        const phone = (s.guardianPhone || '').toLowerCase();
-        return nameEn.includes(q) || nameBn.includes(q) || roll.includes(q) || phone.includes(q);
-      })
-      .slice(0, 8);
+    return yearStudents.filter((s) => matchesStudentSearch(s, q)).slice(0, 10);
   }, [quickQuery, yearStudents]);
 
   const classDistribution = useMemo(() => {
@@ -116,29 +110,40 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     });
   }, [yearStudents, attendanceLogs, loadedModules.attendance, selectedAcademicYear, todayKey]);
 
+  const schoolDisplayName =
+    school?.schoolName?.trim() ||
+    (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+  const emisDisplay = school?.emisCode?.trim() || OFFICIAL_EMIS_CODE;
+
+  const handleDropdownNavigate = (tab: string) => {
+    if (!tab) return;
+    setActionMenuValue('');
+    onNavigate(tab as NavTab);
+  };
+
   return (
     <div className="space-y-6">
-      {/* School Identity Banner */}
+      {/* Clean Minimal School Banner with Dropdown Menus */}
       <section className="bg-white border border-stone-200 rounded-xl p-5 sm:p-6">
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>
+          <div className="text-center md:text-left">
             <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
-              {school?.schoolName || session?.schoolId}
+              {schoolDisplayName}
             </h2>
-            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-600">
+            <div className="mt-1.5 flex flex-wrap items-center justify-center md:justify-start gap-x-3 gap-y-1 text-sm text-slate-600">
               <span>
                 {t(lang, 'schoolIdLabel')}:{' '}
-                <span className="font-mono font-medium text-slate-800">{session?.schoolId}</span>
+                <span className="font-mono font-semibold text-emerald-800">
+                  {session?.schoolId}
+                </span>
               </span>
-              {school?.emisCode && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>
-                    {t(lang, 'emisCode')}:{' '}
-                    <span className="font-mono tabular-nums text-slate-800">{school.emisCode}</span>
-                  </span>
-                </>
-              )}
+              <span aria-hidden="true">·</span>
+              <span>
+                {t(lang, 'emisCode')}:{' '}
+                <span className="font-mono tabular-nums font-medium text-slate-800">
+                  {emisDisplay}
+                </span>
+              </span>
               {school?.upazilaDistrict && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -152,21 +157,30 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            <button
-              type="button"
-              onClick={() => onNavigate('attendance')}
-              className="px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              {t(lang, 'navAttendance')}
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigate('batch-marks')}
-              className="px-4 py-2 text-xs font-semibold bg-white hover:bg-stone-50 text-slate-800 border border-stone-300 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              {t(lang, 'navBatchMarks')}
-            </button>
+          {/* Clean Dropdown Menu instead of cluttered buttons */}
+          <div className="flex flex-wrap items-center justify-center md:justify-end gap-2.5">
+            <div className="relative min-w-[200px]">
+              <select
+                aria-label={t(lang, 'quickActions')}
+                value={actionMenuValue}
+                onChange={(e) => handleDropdownNavigate(e.target.value)}
+                className="w-full appearance-none pl-3.5 pr-9 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-600"
+              >
+                <option value="">{t(lang, 'quickActions')} ▾</option>
+                <option value="students">{t(lang, 'navStudents')}</option>
+                <option value="attendance">{t(lang, 'navAttendance')}</option>
+                <option value="batch-marks">{t(lang, 'navBatchMarks')}</option>
+                <option value="marksheet">{t(lang, 'navMarksheet')}</option>
+                <option value="analytics">{t(lang, 'navAnalytics')}</option>
+                <option value="promotion">{t(lang, 'navPromotion')}</option>
+                <option value="batch-fields">{t(lang, 'navBatchFields')}</option>
+                <option value="comms">{t(lang, 'navComms')}</option>
+                {session?.role === 'ADMIN' && (
+                  <option value="admin">{t(lang, 'navAdmin')}</option>
+                )}
+              </select>
+              <ChevronDown className="w-4 h-4 text-emerald-100 pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2" />
+            </div>
           </div>
         </div>
       </section>
@@ -251,7 +265,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               ? t(lang, 'pendingApprovals')
               : t(lang, 'activeSubjects')}
           </div>
-          <div className="mt-2 text-3xl font-bold text-slate-900 tabular-nums">
+          <div className="mt-2 text-3xl font-bold text-amber-700 tabular-nums">
             {session?.role === 'ADMIN'
               ? pendingCount !== null
                 ? pendingCount
@@ -272,13 +286,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-7 bg-white border border-stone-200 rounded-xl p-5 space-y-4">
           <div className="flex items-center justify-between">
-            <h3 className="text-base font-semibold text-slate-900">
+            <h3 className="text-base font-bold text-slate-900">
               {t(lang, 'classBreakdown')} ({selectedAcademicYear})
             </h3>
             <button
               type="button"
               onClick={() => onNavigate('students')}
-              className="text-xs font-medium text-emerald-700 hover:text-emerald-800 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
+              className="text-xs font-semibold text-emerald-700 hover:text-emerald-800 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap"
             >
               <span>{t(lang, 'navStudents')}</span>
               <ArrowRight className="w-3.5 h-3.5" />
@@ -302,7 +316,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       key={row.classLevel}
                       onClick={() => setSelectedClass(row.classLevel)}
                       className={`cursor-pointer transition-colors ${
-                        isSelected ? 'bg-emerald-50/70' : 'hover:bg-stone-50'
+                        isSelected ? 'bg-emerald-50/80' : 'hover:bg-stone-50'
                       }`}
                     >
                       <td className="py-2.5 pr-4 font-medium text-slate-900">
@@ -323,9 +337,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
 
         <div className="lg:col-span-5 space-y-6">
-          {/* Quick Student Search */}
+          {/* Quick Student Search (supports 04/01, 00/01 path search) */}
           <div className="bg-white border border-stone-200 rounded-xl p-5 space-y-3">
-            <h3 className="text-base font-semibold text-slate-900">
+            <h3 className="text-base font-bold text-slate-900">
               {lang === 'bn' ? 'দ্রুত শিক্ষার্থী অনুসন্ধান' : 'Quick Student Lookup'}
             </h3>
             <div className="relative">
@@ -356,7 +370,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                           setSelectedClass(st.classLevel);
                           onOpenStudentProfile(st.id);
                         }}
-                        className="w-full flex items-center justify-between gap-3 p-2.5 text-left hover:bg-stone-50 cursor-pointer"
+                        className="w-full flex items-center justify-between gap-3 p-2.5 text-left hover:bg-emerald-50/40 cursor-pointer"
                       >
                         <div className="flex items-center gap-2.5 min-w-0">
                           {photo ? (
@@ -370,7 +384,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                             />
                           ) : (
                             <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-800 flex items-center justify-center text-xs font-semibold shrink-0">
-                              {(st.studentNameEn || st.studentNameBn || '?').charAt(0).toUpperCase()}
+                              {(st.studentNameEn || st.studentNameBn || '?')
+                                .charAt(0)
+                                .toUpperCase()}
                             </div>
                           )}
                           <div className="min-w-0">
@@ -391,44 +407,47 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             )}
           </div>
 
-          {/* Quick Action Links */}
+          {/* Clean Dropdown Menu for Academic & Analytics Shortcuts */}
           <div className="bg-white border border-stone-200 rounded-xl p-5 space-y-3">
-            <h3 className="text-base font-semibold text-slate-900">
-              {t(lang, 'quickActions')}
+            <h3 className="text-base font-bold text-slate-900">
+              {lang === 'bn' ? 'মডিউল নির্বাচন করুন' : 'Jump to Module'}
             </h3>
-            <div className="grid grid-cols-2 gap-2.5">
-              <button
-                type="button"
-                onClick={() => onNavigate('students')}
-                className="flex items-center gap-2 p-3 text-left text-xs font-medium text-slate-700 bg-stone-50 hover:bg-emerald-50 hover:text-emerald-900 border border-stone-200 rounded-lg transition-colors cursor-pointer"
-              >
-                <Users className="w-4 h-4 text-emerald-700 shrink-0" />
-                <span className="truncate">{t(lang, 'navStudents')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onNavigate('batch-marks')}
-                className="flex items-center gap-2 p-3 text-left text-xs font-medium text-slate-700 bg-stone-50 hover:bg-emerald-50 hover:text-emerald-900 border border-stone-200 rounded-lg transition-colors cursor-pointer"
-              >
-                <ClipboardList className="w-4 h-4 text-emerald-700 shrink-0" />
-                <span className="truncate">{t(lang, 'navBatchMarks')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onNavigate('attendance')}
-                className="flex items-center gap-2 p-3 text-left text-xs font-medium text-slate-700 bg-stone-50 hover:bg-emerald-50 hover:text-emerald-900 border border-stone-200 rounded-lg transition-colors cursor-pointer"
-              >
-                <CalendarCheck2 className="w-4 h-4 text-emerald-700 shrink-0" />
-                <span className="truncate">{t(lang, 'navAttendance')}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => onNavigate('marksheet')}
-                className="flex items-center gap-2 p-3 text-left text-xs font-medium text-slate-700 bg-stone-50 hover:bg-emerald-50 hover:text-emerald-900 border border-stone-200 rounded-lg transition-colors cursor-pointer"
-              >
-                <FileSpreadsheet className="w-4 h-4 text-emerald-700 shrink-0" />
-                <span className="truncate">{t(lang, 'navMarksheet')}</span>
-              </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="relative">
+                <select
+                  aria-label="Academic Modules"
+                  defaultValue=""
+                  onChange={(e) => handleDropdownNavigate(e.target.value)}
+                  className="w-full appearance-none px-3 py-2.5 pr-8 text-xs font-semibold text-slate-800 bg-stone-50 hover:bg-emerald-50 border border-stone-200 rounded-lg cursor-pointer"
+                >
+                  <option value="">
+                    {lang === 'bn' ? 'একাডেমিক ও উপস্থিতি ▾' : 'Academics & Attendance ▾'}
+                  </option>
+                  <option value="students">{t(lang, 'navStudents')}</option>
+                  <option value="attendance">{t(lang, 'navAttendance')}</option>
+                  <option value="batch-marks">{t(lang, 'navBatchMarks')}</option>
+                  <option value="batch-fields">{t(lang, 'navBatchFields')}</option>
+                </select>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-500 pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2" />
+              </div>
+
+              <div className="relative">
+                <select
+                  aria-label="Reports and Promotion"
+                  defaultValue=""
+                  onChange={(e) => handleDropdownNavigate(e.target.value)}
+                  className="w-full appearance-none px-3 py-2.5 pr-8 text-xs font-semibold text-slate-800 bg-stone-50 hover:bg-emerald-50 border border-stone-200 rounded-lg cursor-pointer"
+                >
+                  <option value="">
+                    {lang === 'bn' ? 'ফলাফল, বিশ্লেষণ ও উত্তীর্ণ ▾' : 'Results, Analytics & Rolls ▾'}
+                  </option>
+                  <option value="marksheet">{t(lang, 'navMarksheet')}</option>
+                  <option value="analytics">{t(lang, 'navAnalytics')}</option>
+                  <option value="promotion">{t(lang, 'navPromotion')}</option>
+                  <option value="comms">{t(lang, 'navComms')}</option>
+                </select>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-500 pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2" />
+              </div>
             </div>
           </div>
         </div>

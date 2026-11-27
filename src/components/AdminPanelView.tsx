@@ -3,16 +3,22 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
+  getDocs,
   serverTimestamp,
   setDoc,
   updateDoc,
 } from 'firebase/firestore';
 import {
+  ArrowRightLeft,
   Check,
+  Copy,
   KeyRound,
+  Link2,
   Plus,
   ShieldAlert,
   ShieldCheck,
+  Smartphone,
   Trash2,
   UserX,
   X,
@@ -40,9 +46,18 @@ import { t } from '../lib/i18n';
 import {
   formatTimestampDateTime,
   getAttendanceDocId,
+  getOfficialExamLabel,
+  isSameHostnameUrl,
+  normalizeAppUpdateUrl,
   normalizeBdPhone,
   normalizeExamConfigs,
+  normalizeSchoolId,
+  OFFICIAL_EMIS_CODE,
+  OFFICIAL_SCHOOL_ID,
+  OFFICIAL_SCHOOL_NAME_EN,
+  resolveDirectApkDownloadInfo,
   sha256Hex,
+  verifySelfHostedApkUrl,
 } from '../lib/schoolUtils';
 import type {
   CustomFieldType,
@@ -115,6 +130,26 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [deletedSoFar, setDeletedSoFar] = useState(0);
   const [lastDeletedResult, setLastDeletedResult] = useState<number | null>(null);
 
+  // Android App Update Publisher State
+  const [verCodeInput, setVerCodeInput] = useState(() =>
+    school?.latestAppVersionCode ? String(school.latestAppVersionCode) : '11'
+  );
+  const [verNameInput, setVerNameInput] = useState(
+    () => school?.latestAppVersionName || '2.0'
+  );
+  const [appUrlInput, setAppUrlInput] = useState(() => school?.appUpdateUrl || '');
+  const [appNotesInput, setAppNotesInput] = useState(() => school?.appUpdateNotes || '');
+  const [appUpdatePassword, setAppUpdatePassword] = useState('');
+  const [savingAppUpdate, setSavingAppUpdate] = useState(false);
+  const [copiedGeneratedLink, setCopiedGeneratedLink] = useState(false);
+
+  // Zero-Data-Loss Workspace Migration Tool State
+  const [migSourceId, setMigSourceId] = useState('');
+  const [migTargetId, setMigTargetId] = useState(OFFICIAL_SCHOOL_ID);
+  const [migPassword, setMigPassword] = useState('');
+  const [migrating, setMigrating] = useState(false);
+  const [migReport, setMigReport] = useState<string | null>(null);
+
   useEffect(() => {
     setAdminTab(initialTab);
   }, [initialTab]);
@@ -122,6 +157,18 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   useEffect(() => {
     setExamDrafts(normalizeExamConfigs(school?.examConfigs));
   }, [school?.examConfigs]);
+
+  useEffect(() => {
+    if (school?.latestAppVersionCode) setVerCodeInput(String(school.latestAppVersionCode));
+    if (school?.latestAppVersionName) setVerNameInput(school.latestAppVersionName);
+    if (school?.appUpdateUrl !== undefined) setAppUrlInput(school.appUpdateUrl || '');
+    if (school?.appUpdateNotes !== undefined) setAppNotesInput(school.appUpdateNotes || '');
+  }, [
+    school?.latestAppVersionCode,
+    school?.latestAppVersionName,
+    school?.appUpdateUrl,
+    school?.appUpdateNotes,
+  ]);
 
   if (session?.role !== 'ADMIN') {
     return (
@@ -774,6 +821,331 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     }
   };
 
+  // 5. Publish Android App Update Metadata (Strict 5-field payload on schools/{schoolId})
+  const resolvedAppLink = useMemo(
+    () => resolveDirectApkDownloadInfo(appUrlInput || school?.appUpdateUrl || ''),
+    [appUrlInput, school?.appUpdateUrl]
+  );
+
+  const handleGenerateAndCopyUpdateLink = async () => {
+    const info = resolveDirectApkDownloadInfo(appUrlInput || school?.appUpdateUrl || '');
+    if (!info?.directDownloadUrl) {
+      setBanner({
+        type: 'error',
+        text:
+          lang === 'bn'
+            ? 'সঠিক Google Drive / GitHub / সরাসরি APK লিংক লিখুন।'
+            : 'Enter a valid external APK URL (Google Drive, GitHub Releases, Dropbox, or direct .apk) first.',
+      });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(info.directDownloadUrl);
+      setCopiedGeneratedLink(true);
+      setTimeout(() => setCopiedGeneratedLink(false), 2600);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handlePublishAppUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const instances = getFirebaseInstances();
+    if (!instances || !session) return;
+
+    setBanner(null);
+    const code = Math.trunc(Number(verCodeInput));
+    if (!Number.isFinite(code) || code < 1 || code > 999999) {
+      setBanner({
+        type: 'error',
+        text:
+          lang === 'bn'
+            ? 'ভার্সন কোড ১ থেকে ৯৯৯৯৯৯-এর মধ্যে পূর্ণসংখ্যা হতে হবে।'
+            : 'Version Code must be an integer between 1 and 999999.',
+      });
+      return;
+    }
+
+    const verName = String(verNameInput || '').trim().slice(0, 20);
+    if (!verName) {
+      setBanner({
+        type: 'error',
+        text: lang === 'bn' ? 'ভার্সন নাম লিখুন (যেমন 2.0)।' : 'Version Name is required.',
+      });
+      return;
+    }
+
+    const normalizedUrl = normalizeAppUpdateUrl(appUrlInput).slice(0, 500);
+    if (!normalizedUrl) {
+      setBanner({
+        type: 'error',
+        text:
+          lang === 'bn'
+            ? 'সঠিক https:// বা http:// APK ডাউনলোড লিংক দিন।'
+            : 'Please enter a valid https:// or http:// APK download URL.',
+      });
+      return;
+    }
+
+    if (isSameHostnameUrl(normalizedUrl)) {
+      const validBinary = await verifySelfHostedApkUrl(normalizedUrl);
+      if (!validBinary) {
+        setBanner({
+          type: 'error',
+          text:
+            'This URL points back to the website itself and has no APK file. Upload your .apk to Google Drive ("Anyone with the link") or GitHub Releases and paste that link here.',
+        });
+        return;
+      }
+    }
+
+    if (!appUpdatePassword) {
+      setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+      return;
+    }
+
+    setSavingAppUpdate(true);
+    setSyncing(true);
+    try {
+      const currentAdminRecord = teachers.find(
+        (m) =>
+          normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
+          m.role === 'ADMIN'
+      );
+      if (!currentAdminRecord?.passwordHash) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+        return;
+      }
+      const enteredHash = await sha256Hex(appUpdatePassword);
+      if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+        return;
+      }
+
+      const notes = String(appNotesInput || '').trim().slice(0, 300);
+
+      // STRICT 5-field update payload on schools/{schoolId}
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', session.schoolId), {
+          latestAppVersionCode: code,
+          latestAppVersionName: verName,
+          appUpdateUrl: normalizedUrl,
+          appUpdateNotes: notes,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      setAppUpdatePassword('');
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `অ্যান্ড্রয়েড অ্যাপ আপডেট v${verName} (#${code}) সফলভাবে প্রকাশিত হয়েছে।`
+            : `Published Android App update v${verName} (#${code}).`,
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingAppUpdate(false);
+      setSyncing(false);
+    }
+  };
+
+  // 6. Zero-Data-Loss Workspace Migration Tool (Never overwrites or deletes destination data)
+  const handleMigrateWorkspace = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const instances = getFirebaseInstances();
+    if (!instances || !session) return;
+
+    const srcId = normalizeSchoolId(migSourceId);
+    const dstId = normalizeSchoolId(migTargetId);
+
+    if (!srcId || !dstId) {
+      setBanner({
+        type: 'error',
+        text:
+          lang === 'bn'
+            ? 'সঠিক উৎস এবং গন্তব্য স্কুল আইডি লিখুন।'
+            : 'Please enter valid Source and Target School IDs.',
+      });
+      return;
+    }
+
+    if (srcId === dstId) {
+      setBanner({
+        type: 'error',
+        text:
+          lang === 'bn'
+            ? 'উৎস এবং গন্তব্য স্কুল আইডি আলাদা হতে হবে।'
+            : 'Source and Target School IDs must be different.',
+      });
+      return;
+    }
+
+    if (!migPassword) {
+      setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+      return;
+    }
+
+    setMigrating(true);
+    setSyncing(true);
+    setBanner(null);
+    setMigReport(null);
+
+    try {
+      const currentAdminRecord = teachers.find(
+        (m) =>
+          normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
+          m.role === 'ADMIN'
+      );
+      if (!currentAdminRecord?.passwordHash) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+        return;
+      }
+      const enteredHash = await sha256Hex(migPassword);
+      if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
+        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
+        return;
+      }
+
+      const srcSchoolSnap = await getDoc(doc(instances.db, 'schools', srcId));
+      if (!srcSchoolSnap.exists()) {
+        throw new Error(`Source school "${srcId}" does not exist.`);
+      }
+      const srcSchoolData = srcSchoolSnap.data() as Record<string, unknown>;
+      const dstSchoolRef = doc(instances.db, 'schools', dstId);
+      const dstSchoolSnap = await getDoc(dstSchoolRef);
+      const dstSchoolData = dstSchoolSnap.exists()
+        ? (dstSchoolSnap.data() as Record<string, unknown>)
+        : {};
+
+      // Merge school metadata ONLY for missing fields on target (never overwrite existing target settings)
+      const schoolPatch: Record<string, unknown> = {
+        schoolId: dstId,
+        updatedAt: serverTimestamp(),
+      };
+      if (!dstSchoolData.schoolName) {
+        schoolPatch.schoolName =
+          srcSchoolData.schoolName ||
+          (dstId === OFFICIAL_SCHOOL_ID ? OFFICIAL_SCHOOL_NAME_EN : dstId);
+      }
+      if (!dstSchoolData.emisCode) {
+        schoolPatch.emisCode =
+          srcSchoolData.emisCode ||
+          (dstId === OFFICIAL_SCHOOL_ID ? OFFICIAL_EMIS_CODE : '');
+      }
+      if (!dstSchoolData.upazilaDistrict && srcSchoolData.upazilaDistrict) {
+        schoolPatch.upazilaDistrict = srcSchoolData.upazilaDistrict;
+      }
+      if (!dstSchoolData.defaultAcademicYear && srcSchoolData.defaultAcademicYear) {
+        schoolPatch.defaultAcademicYear = srcSchoolData.defaultAcademicYear;
+      }
+      if (
+        (!Array.isArray(dstSchoolData.examConfigs) || dstSchoolData.examConfigs.length === 0) &&
+        Array.isArray(srcSchoolData.examConfigs)
+      ) {
+        schoolPatch.examConfigs = sanitizeExamConfigs(srcSchoolData.examConfigs);
+      }
+
+      const existingDstTeachers = Array.isArray(dstSchoolData.teachers)
+        ? (dstSchoolData.teachers as TeacherMember[])
+        : [];
+      const srcTeachers = Array.isArray(srcSchoolData.teachers)
+        ? (srcSchoolData.teachers as TeacherMember[])
+        : [];
+      const mergedTeachers = [...existingDstTeachers];
+      for (const stMember of srcTeachers) {
+        const normPhone = normalizeBdPhone(stMember.phoneNumber || '');
+        const already = mergedTeachers.some(
+          (m) =>
+            normalizeBdPhone(m.phoneNumber || '') === normPhone ||
+            (stMember.deviceId && m.deviceId === stMember.deviceId)
+        );
+        if (!already) {
+          mergedTeachers.push(stMember);
+        }
+      }
+      if (mergedTeachers.length > existingDstTeachers.length || !dstSchoolSnap.exists()) {
+        schoolPatch.teachers = mergedTeachers;
+      }
+      if (!dstSchoolSnap.exists()) {
+        schoolPatch.createdAt = serverTimestamp();
+      }
+
+      await withWriteTimeout(setDoc(dstSchoolRef, schoolPatch, { merge: true }));
+
+      // Subcollections to migrate WITHOUT overwriting existing destination doc IDs
+      const subcols = [
+        'students',
+        'subjects',
+        'customFields',
+        'attendanceLogs',
+        'parentNotices',
+        'messages',
+      ] as const;
+
+      const summaryParts: string[] = [];
+
+      for (const subcol of subcols) {
+        const [srcSnap, dstSnap] = await Promise.all([
+          getDocs(collection(instances.db, 'schools', srcId, subcol)),
+          getDocs(collection(instances.db, 'schools', dstId, subcol)),
+        ]);
+
+        const existingDstIds = new Set(dstSnap.docs.map((d) => d.id));
+        const toCopy = srcSnap.docs.filter((d) => !existingDstIds.has(d.id));
+        const skipped = srcSnap.docs.length - toCopy.length;
+
+        if (toCopy.length > 0) {
+          await withWriteTimeout(
+            commitBatchesInChunks(
+              instances.db,
+              toCopy,
+              (batch, srcDoc) => {
+                const raw = srcDoc.data() as Record<string, unknown>;
+                const cloned: Record<string, unknown> = {
+                  ...raw,
+                  schoolId: dstId,
+                  updatedAt: serverTimestamp(),
+                };
+                batch.set(
+                  doc(instances.db, 'schools', dstId, subcol, srcDoc.id),
+                  cloned,
+                  { merge: true }
+                );
+              },
+              200
+            )
+          );
+        }
+
+        summaryParts.push(`${subcol}: +${toCopy.length} copied (${skipped} kept)`);
+      }
+
+      const reportStr = summaryParts.join(' · ');
+      setMigReport(reportStr);
+      setMigPassword('');
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `${srcId} থেকে ${dstId}-এ নিরাপদ মাইগ্রেশন সম্পন্ন হয়েছে (কোনো বিদ্যমান তথ্য মুছে ফেলা হয়নি)।`
+            : `Zero-data-loss migration from ${srcId} to ${dstId} complete.`,
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setMigrating(false);
+      setSyncing(false);
+    }
+  };
+
   const pendingBadgeCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
 
   return (
@@ -1010,8 +1382,8 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               <div>
                 <h3 className="text-base font-semibold text-slate-900">
                   {lang === 'bn'
-                    ? '৩-সাময়িকী পরীক্ষার বিষয় ও নম্বর সেটআপ (examConfigs)'
-                    : '3-Term Exam Subjects Configuration (examConfigs)'}
+                    ? 'প্রান্তিক পরীক্ষা ও বিষয় কনফিগারেশন (examConfigs)'
+                    : 'Term Exams & Subjects Configuration (examConfigs)'}
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
                   {lang === 'bn'
@@ -1030,7 +1402,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-1 p-1 bg-stone-100 rounded-lg">
+              <div className="flex flex-wrap items-center gap-1 p-1 bg-stone-100 rounded-lg">
                 {(['exam_1', 'exam_2', 'exam_3'] as const).map((tid) => (
                   <button
                     key={tid}
@@ -1042,11 +1414,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                         : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
-                    {tid === 'exam_1'
-                      ? t(lang, 'term1')
-                      : tid === 'exam_2'
-                      ? t(lang, 'term2')
-                      : t(lang, 'term3')}
+                    {getOfficialExamLabel(tid, lang)}
                   </button>
                 ))}
               </div>
@@ -1285,112 +1653,357 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         </div>
       )}
 
-      {/* TAB 4: Safe Server APK Cleanup (Deletes ONLY appReleaseChunks & resets 5 APK metadata fields) */}
+      {/* TAB 4: Android App Update Publisher, Safe Workspace Migration & APK Cleanup */}
       {adminTab === 'update' && (
-        <form
-          onSubmit={handleDeleteApkChunks}
-          className="bg-white border border-stone-200 rounded-xl p-6 max-w-2xl space-y-5"
-        >
-          <div className="flex items-start justify-between gap-3 pb-4 border-b border-stone-200">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-lg bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center shrink-0 mt-0.5">
-                <Trash2 className="w-5 h-5" />
+        <div className="space-y-6 max-w-3xl">
+          {/* A. Publish Android App Update Link */}
+          <form
+            onSubmit={handlePublishAppUpdate}
+            className="bg-white border border-stone-200 rounded-xl p-6 space-y-4"
+          >
+            <div className="flex items-start gap-3 pb-3 border-b border-stone-200">
+              <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                <Smartphone className="w-5 h-5" />
               </div>
               <div>
                 <h3 className="text-base font-semibold text-slate-900">
-                  {t(lang, 'deleteApkTitle')}
+                  {lang === 'bn'
+                    ? 'অ্যান্ড্রয়েড অ্যাপ আপডেট প্রকাশ ও লিংক জেনারেটর'
+                    : 'Publish Android App Update & Link Generator'}
                 </h3>
-                <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                  {t(lang, 'deleteApkDesc')}
+                <p className="text-xs text-slate-600 mt-0.5">
+                  {lang === 'bn'
+                    ? 'Google Drive, GitHub Releases বা সরাসরি .apk লিংক দিলে স্বয়ংক্রিয়ভাবে সরাসরি ডাউনলোড লিংক তৈরি হয়।'
+                    : 'Supports Google Drive share links, GitHub Releases, Dropbox, or direct external .apk URLs.'}
                 </p>
               </div>
             </div>
-          </div>
 
-          <div className="p-4 rounded-lg bg-emerald-50/70 border border-emerald-200 flex items-start gap-3 text-xs text-emerald-950">
-            <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <div className="font-semibold">
-                {lang === 'bn'
-                  ? 'নিরাপদ ক্লিনআপ গ্যারান্টি'
-                  : 'Protected Collections (Never Modified or Deleted)'}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Version Code (integer)
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={999999}
+                  required
+                  value={verCodeInput}
+                  onChange={(e) => setVerCodeInput(e.target.value)}
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-stone-300 rounded-lg"
+                />
               </div>
-              <p className="text-emerald-900/90 leading-relaxed">
-                <code>students</code>, <code>subjects</code>, <code>customFields</code>,{' '}
-                <code>attendanceLogs</code>, <code>pendingChanges</code>,{' '}
-                <code>parentNotices</code>, <code>messages</code>, <code>teachers</code>
-              </p>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  Version Name
+                </label>
+                <input
+                  type="text"
+                  maxLength={20}
+                  required
+                  value={verNameInput}
+                  onChange={(e) => setVerNameInput(e.target.value)}
+                  placeholder="2.0"
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
+                />
+              </div>
             </div>
-          </div>
 
-          <div className="p-3.5 rounded-lg bg-stone-50 border border-stone-200 text-xs text-slate-700 space-y-1">
             <div>
-              <span className="font-semibold text-slate-900">
-                {lang === 'bn' ? 'বর্তমান APK মেটাডেটা:' : 'Current APK Metadata on School Doc:'}
-              </span>{' '}
-              {hasLegacyApkMetadata(school) ? (
-                <span className="font-mono text-amber-800">
-                  v{school?.latestAppVersionName || '—'} (#{school?.latestAppVersionCode ?? 0})
-                </span>
-              ) : (
-                <span className="font-medium text-emerald-700">
-                  {lang === 'bn' ? 'পরিষ্কার (0 / খালি)' : 'Clean (0 / empty)'}
-                </span>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                External APK URL (Google Drive / GitHub Releases / Direct .apk)
+              </label>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  maxLength={500}
+                  required
+                  value={appUrlInput}
+                  onChange={(e) => setAppUrlInput(e.target.value)}
+                  placeholder="https://drive.google.com/file/d/.../view"
+                  className="flex-1 px-3 py-2 text-sm border border-stone-300 rounded-lg"
+                />
+                <button
+                  type="button"
+                  onClick={handleGenerateAndCopyUpdateLink}
+                  className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-lg cursor-pointer whitespace-nowrap"
+                >
+                  {copiedGeneratedLink ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-700" />
+                  ) : (
+                    <Link2 className="w-3.5 h-3.5" />
+                  )}
+                  <span>
+                    {copiedGeneratedLink
+                      ? lang === 'bn'
+                        ? 'লিংক কপি হয়েছে'
+                        : 'Link Copied'
+                      : lang === 'bn'
+                      ? 'আপডেট লিংক তৈরি করুন'
+                      : 'Generate Update Link'}
+                  </span>
+                </button>
+              </div>
+              {resolvedAppLink && (
+                <div className="mt-2 p-2.5 rounded-lg bg-stone-50 border border-stone-200 flex items-center justify-between gap-2 text-xs">
+                  <span className="font-mono text-slate-700 truncate">
+                    {resolvedAppLink.directDownloadUrl}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleGenerateAndCopyUpdateLink}
+                    className="p-1 text-slate-600 hover:text-slate-900 cursor-pointer shrink-0"
+                    title="Copy Direct Link"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               )}
             </div>
-            {lastDeletedResult !== null && (
-              <div className="text-emerald-800 font-medium">
-                {lang === 'bn'
-                  ? `সর্বশেষ ক্লিনআপে ${lastDeletedResult} টি APK অংশ মুছে ফেলা হয়েছে।`
-                  : `Last cleanup removed ${lastDeletedResult} APK chunk document(s).`}
-              </div>
-            )}
-          </div>
 
-          <div>
-            <label
-              htmlFor="cleanup-admin-pw"
-              className="block text-xs font-medium text-slate-700 mb-1"
-            >
-              {t(lang, 'adminPasswordLabel')}
-            </label>
-            <div className="relative">
-              <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                id="cleanup-admin-pw"
-                type="password"
-                required
-                disabled={cleaningApk}
-                value={cleanupPassword}
-                onChange={(e) => setCleanupPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-600 disabled:bg-stone-50"
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Release Notes
+              </label>
+              <textarea
+                rows={2}
+                maxLength={300}
+                value={appNotesInput}
+                onChange={(e) => setAppNotesInput(e.target.value)}
+                placeholder="What's new in this update..."
+                className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
               />
             </div>
-            <p className="text-[11px] text-slate-500 mt-1">
-              {t(lang, 'adminPasswordRequiredForCleanup')}
-            </p>
-          </div>
 
-          {cleaningApk && (
-            <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs font-medium text-amber-900">
-              {t(lang, 'deletingApkProgress')} ({deletedSoFar})
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'adminPasswordLabel')}
+                </label>
+                <div className="relative">
+                  <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="password"
+                    required
+                    value={appUpdatePassword}
+                    onChange={(e) => setAppUpdatePassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg"
+                  />
+                </div>
+              </div>
+              <button
+                type="submit"
+                disabled={savingAppUpdate}
+                className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+              >
+                {savingAppUpdate
+                  ? t(lang, 'loading')
+                  : lang === 'bn'
+                  ? 'অ্যাপ আপডেট প্রকাশ করুন'
+                  : 'Publish App Update'}
+              </button>
             </div>
-          )}
+          </form>
 
-          <button
-            type="submit"
-            disabled={cleaningApk}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+          {/* B. Zero-Data-Loss Workspace Migration Tool */}
+          <form
+            onSubmit={handleMigrateWorkspace}
+            className="bg-white border border-stone-200 rounded-xl p-6 space-y-4"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>
-              {cleaningApk
-                ? `${t(lang, 'deletingApkProgress')} (${deletedSoFar})`
-                : t(lang, 'deleteApkBtn')}
-            </span>
-          </button>
-        </form>
+            <div className="flex items-start gap-3 pb-3 border-b border-stone-200">
+              <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                <ArrowRightLeft className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  {lang === 'bn'
+                    ? 'নিরাপদ ওয়ার্কস্পেস মাইগ্রেশন (Zero Data Loss)'
+                    : 'Zero-Data-Loss Workspace Migration'}
+                </h3>
+                <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
+                  {lang === 'bn'
+                    ? 'পুরোনো স্কুল আইডি থেকে অফিসিয়াল স্কুল আইডি (139783)-তে অনুপস্থিত শিক্ষার্থী, নম্বর, উপস্থিতি ও তথ্য কপি করুন। গন্তব্যের কোনো বিদ্যমান তথ্য মুছে ফেলা বা প্রতিস্থাপন করা হবে না।'
+                    : 'Safely copy missing students, marks, subjects, customFields, attendance, notices, and messages from an older School ID into Target School ID (139783). Existing destination records are never overwritten or deleted.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {lang === 'bn' ? 'উৎস স্কুল আইডি (পুরোনো)' : 'Source School ID (Old)'}
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={migSourceId}
+                  onChange={(e) => setMigSourceId(e.target.value)}
+                  placeholder="e.g. OLD-SCHOOL-ID"
+                  className="w-full px-3 py-2 text-sm font-mono border border-stone-300 rounded-lg uppercase"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {lang === 'bn' ? 'গন্তব্য স্কুল আইডি (অফিসিয়াল)' : 'Target School ID (Official)'}
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={migTargetId}
+                  onChange={(e) => setMigTargetId(e.target.value)}
+                  placeholder={OFFICIAL_SCHOOL_ID}
+                  className="w-full px-3 py-2 text-sm font-mono border border-stone-300 rounded-lg uppercase"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'adminPasswordLabel')}
+                </label>
+                <div className="relative">
+                  <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="password"
+                    required
+                    value={migPassword}
+                    onChange={(e) => setMigPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg"
+                  />
+                </div>
+              </div>
+              <button
+                type="submit"
+                disabled={migrating}
+                className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+              >
+                {migrating
+                  ? lang === 'bn'
+                    ? 'মাইগ্রেট হচ্ছে...'
+                    : 'Migrating safely...'
+                  : lang === 'bn'
+                  ? 'নিরাপদে মাইগ্রেট করুন'
+                  : 'Run Safe Merge Migration'}
+              </button>
+            </div>
+
+            {migReport && (
+              <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 font-mono">
+                {migReport}
+              </div>
+            )}
+          </form>
+
+          {/* C. Safe Server APK Cleanup */}
+          <form
+            onSubmit={handleDeleteApkChunks}
+            className="bg-white border border-stone-200 rounded-xl p-6 space-y-5"
+          >
+            <div className="flex items-start justify-between gap-3 pb-4 border-b border-stone-200">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-lg bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center shrink-0 mt-0.5">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    {t(lang, 'deleteApkTitle')}
+                  </h3>
+                  <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                    {t(lang, 'deleteApkDesc')}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-lg bg-emerald-50/70 border border-emerald-200 flex items-start gap-3 text-xs text-emerald-950">
+              <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-semibold">
+                  {lang === 'bn'
+                    ? 'নিরাপদ ক্লিনআপ গ্যারান্টি'
+                    : 'Protected Collections (Never Modified or Deleted)'}
+                </div>
+                <p className="text-emerald-900/90 leading-relaxed">
+                  <code>students</code>, <code>subjects</code>, <code>customFields</code>,{' '}
+                  <code>attendanceLogs</code>, <code>pendingChanges</code>,{' '}
+                  <code>parentNotices</code>, <code>messages</code>, <code>teachers</code>
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-lg bg-stone-50 border border-stone-200 text-xs text-slate-700 space-y-1">
+              <div>
+                <span className="font-semibold text-slate-900">
+                  {lang === 'bn' ? 'বর্তমান APK মেটাডেটা:' : 'Current APK Metadata on School Doc:'}
+                </span>{' '}
+                {hasLegacyApkMetadata(school) ? (
+                  <span className="font-mono text-amber-800">
+                    v{school?.latestAppVersionName || '—'} (#{school?.latestAppVersionCode ?? 0})
+                  </span>
+                ) : (
+                  <span className="font-medium text-emerald-700">
+                    {lang === 'bn' ? 'পরিষ্কার (0 / খালি)' : 'Clean (0 / empty)'}
+                  </span>
+                )}
+              </div>
+              {lastDeletedResult !== null && (
+                <div className="text-emerald-800 font-medium">
+                  {lang === 'bn'
+                    ? `সর্বশেষ ক্লিনআপে ${lastDeletedResult} টি APK অংশ মুছে ফেলা হয়েছে।`
+                    : `Last cleanup removed ${lastDeletedResult} APK chunk document(s).`}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label
+                htmlFor="cleanup-admin-pw"
+                className="block text-xs font-medium text-slate-700 mb-1"
+              >
+                {t(lang, 'adminPasswordLabel')}
+              </label>
+              <div className="relative">
+                <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  id="cleanup-admin-pw"
+                  type="password"
+                  required
+                  disabled={cleaningApk}
+                  value={cleanupPassword}
+                  onChange={(e) => setCleanupPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-600 disabled:bg-stone-50"
+                />
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">
+                {t(lang, 'adminPasswordRequiredForCleanup')}
+              </p>
+            </div>
+
+            {cleaningApk && (
+              <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs font-medium text-amber-900">
+                {t(lang, 'deletingApkProgress')} ({deletedSoFar})
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={cleaningApk}
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-lg cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>
+                {cleaningApk
+                  ? `${t(lang, 'deletingApkProgress')} (${deletedSoFar})`
+                  : t(lang, 'deleteApkBtn')}
+              </span>
+            </button>
+          </form>
+        </div>
       )}
 
       {/* Confirm Teacher Removal with Admin Password Modal */}

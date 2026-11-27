@@ -16,9 +16,10 @@ import {
 import { getClassLabel, t } from '../lib/i18n';
 import {
   compareRollNumbers,
-  computeFinalExamMeritMap,
+  computeClassMeritDetails,
   computeStudentTermSummary,
   getClassSubjectsForMarksheet,
+  getOfficialExamLabel,
   normalizeExamConfigs,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
@@ -83,8 +84,8 @@ export const PromotionManagerView: React.FC = () => {
     [examConfigs, selectedClass]
   );
 
-  const meritMap = useMemo(
-    () => computeFinalExamMeritMap(classStudents, classSubjects),
+  const meritDetailsMap = useMemo(
+    () => computeClassMeritDetails(classStudents, classSubjects),
     [classStudents, classSubjects]
   );
 
@@ -104,16 +105,19 @@ export const PromotionManagerView: React.FC = () => {
     > = {};
     const autoSelected = new Set<string>();
     for (const st of classStudents) {
-      const summary = computeStudentTermSummary(st, classSubjects, 'exam_3');
-      const merit = meritMap.get(st.id);
+      const detail = meritDetailsMap.get(st.id);
       const defaultStatus =
         st.promotionStatus ||
-        (summary.scoredSubjects > 0 ? (summary.passed ? 'Promoted' : 'Retained') : '');
+        (detail && detail.scoredCount > 0
+          ? detail.fCount === 0
+            ? 'Promoted'
+            : 'Retained'
+          : '');
       const defaultNextRoll =
         st.nextYearRollNumber !== undefined && String(st.nextYearRollNumber) !== ''
           ? String(st.nextYearRollNumber)
-          : merit
-          ? String(merit)
+          : detail
+          ? String(detail.rank)
           : '';
       nextDrafts[st.id] = {
         promotionStatus: defaultStatus,
@@ -125,18 +129,28 @@ export const PromotionManagerView: React.FC = () => {
     }
     setDrafts(nextDrafts);
     setSelectedIds(autoSelected);
-  }, [classStudents, classSubjects, meritMap]);
+  }, [classStudents, meritDetailsMap]);
 
   const handleAutoAssignByMerit = () => {
     const passers = classStudents
-      .filter((st) => meritMap.has(st.id))
-      .sort((a, b) => (meritMap.get(a.id) || 9999) - (meritMap.get(b.id) || 9999));
+      .filter((st) => {
+        const d = meritDetailsMap.get(st.id);
+        return Boolean(d && d.scoredCount > 0 && d.fCount === 0);
+      })
+      .sort(
+        (a, b) =>
+          (meritDetailsMap.get(a.id)?.rank || 9999) -
+          (meritDetailsMap.get(b.id)?.rank || 9999)
+      );
 
+    const anyScored = Array.from(meritDetailsMap.values()).some((d) => d.scoredCount > 0);
     const nextDrafts = { ...drafts };
     const nextSelected = new Set<string>();
 
-    if (passers.length > 0) {
+    if (anyScored) {
+      const passerIds = new Set<string>();
       passers.forEach((st, idx) => {
+        passerIds.add(st.id);
         nextDrafts[st.id] = {
           promotionStatus: 'Promoted',
           nextYearRollNumber: String(idx + 1),
@@ -144,7 +158,7 @@ export const PromotionManagerView: React.FC = () => {
         nextSelected.add(st.id);
       });
       for (const st of classStudents) {
-        if (!meritMap.has(st.id)) {
+        if (!passerIds.has(st.id)) {
           nextDrafts[st.id] = {
             promotionStatus: 'Retained',
             nextYearRollNumber: String(st.rollNumber || ''),
@@ -152,7 +166,6 @@ export const PromotionManagerView: React.FC = () => {
         }
       }
     } else {
-      // Fallback: assign sequentially by current roll if Final Exam hasn't been scored yet
       classStudents.forEach((st, idx) => {
         nextDrafts[st.id] = {
           promotionStatus: 'Promoted',
@@ -467,7 +480,7 @@ export const PromotionManagerView: React.FC = () => {
                   </th>
                   <th className="py-3 px-3 w-20">{t(lang, 'rollNumber')}</th>
                   <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থী' : 'Student'}</th>
-                  <th className="py-3 px-3 text-right">{t(lang, 'term3')}</th>
+                  <th className="py-3 px-3 text-right">{getOfficialExamLabel('exam_3', lang)}</th>
                   <th className="py-3 px-3 text-right">{t(lang, 'meritPosition')}</th>
                   <th className="py-3 px-3 w-40">{t(lang, 'promotionStatus')}</th>
                   <th className="py-3 px-3 w-32">{t(lang, 'nextYearRollNumber')}</th>
@@ -476,7 +489,7 @@ export const PromotionManagerView: React.FC = () => {
               <tbody className="divide-y divide-stone-100">
                 {pagedStudents.map((st) => {
                   const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
-                  const merit = meritMap.get(st.id);
+                  const detail = meritDetailsMap.get(st.id);
                   const d = drafts[st.id] || { promotionStatus: '', nextYearRollNumber: '' };
                   return (
                     <tr key={st.id} className="hover:bg-stone-50/60">
@@ -503,12 +516,14 @@ export const PromotionManagerView: React.FC = () => {
                           <span className={t3.passed ? 'text-emerald-700' : 'text-rose-600'}>
                             {t3.totalObtained} ({t3.grade})
                           </span>
+                        ) : t3.absentSubjects > 0 ? (
+                          <span className="text-amber-700">{t(lang, 'absentLabel')}</span>
                         ) : (
                           '—'
                         )}
                       </td>
                       <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-emerald-800">
-                        {merit ? `#${merit}` : '—'}
+                        {detail ? `#${detail.rank}` : '—'}
                       </td>
                       <td className="py-1.5 px-3">
                         <select

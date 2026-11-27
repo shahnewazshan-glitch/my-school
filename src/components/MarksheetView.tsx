@@ -23,14 +23,23 @@ import {
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import {
-  computeFinalExamMeritMap,
+  calculateSubjectGrade,
+  computeClassMeritDetails,
   computeStudentTermSummary,
+  computeSubjectCombinedAverage,
   formatPhotoSrc,
   getClassSubjectsForMarksheet,
+  getExamAbsentKey,
+  getOfficialExamLabel,
   getTermSubjectScore,
+  isAbsentMarkerValue,
   normalizeExamConfigs,
+  OFFICIAL_EMIS_CODE,
+  OFFICIAL_SCHOOL_NAME_BN,
+  OFFICIAL_SCHOOL_NAME_EN,
+  TERM_ORDER,
 } from '../lib/schoolUtils';
-import type { AttendanceLogDoc, StudentDoc } from '../types/school';
+import type { AttendanceLogDoc, ExamTermId, StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
@@ -51,6 +60,7 @@ export const MarksheetView: React.FC = () => {
 
   const isAdmin = session?.role === 'ADMIN';
   const [viewMode, setViewMode] = useState<'card' | 'tabulation'>('card');
+  const [selectedExam, setSelectedExam] = useState<ExamTermId>('exam_3');
   const [selectedStudentId, setSelectedStudentId] = useState<string>('');
   const [tabPage, setTabPage] = useState(1);
   const [importBanner, setImportBanner] = useState<{
@@ -104,12 +114,12 @@ export const MarksheetView: React.FC = () => {
     [examConfigs, selectedClass]
   );
 
-  const meritMap = useMemo(
-    () => computeFinalExamMeritMap(classStudents, classSubjects),
+  const meritDetailsMap = useMemo(
+    () => computeClassMeritDetails(classStudents, classSubjects),
     [classStudents, classSubjects]
   );
 
-  // Build individual student 3-term marksheet rows & bottom totals
+  // Build individual student marksheet rows & bottom totals (respecting single-exam vs combined view)
   const buildStudentMarksheetData = (st: StudentDoc) => {
     let fullMarksSum = 0;
     let t1ContSum = 0;
@@ -129,37 +139,40 @@ export const MarksheetView: React.FC = () => {
       const s2 = getTermSubjectScore(st.examResults, 'exam_2', subj.subjectId);
       const s3 = getTermSubjectScore(st.examResults, 'exam_3', subj.subjectId);
 
-      const termTotals = [s1, s2, s3]
-        .filter((s) => s.hasScore && s.total !== null)
-        .map((s) => s.total as number);
-      const rowAvg =
-        termTotals.length > 0
-          ? Number((termTotals.reduce((a, b) => a + b, 0) / termTotals.length).toFixed(1))
-          : null;
+      const combined = computeSubjectCombinedAverage(st.examResults, subj.subjectId);
+      const rowAvg = combined.avg !== null ? Number(combined.avg.toFixed(1)) : null;
 
       fullMarksSum += subj.fullMarks;
-      if (s1.cont !== null) t1ContSum += s1.cont;
-      if (s1.sum !== null) t1SumSum += s1.sum;
-      if (s1.total !== null) t1TotalSum += s1.total;
+      if (!s1.isAbsent && s1.cont !== null) t1ContSum += s1.cont;
+      if (!s1.isAbsent && s1.sum !== null) t1SumSum += s1.sum;
+      if (!s1.isAbsent && s1.total !== null) t1TotalSum += s1.total;
 
-      if (s2.cont !== null) t2ContSum += s2.cont;
-      if (s2.sum !== null) t2SumSum += s2.sum;
-      if (s2.total !== null) t2TotalSum += s2.total;
+      if (!s2.isAbsent && s2.cont !== null) t2ContSum += s2.cont;
+      if (!s2.isAbsent && s2.sum !== null) t2SumSum += s2.sum;
+      if (!s2.isAbsent && s2.total !== null) t2TotalSum += s2.total;
 
-      if (s3.cont !== null) t3ContSum += s3.cont;
-      if (s3.sum !== null) t3SumSum += s3.sum;
-      if (s3.total !== null) t3TotalSum += s3.total;
+      if (!s3.isAbsent && s3.cont !== null) t3ContSum += s3.cont;
+      if (!s3.isAbsent && s3.sum !== null) t3SumSum += s3.sum;
+      if (!s3.isAbsent && s3.total !== null) t3TotalSum += s3.total;
 
       if (rowAvg !== null) {
         avgSum += rowAvg;
         avgCount += 1;
       }
 
+      const activeScore = selectedExam === 'exam_1' ? s1 : selectedExam === 'exam_2' ? s2 : s3;
+      const activeGrade =
+        !activeScore.isAbsent && activeScore.hasScore && activeScore.total !== null
+          ? calculateSubjectGrade(activeScore.total, subj.fullMarks)
+          : null;
+
       return {
         subj,
         s1,
         s2,
         s3,
+        activeScore,
+        activeGrade,
         rowAvg,
       };
     });
@@ -169,7 +182,13 @@ export const MarksheetView: React.FC = () => {
     const term1Summary = computeStudentTermSummary(st, classSubjects, 'exam_1');
     const term2Summary = computeStudentTermSummary(st, classSubjects, 'exam_2');
     const term3Summary = computeStudentTermSummary(st, classSubjects, 'exam_3');
-    const meritRank = meritMap.get(st.id) || null;
+    const activeSummary =
+      selectedExam === 'exam_1'
+        ? term1Summary
+        : selectedExam === 'exam_2'
+        ? term2Summary
+        : term3Summary;
+    const meritDetail = meritDetailsMap.get(st.id) || null;
 
     return {
       rows,
@@ -189,33 +208,96 @@ export const MarksheetView: React.FC = () => {
       term1Summary,
       term2Summary,
       term3Summary,
-      meritRank,
+      activeSummary,
+      meritRank: meritDetail?.rank || null,
+      meritDetail,
     };
   };
 
   const activeData = useMemo(
     () => (activeStudent ? buildStudentMarksheetData(activeStudent) : null),
-    [activeStudent, classSubjects, meritMap]
+    [activeStudent, classSubjects, meritDetailsMap, selectedExam]
   );
 
-  // Export 3-Term Marksheet (NO Pass Marks column!)
+  const schoolTitle =
+    school?.schoolName?.trim() ||
+    (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+
+  // Export single-exam (1st or 2nd) or full academic year combined (3rd) marksheet
   const exportMarksheetFile = async (format: 'xlsx' | 'csv') => {
     if (!activeStudent || !activeData) return;
     const XLSX = await import('xlsx');
+    const isCombined = selectedExam === 'exam_3';
+    const examTitle = getOfficialExamLabel(selectedExam, lang);
+    const safeRoll = String(activeStudent.rollNumber || 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    if (!isCombined) {
+      const headerRow = ['Subject', 'Full Marks', 'Cont.', 'Sum.', 'Total', 'Grade', 'Status'];
+      const bodyRows = activeData.rows.map((r) => {
+        const sc = r.activeScore;
+        if (sc.isAbsent) {
+          return [r.subj.subjectName, r.subj.fullMarks, 'Absent', 'Absent', 'Absent', 'Absent', 'Absent'];
+        }
+        return [
+          r.subj.subjectName,
+          r.subj.fullMarks,
+          sc.cont ?? '',
+          sc.sum ?? '',
+          sc.total ?? '',
+          r.activeGrade ? r.activeGrade.grade : '',
+          r.activeGrade ? (r.activeGrade.passed ? 'Passed' : 'Failed') : '',
+        ];
+      });
+      const totalsRow = [
+        'Totals',
+        activeData.totals.fullMarksSum,
+        selectedExam === 'exam_1' ? activeData.totals.t1ContSum : activeData.totals.t2ContSum,
+        selectedExam === 'exam_1' ? activeData.totals.t1SumSum : activeData.totals.t2SumSum,
+        selectedExam === 'exam_1' ? activeData.totals.t1TotalSum : activeData.totals.t2TotalSum,
+        activeData.activeSummary.scoredSubjects > 0
+          ? `${activeData.activeSummary.gpa.toFixed(2)} (${activeData.activeSummary.grade})`
+          : '',
+        activeData.activeSummary.scoredSubjects > 0
+          ? activeData.activeSummary.passed
+            ? 'Passed'
+            : `${activeData.activeSummary.fCount} F`
+          : '',
+      ];
+      const aoa = [
+        [`${schoolTitle} — ${examTitle}`],
+        [
+          `Student: ${activeStudent.studentNameBn || activeStudent.studentNameEn}`,
+          `Roll: ${activeStudent.rollNumber}`,
+          `Class: ${selectedClass}`,
+          `Year: ${selectedAcademicYear}`,
+          `GPA: ${Number.isFinite(activeData.activeSummary.gpa) ? activeData.activeSummary.gpa.toFixed(2) : '0.00'} (${activeData.activeSummary.grade})`,
+        ],
+        [],
+        headerRow,
+        ...bodyRows,
+        totalsRow,
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, selectedExam === 'exam_1' ? '1st Term' : '2nd Term');
+      const filename = `Marksheet_${selectedExam}_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
+      XLSX.writeFile(wb, filename, { bookType: format });
+      return;
+    }
 
     const headerRow1 = [
       'Subject',
       'Full Marks',
-      '1st Term',
+      getOfficialExamLabel('exam_1', 'bn'),
       '',
       '',
-      '2nd Term',
+      getOfficialExamLabel('exam_2', 'bn'),
       '',
       '',
-      'Final Term',
+      getOfficialExamLabel('exam_3', 'bn'),
       '',
       '',
-      '3-Term Average',
+      'Combined Avg',
     ];
     const headerRow2 = [
       '',
@@ -235,15 +317,15 @@ export const MarksheetView: React.FC = () => {
     const bodyRows = activeData.rows.map((r) => [
       r.subj.subjectName,
       r.subj.fullMarks,
-      r.s1.cont ?? '',
-      r.s1.sum ?? '',
-      r.s1.total ?? '',
-      r.s2.cont ?? '',
-      r.s2.sum ?? '',
-      r.s2.total ?? '',
-      r.s3.cont ?? '',
-      r.s3.sum ?? '',
-      r.s3.total ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.cont ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.sum ?? '',
+      r.s1.isAbsent ? 'Absent' : r.s1.total ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.cont ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.sum ?? '',
+      r.s2.isAbsent ? 'Absent' : r.s2.total ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.cont ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.sum ?? '',
+      r.s3.isAbsent ? 'Absent' : r.s3.total ?? '',
       r.rowAvg ?? '',
     ]);
 
@@ -263,13 +345,13 @@ export const MarksheetView: React.FC = () => {
     ];
 
     const aoa = [
-      [`${school?.schoolName || 'My School'} — 3-Term Marksheet`],
+      [`${schoolTitle} — ${examTitle}`],
       [
         `Student: ${activeStudent.studentNameBn || activeStudent.studentNameEn}`,
         `Roll: ${activeStudent.rollNumber}`,
         `Class: ${selectedClass}`,
         `Year: ${selectedAcademicYear}`,
-        `Final GPA: ${Number.isFinite(activeData.term3Summary.gpa) ? activeData.term3Summary.gpa.toFixed(2) : '0.00'} (${activeData.term3Summary.grade})`,
+        `GPA: ${Number.isFinite(activeData.term3Summary.gpa) ? activeData.term3Summary.gpa.toFixed(2) : '0.00'} (${activeData.term3Summary.grade})`,
         activeData.meritRank ? `Merit Rank: #${activeData.meritRank}` : '',
       ],
       [],
@@ -290,20 +372,20 @@ export const MarksheetView: React.FC = () => {
     ];
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, '3-Term Marksheet');
-    const safeRoll = String(activeStudent.rollNumber || 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
+    XLSX.utils.book_append_sheet(wb, ws, 'Combined Marksheet');
     const filename = `Marksheet_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
     XLSX.writeFile(wb, filename, { bookType: format });
   };
 
-  // Export full class tabulation + student roster compatible with Android app
+  // Export class tabulation + student roster for active exam (single exam for 1st/2nd, combined for 3rd)
   const exportClassRosterOrTabulation = async (format: 'xlsx' | 'csv') => {
     const XLSX = await import('xlsx');
+    const isCombined = selectedExam === 'exam_3';
     const rows = classStudents.map((st) => {
       const t1 = computeStudentTermSummary(st, classSubjects, 'exam_1');
       const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
       const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
-      const merit = meritMap.get(st.id) || '';
+      const meritDetail = meritDetailsMap.get(st.id);
 
       const base: Record<string, string | number> = {
         rollNumber: st.rollNumber,
@@ -315,26 +397,45 @@ export const MarksheetView: React.FC = () => {
         guardianPhone: st.guardianPhone || '',
         address: st.address || '',
         classLevel: st.classLevel,
-        section: st.section || '',
         academicYear: st.academicYear,
         totalSchoolDays: st.totalSchoolDays || 0,
         daysPresent: st.daysPresent || 0,
         promotionStatus: st.promotionStatus || '',
-        term1Total: t1.totalObtained,
-        term2Total: t2.totalObtained,
-        finalTotal: t3.totalObtained,
-        finalGpa: t3.scoredSubjects > 0 ? t3.gpa.toFixed(2) : '',
-        finalGrade: t3.grade,
-        finalMeritRank: merit,
       };
 
-      for (const subj of classSubjects) {
-        const s1 = getTermSubjectScore(st.examResults, 'exam_1', subj.subjectId);
-        const s2 = getTermSubjectScore(st.examResults, 'exam_2', subj.subjectId);
-        const s3 = getTermSubjectScore(st.examResults, 'exam_3', subj.subjectId);
-        base[`${subj.subjectName} (1st Total)`] = s1.total ?? '';
-        base[`${subj.subjectName} (2nd Total)`] = s2.total ?? '';
-        base[`${subj.subjectName} (Final Total)`] = s3.total ?? '';
+      if (selectedExam === 'exam_1') {
+        base.exam1Total = t1.scoredSubjects > 0 ? t1.totalObtained : t1.absentSubjects > 0 ? 'Absent' : '';
+        base.exam1Gpa = t1.scoredSubjects > 0 ? t1.gpa.toFixed(2) : '';
+        base.exam1Grade = t1.grade;
+        for (const subj of classSubjects) {
+          const s1 = getTermSubjectScore(st.examResults, 'exam_1', subj.subjectId);
+          base[`${subj.subjectName} (1st Total)`] = s1.isAbsent ? 'Absent' : s1.total ?? '';
+        }
+      } else if (selectedExam === 'exam_2') {
+        base.exam2Total = t2.scoredSubjects > 0 ? t2.totalObtained : t2.absentSubjects > 0 ? 'Absent' : '';
+        base.exam2Gpa = t2.scoredSubjects > 0 ? t2.gpa.toFixed(2) : '';
+        base.exam2Grade = t2.grade;
+        for (const subj of classSubjects) {
+          const s2 = getTermSubjectScore(st.examResults, 'exam_2', subj.subjectId);
+          base[`${subj.subjectName} (2nd Total)`] = s2.isAbsent ? 'Absent' : s2.total ?? '';
+        }
+      } else {
+        base.term1Total = t1.scoredSubjects > 0 ? t1.totalObtained : t1.absentSubjects > 0 ? 'Absent' : '';
+        base.term2Total = t2.scoredSubjects > 0 ? t2.totalObtained : t2.absentSubjects > 0 ? 'Absent' : '';
+        base.finalTotal = t3.scoredSubjects > 0 ? t3.totalObtained : t3.absentSubjects > 0 ? 'Absent' : '';
+        base.finalGpa = t3.scoredSubjects > 0 ? t3.gpa.toFixed(2) : '';
+        base.finalGrade = t3.grade;
+        base.fCount = meritDetail ? meritDetail.fCount : '';
+        base.combinedPct = meritDetail && meritDetail.scoredCount > 0 ? `${meritDetail.percentage.toFixed(1)}%` : '';
+        base.finalMeritRank = meritDetail ? meritDetail.rank : '';
+        for (const subj of classSubjects) {
+          const s1 = getTermSubjectScore(st.examResults, 'exam_1', subj.subjectId);
+          const s2 = getTermSubjectScore(st.examResults, 'exam_2', subj.subjectId);
+          const s3 = getTermSubjectScore(st.examResults, 'exam_3', subj.subjectId);
+          base[`${subj.subjectName} (1st Total)`] = s1.isAbsent ? 'Absent' : s1.total ?? '';
+          base[`${subj.subjectName} (2nd Total)`] = s2.isAbsent ? 'Absent' : s2.total ?? '';
+          base[`${subj.subjectName} (Final Total)`] = s3.isAbsent ? 'Absent' : s3.total ?? '';
+        }
       }
 
       return base;
@@ -342,8 +443,9 @@ export const MarksheetView: React.FC = () => {
 
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Class Tabulation');
-    const filename = `${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}_Roster.${format}`;
+    XLSX.utils.book_append_sheet(wb, ws, isCombined ? 'Combined Tabulation' : selectedExam);
+    const suffix = isCombined ? 'Roster' : selectedExam;
+    const filename = `${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}_${suffix}.${format}`;
     XLSX.writeFile(wb, filename, { bookType: format });
   };
 
@@ -545,6 +647,23 @@ export const MarksheetView: React.FC = () => {
             const contKey = `${termId}__${subj.subjectId}__cont`;
             const sumKey = `${termId}__${subj.subjectId}__sum`;
             const totalKey = `${termId}__${subj.subjectId}`;
+            const absentKey = getExamAbsentKey(termId, subj.subjectId);
+
+            if (
+              (hasTotalOnly && isAbsentMarkerValue(row[totalHeader]) && String(row[totalHeader]).trim() !== '1') ||
+              (hasCont && isAbsentMarkerValue(row[contHeader]) && String(row[contHeader]).trim() !== '1') ||
+              (hasSum && isAbsentMarkerValue(row[sumHeader]) && String(row[sumHeader]).trim() !== '1')
+            ) {
+              nextResults[absentKey] = '1';
+              marksPatch[absentKey] = '1';
+              delete nextResults[contKey];
+              delete nextResults[sumKey];
+              delete nextResults[totalKey];
+              marksPatch[contKey] = '';
+              marksPatch[sumKey] = '';
+              marksPatch[totalKey] = '';
+              continue;
+            }
 
             if (hasCont) {
               const num = Number(row[contHeader]);
@@ -552,6 +671,8 @@ export const MarksheetView: React.FC = () => {
                 const s = String(num).trim();
                 nextResults[contKey] = s;
                 marksPatch[contKey] = s;
+                delete nextResults[absentKey];
+                marksPatch[absentKey] = '';
               }
             }
             if (hasSum) {
@@ -560,6 +681,8 @@ export const MarksheetView: React.FC = () => {
                 const s = String(num).trim();
                 nextResults[sumKey] = s;
                 marksPatch[sumKey] = s;
+                delete nextResults[absentKey];
+                marksPatch[absentKey] = '';
               }
             }
             if (hasCont || hasSum) {
@@ -574,6 +697,8 @@ export const MarksheetView: React.FC = () => {
                 const s = String(num).trim();
                 nextResults[totalKey] = s;
                 marksPatch[totalKey] = s;
+                delete nextResults[absentKey];
+                marksPatch[absentKey] = '';
               }
             }
           }
@@ -784,6 +909,23 @@ export const MarksheetView: React.FC = () => {
             </button>
           </div>
 
+          <div className="flex flex-wrap items-center gap-1 p-1 bg-stone-100 rounded-lg">
+            {TERM_ORDER.map((termId) => (
+              <button
+                key={termId}
+                type="button"
+                onClick={() => setSelectedExam(termId)}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                  selectedExam === termId
+                    ? 'bg-white text-emerald-900 font-semibold shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                {getOfficialExamLabel(termId, lang)}
+              </button>
+            ))}
+          </div>
+
           {viewMode === 'card' && classStudents.length > 0 && (
             <select
               value={selectedStudentId}
@@ -874,7 +1016,7 @@ export const MarksheetView: React.FC = () => {
         </div>
       </div>
 
-      {/* Individual 3-Term Marksheet Card */}
+      {/* Individual Academic Marksheet Card */}
       {viewMode === 'card' && (
         <div className="bg-white border border-stone-200 rounded-xl p-6 sm:p-8 print-card">
           {!activeStudent || !activeData ? (
@@ -890,21 +1032,24 @@ export const MarksheetView: React.FC = () => {
               {/* Academic Report Card Header */}
               <div className="text-center border-b-2 border-slate-800 pb-4 space-y-1">
                 <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
-                  {school?.schoolName || 'My School'}
+                  {schoolTitle}
                 </h2>
                 <p className="text-xs text-slate-600">
                   {school?.upazilaDistrict ? `${school.upazilaDistrict} · ` : ''}
-                  {school?.emisCode ? `EMIS: ${school.emisCode} · ` : ''}
+                  EMIS: {school?.emisCode || OFFICIAL_EMIS_CODE} ·{' '}
                   {t(lang, 'academicYear')}: {selectedAcademicYear}
                 </p>
-                <div className="pt-1 text-sm font-semibold uppercase tracking-wide text-emerald-800">
-                  {lang === 'bn'
-                    ? '৩-সাময়িকী সমন্বিত নম্বরপত্র (মার্কশিট)'
-                    : '3-Term Consolidated Academic Marksheet'}
+                <div className="pt-1 text-sm font-semibold text-emerald-800">
+                  {getOfficialExamLabel(selectedExam, lang)}
+                  {selectedExam === 'exam_3' && (
+                    <span className="ml-2 text-xs font-medium text-slate-500">
+                      ({lang === 'bn' ? 'বার্ষিক সমন্বিত নম্বরপত্র' : 'Combined Annual Marksheet'})
+                    </span>
+                  )}
                 </div>
               </div>
 
-              {/* Student Particulars */}
+              {/* Student Particulars (No Section UI) */}
               <div className="flex flex-wrap items-center justify-between gap-4 bg-stone-50 border border-stone-200 rounded-lg p-4 text-sm">
                 <div className="flex items-center gap-4">
                   {formatPhotoSrc(activeStudent.photoBase64) && (
@@ -943,10 +1088,6 @@ export const MarksheetView: React.FC = () => {
                     </strong>
                   </div>
                   <div>
-                    <span className="text-slate-500">{t(lang, 'section')}:</span>{' '}
-                    <strong className="text-slate-900">{activeStudent.section || '—'}</strong>
-                  </div>
-                  <div>
                     <span className="text-slate-500">{t(lang, 'meritPosition')}:</span>{' '}
                     <strong className="font-mono tabular-nums text-emerald-800">
                       {activeData.meritRank ? `#${activeData.meritRank}` : t(lang, 'notQualified')}
@@ -955,200 +1096,374 @@ export const MarksheetView: React.FC = () => {
                 </div>
               </div>
 
-              {/* 2-Tier 3-Term Marksheet Table (STRICTLY NO Pass Marks column) */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs sm:text-sm border-collapse border border-stone-300">
-                  <thead>
-                    <tr className="bg-stone-100 text-slate-800 font-semibold">
-                      <th
-                        rowSpan={2}
-                        className="border border-stone-300 py-2.5 px-3 text-left align-middle"
-                      >
-                        {t(lang, 'subject')}
-                      </th>
-                      <th
-                        rowSpan={2}
-                        className="border border-stone-300 py-2.5 px-2 text-center align-middle w-20"
-                      >
-                        {t(lang, 'fullMarks')}
-                      </th>
-                      <th
-                        colSpan={3}
-                        className="border border-stone-300 py-2 px-2 text-center bg-emerald-50/70"
-                      >
-                        {t(lang, 'term1')}
-                      </th>
-                      <th
-                        colSpan={3}
-                        className="border border-stone-300 py-2 px-2 text-center bg-sky-50/60"
-                      >
-                        {t(lang, 'term2')}
-                      </th>
-                      <th
-                        colSpan={3}
-                        className="border border-stone-300 py-2 px-2 text-center bg-amber-50/60"
-                      >
-                        {t(lang, 'term3')}
-                      </th>
-                      <th
-                        rowSpan={2}
-                        className="border border-stone-300 py-2.5 px-2 text-center align-middle w-24"
-                      >
-                        {t(lang, 'avg3Term')}
-                      </th>
-                    </tr>
-                    <tr className="bg-stone-50 text-slate-600 text-xs font-medium">
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'contShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'sumShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
-                        {t(lang, 'totalShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'contShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'sumShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
-                        {t(lang, 'totalShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'contShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center">
-                        {t(lang, 'sumShort')}
-                      </th>
-                      <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
-                        {t(lang, 'totalShort')}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {activeData.rows.map(({ subj, s1, s2, s3, rowAvg }) => (
-                      <tr key={subj.subjectId} className="hover:bg-stone-50/60">
-                        <td className="border border-stone-300 py-2 px-3 font-medium text-slate-900">
-                          {subj.subjectName}
+              {/* Single Exam (1st / 2nd) vs Combined (3rd) Marksheet Table */}
+              {selectedExam !== 'exam_3' ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs sm:text-sm border-collapse border border-stone-300">
+                    <thead>
+                      <tr className="bg-stone-100 text-slate-800 font-semibold">
+                        <th className="border border-stone-300 py-2.5 px-3 text-left">
+                          {t(lang, 'subject')}
+                        </th>
+                        <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                          {t(lang, 'fullMarks')}
+                        </th>
+                        <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                          {t(lang, 'contShort')}
+                        </th>
+                        <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                          {t(lang, 'sumShort')}
+                        </th>
+                        <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                          {t(lang, 'totalShort')}
+                        </th>
+                        <th className="border border-stone-300 py-2.5 px-2 text-center w-24">
+                          {t(lang, 'gradeInternal')}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeData.rows.map(({ subj, activeScore, activeGrade }) => (
+                        <tr key={subj.subjectId} className="hover:bg-stone-50/60">
+                          <td className="border border-stone-300 py-2 px-3 font-medium text-slate-900">
+                            {subj.subjectName}
+                          </td>
+                          <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                            {subj.fullMarks}
+                          </td>
+                          {activeScore.isAbsent ? (
+                            <td
+                              colSpan={4}
+                              className="border border-stone-300 py-2 px-2 text-center text-xs font-semibold text-amber-800 bg-amber-50/50"
+                            >
+                              {t(lang, 'absentLabel')}
+                            </td>
+                          ) : (
+                            <>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {activeScore.cont ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {activeScore.sum ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-emerald-50/20">
+                                {activeScore.total ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono font-semibold">
+                                {activeGrade ? (
+                                  <span
+                                    className={
+                                      activeGrade.passed ? 'text-emerald-700' : 'text-rose-600'
+                                    }
+                                  >
+                                    {activeGrade.grade}
+                                  </span>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr className="bg-stone-100 font-bold text-slate-900">
+                        <td className="border border-stone-300 py-2.5 px-3">
+                          {t(lang, 'totalsRow')}
                         </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {subj.fullMarks}
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.fullMarksSum}
                         </td>
-                        {/* Term 1 */}
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s1.cont ?? '—'}
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {selectedExam === 'exam_1'
+                            ? activeData.totals.t1ContSum
+                            : activeData.totals.t2ContSum}
                         </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s1.sum ?? '—'}
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {selectedExam === 'exam_1'
+                            ? activeData.totals.t1SumSum
+                            : activeData.totals.t2SumSum}
                         </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-emerald-50/20">
-                          {s1.total ?? '—'}
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {selectedExam === 'exam_1'
+                            ? activeData.totals.t1TotalSum
+                            : activeData.totals.t2TotalSum}
                         </td>
-                        {/* Term 2 */}
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s2.cont ?? '—'}
-                        </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s2.sum ?? '—'}
-                        </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-sky-50/20">
-                          {s2.total ?? '—'}
-                        </td>
-                        {/* Term 3 */}
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s3.cont ?? '—'}
-                        </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
-                          {s3.sum ?? '—'}
-                        </td>
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-amber-50/20">
-                          {s3.total ?? '—'}
-                        </td>
-                        {/* 3-Term Avg */}
-                        <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900">
-                          {rowAvg ?? '—'}
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.activeSummary.scoredSubjects > 0
+                            ? activeData.activeSummary.grade
+                            : activeData.activeSummary.absentSubjects > 0
+                            ? t(lang, 'absentLabel')
+                            : '—'}
                         </td>
                       </tr>
-                    ))}
-                  </tbody>
-                  <tfoot>
-                    <tr className="bg-stone-100 font-bold text-slate-900">
-                      <td className="border border-stone-300 py-2.5 px-3">
-                        {t(lang, 'totalsRow')}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.fullMarksSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t1ContSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t1SumSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t1TotalSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t2ContSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t2SumSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t2TotalSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t3ContSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t3SumSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.t3TotalSum}
-                      </td>
-                      <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
-                        {activeData.totals.overallAvg ?? '—'}
-                      </td>
-                    </tr>
-                  </tfoot>
-                </table>
-              </div>
+                    </tfoot>
+                  </table>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs sm:text-sm border-collapse border border-stone-300">
+                    <thead>
+                      <tr className="bg-stone-100 text-slate-800 font-semibold">
+                        <th
+                          rowSpan={2}
+                          className="border border-stone-300 py-2.5 px-3 text-left align-middle"
+                        >
+                          {t(lang, 'subject')}
+                        </th>
+                        <th
+                          rowSpan={2}
+                          className="border border-stone-300 py-2.5 px-2 text-center align-middle w-20"
+                        >
+                          {t(lang, 'fullMarks')}
+                        </th>
+                        <th
+                          colSpan={3}
+                          className="border border-stone-300 py-2 px-2 text-center bg-emerald-50/70"
+                        >
+                          {getOfficialExamLabel('exam_1', lang)}
+                        </th>
+                        <th
+                          colSpan={3}
+                          className="border border-stone-300 py-2 px-2 text-center bg-sky-50/60"
+                        >
+                          {getOfficialExamLabel('exam_2', lang)}
+                        </th>
+                        <th
+                          colSpan={3}
+                          className="border border-stone-300 py-2 px-2 text-center bg-amber-50/60"
+                        >
+                          {getOfficialExamLabel('exam_3', lang)}
+                        </th>
+                        <th
+                          rowSpan={2}
+                          className="border border-stone-300 py-2.5 px-2 text-center align-middle w-24"
+                        >
+                          {t(lang, 'avg3Term')}
+                        </th>
+                      </tr>
+                      <tr className="bg-stone-50 text-slate-600 text-xs font-medium">
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'contShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'sumShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
+                          {t(lang, 'totalShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'contShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'sumShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
+                          {t(lang, 'totalShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'contShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center">
+                          {t(lang, 'sumShort')}
+                        </th>
+                        <th className="border border-stone-300 py-1.5 px-2 text-center font-semibold text-slate-900">
+                          {t(lang, 'totalShort')}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeData.rows.map(({ subj, s1, s2, s3, rowAvg }) => (
+                        <tr key={subj.subjectId} className="hover:bg-stone-50/60">
+                          <td className="border border-stone-300 py-2 px-3 font-medium text-slate-900">
+                            {subj.subjectName}
+                          </td>
+                          <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                            {subj.fullMarks}
+                          </td>
+                          {/* Exam 1 */}
+                          {s1.isAbsent ? (
+                            <td
+                              colSpan={3}
+                              className="border border-stone-300 py-2 px-2 text-center text-xs font-semibold text-amber-800 bg-amber-50/40"
+                            >
+                              {t(lang, 'absentLabel')}
+                            </td>
+                          ) : (
+                            <>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s1.cont ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s1.sum ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-emerald-50/20">
+                                {s1.total ?? '—'}
+                              </td>
+                            </>
+                          )}
+                          {/* Exam 2 */}
+                          {s2.isAbsent ? (
+                            <td
+                              colSpan={3}
+                              className="border border-stone-300 py-2 px-2 text-center text-xs font-semibold text-amber-800 bg-amber-50/40"
+                            >
+                              {t(lang, 'absentLabel')}
+                            </td>
+                          ) : (
+                            <>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s2.cont ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s2.sum ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-sky-50/20">
+                                {s2.total ?? '—'}
+                              </td>
+                            </>
+                          )}
+                          {/* Exam 3 */}
+                          {s3.isAbsent ? (
+                            <td
+                              colSpan={3}
+                              className="border border-stone-300 py-2 px-2 text-center text-xs font-semibold text-amber-800 bg-amber-50/40"
+                            >
+                              {t(lang, 'absentLabel')}
+                            </td>
+                          ) : (
+                            <>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s3.cont ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums text-slate-700">
+                                {s3.sum ?? '—'}
+                              </td>
+                              <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900 bg-amber-50/20">
+                                {s3.total ?? '—'}
+                              </td>
+                            </>
+                          )}
+                          {/* Combined Avg across attended exams */}
+                          <td className="border border-stone-300 py-2 px-2 text-center font-mono tabular-nums font-semibold text-slate-900">
+                            {rowAvg ?? '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr className="bg-stone-100 font-bold text-slate-900">
+                        <td className="border border-stone-300 py-2.5 px-3">
+                          {t(lang, 'totalsRow')}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.fullMarksSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t1ContSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t1SumSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t1TotalSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t2ContSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t2SumSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t2TotalSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t3ContSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t3SumSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.t3TotalSum}
+                        </td>
+                        <td className="border border-stone-300 py-2.5 px-2 text-center font-mono tabular-nums">
+                          {activeData.totals.overallAvg ?? '—'}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
 
               {/* Internal Bangladesh GPA & Merit Summary Strip */}
-              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 pt-2 text-xs">
-                <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
-                  <div className="text-slate-500">{t(lang, 'term1')} GPA / Grade</div>
-                  <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
-                    {activeData.term1Summary.scoredSubjects > 0
-                      ? `${activeData.term1Summary.gpa.toFixed(2)} (${activeData.term1Summary.grade})`
-                      : '—'}
+              {selectedExam !== 'exam_3' ? (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 text-xs">
+                  <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
+                    <div className="text-slate-500">{getOfficialExamLabel(selectedExam, lang)}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                      {activeData.activeSummary.scoredSubjects > 0
+                        ? `${activeData.activeSummary.totalObtained} / ${activeData.activeSummary.totalFullMarks}`
+                        : activeData.activeSummary.absentSubjects > 0
+                        ? t(lang, 'absentLabel')
+                        : '—'}
+                    </div>
+                  </div>
+                  <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
+                    <div className="text-slate-500">GPA / Grade</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                      {activeData.activeSummary.scoredSubjects > 0
+                        ? `${activeData.activeSummary.gpa.toFixed(2)} (${activeData.activeSummary.grade})`
+                        : '—'}
+                    </div>
+                  </div>
+                  <div className="border border-stone-200 rounded-lg p-3 bg-emerald-50/70">
+                    <div className="text-emerald-800">{t(lang, 'absentLabel')}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-emerald-900">
+                      {activeData.activeSummary.absentSubjects}
+                    </div>
                   </div>
                 </div>
-                <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
-                  <div className="text-slate-500">{t(lang, 'term2')} GPA / Grade</div>
-                  <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
-                    {activeData.term2Summary.scoredSubjects > 0
-                      ? `${activeData.term2Summary.gpa.toFixed(2)} (${activeData.term2Summary.grade})`
-                      : '—'}
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 pt-2 text-xs">
+                  <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
+                    <div className="text-slate-500">{getOfficialExamLabel('exam_1', lang)}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                      {activeData.term1Summary.scoredSubjects > 0
+                        ? `${activeData.term1Summary.gpa.toFixed(2)} (${activeData.term1Summary.grade})`
+                        : activeData.term1Summary.absentSubjects > 0
+                        ? t(lang, 'absentLabel')
+                        : '—'}
+                    </div>
+                  </div>
+                  <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
+                    <div className="text-slate-500">{getOfficialExamLabel('exam_2', lang)}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                      {activeData.term2Summary.scoredSubjects > 0
+                        ? `${activeData.term2Summary.gpa.toFixed(2)} (${activeData.term2Summary.grade})`
+                        : activeData.term2Summary.absentSubjects > 0
+                        ? t(lang, 'absentLabel')
+                        : '—'}
+                    </div>
+                  </div>
+                  <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
+                    <div className="text-slate-500">{getOfficialExamLabel('exam_3', lang)}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
+                      {activeData.term3Summary.scoredSubjects > 0
+                        ? `${activeData.term3Summary.gpa.toFixed(2)} (${activeData.term3Summary.grade})`
+                        : activeData.term3Summary.absentSubjects > 0
+                        ? t(lang, 'absentLabel')
+                        : '—'}
+                    </div>
+                  </div>
+                  <div className="border border-stone-200 rounded-lg p-3 bg-emerald-50/70">
+                    <div className="text-emerald-800">{t(lang, 'meritPosition')}</div>
+                    <div className="mt-1 text-base font-bold font-mono tabular-nums text-emerald-900">
+                      {activeData.meritRank ? `#${activeData.meritRank}` : t(lang, 'notQualified')}
+                    </div>
                   </div>
                 </div>
-                <div className="border border-stone-200 rounded-lg p-3 bg-stone-50">
-                  <div className="text-slate-500">{t(lang, 'term3')} GPA / Grade</div>
-                  <div className="mt-1 text-base font-bold font-mono tabular-nums text-slate-900">
-                    {activeData.term3Summary.scoredSubjects > 0
-                      ? `${activeData.term3Summary.gpa.toFixed(2)} (${activeData.term3Summary.grade})`
-                      : '—'}
-                  </div>
-                </div>
-                <div className="border border-stone-200 rounded-lg p-3 bg-emerald-50/70">
-                  <div className="text-emerald-800">{t(lang, 'meritPosition')}</div>
-                  <div className="mt-1 text-base font-bold font-mono tabular-nums text-emerald-900">
-                    {activeData.meritRank ? `#${activeData.meritRank}` : t(lang, 'notQualified')}
-                  </div>
-                </div>
-              </div>
+              )}
 
               {/* Signatures for Print */}
               <div className="pt-10 grid grid-cols-2 gap-12 text-xs text-slate-700">
@@ -1183,11 +1498,21 @@ export const MarksheetView: React.FC = () => {
                     <tr className="bg-stone-50 border-b border-stone-200 text-xs font-semibold text-slate-600">
                       <th className="py-3 px-4">{t(lang, 'rollNumber')}</th>
                       <th className="py-3 px-4">{lang === 'bn' ? 'শিক্ষার্থীর নাম' : 'Student Name'}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term1')}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term2')}</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'term3')}</th>
-                      <th className="py-3 px-4 text-right">GPA / Grade</th>
-                      <th className="py-3 px-4 text-right">{t(lang, 'meritPosition')}</th>
+                      {selectedExam === 'exam_3' ? (
+                        <>
+                          <th className="py-3 px-4 text-right">{getOfficialExamLabel('exam_1', lang)}</th>
+                          <th className="py-3 px-4 text-right">{getOfficialExamLabel('exam_2', lang)}</th>
+                          <th className="py-3 px-4 text-right">{getOfficialExamLabel('exam_3', lang)}</th>
+                          <th className="py-3 px-4 text-right">GPA / Grade</th>
+                          <th className="py-3 px-4 text-right">{t(lang, 'meritPosition')}</th>
+                        </>
+                      ) : (
+                        <>
+                          <th className="py-3 px-4 text-right">{getOfficialExamLabel(selectedExam, lang)}</th>
+                          <th className="py-3 px-4 text-right">GPA / Grade</th>
+                          <th className="py-3 px-4 text-center">{t(lang, 'absentLabel')}</th>
+                        </>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-stone-100">
@@ -1195,7 +1520,9 @@ export const MarksheetView: React.FC = () => {
                       const t1 = computeStudentTermSummary(st, classSubjects, 'exam_1');
                       const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
                       const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
-                      const rank = meritMap.get(st.id);
+                      const activeSummary =
+                        selectedExam === 'exam_1' ? t1 : selectedExam === 'exam_2' ? t2 : t3;
+                      const detail = meritDetailsMap.get(st.id);
 
                       return (
                         <tr
@@ -1212,27 +1539,79 @@ export const MarksheetView: React.FC = () => {
                           <td className="py-2.5 px-4 font-medium text-slate-900">
                             {st.studentNameBn || st.studentNameEn}
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {t1.scoredSubjects > 0 ? t1.totalObtained : '—'}
-                          </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
-                            {t2.scoredSubjects > 0 ? t2.totalObtained : '—'}
-                          </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
-                            {t3.scoredSubjects > 0 ? t3.totalObtained : '—'}
-                          </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                            {t3.scoredSubjects > 0 ? (
-                              <span className={t3.passed ? 'text-emerald-700 font-semibold' : 'text-rose-600 font-semibold'}>
-                                {t3.gpa.toFixed(2)} ({t3.grade})
-                              </span>
-                            ) : (
-                              '—'
-                            )}
-                          </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
-                            {rank ? `#${rank}` : '—'}
-                          </td>
+                          {selectedExam === 'exam_3' ? (
+                            <>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                                {t1.scoredSubjects > 0
+                                  ? t1.totalObtained
+                                  : t1.absentSubjects > 0
+                                  ? t(lang, 'absentLabel')
+                                  : '—'}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-700">
+                                {t2.scoredSubjects > 0
+                                  ? t2.totalObtained
+                                  : t2.absentSubjects > 0
+                                  ? t(lang, 'absentLabel')
+                                  : '—'}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                                {t3.scoredSubjects > 0
+                                  ? t3.totalObtained
+                                  : t3.absentSubjects > 0
+                                  ? t(lang, 'absentLabel')
+                                  : '—'}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                                {t3.scoredSubjects > 0 ? (
+                                  <span
+                                    className={
+                                      t3.passed
+                                        ? 'text-emerald-700 font-semibold'
+                                        : 'text-rose-600 font-semibold'
+                                    }
+                                  >
+                                    {t3.gpa.toFixed(2)} ({t3.grade})
+                                  </span>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-emerald-800">
+                                {detail ? `#${detail.rank}` : '—'}
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900">
+                                {activeSummary.scoredSubjects > 0
+                                  ? activeSummary.totalObtained
+                                  : activeSummary.absentSubjects > 0
+                                  ? t(lang, 'absentLabel')
+                                  : '—'}
+                              </td>
+                              <td className="py-2.5 px-4 text-right font-mono tabular-nums">
+                                {activeSummary.scoredSubjects > 0 ? (
+                                  <span
+                                    className={
+                                      activeSummary.passed
+                                        ? 'text-emerald-700 font-semibold'
+                                        : 'text-rose-600 font-semibold'
+                                    }
+                                  >
+                                    {activeSummary.gpa.toFixed(2)} ({activeSummary.grade})
+                                  </span>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td className="py-2.5 px-4 text-center font-mono tabular-nums text-amber-800">
+                                {activeSummary.absentSubjects > 0
+                                  ? activeSummary.absentSubjects
+                                  : '0'}
+                              </td>
+                            </>
+                          )}
                         </tr>
                       );
                     })}

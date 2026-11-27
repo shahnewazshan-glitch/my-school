@@ -4,11 +4,15 @@
   :root {
     --font-sans: 'Plus Jakarta Sans', 'Noto Sans Bengali', system-ui, -apple-system, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+    --school-primary: #047857;
+    --school-accent: #d97706;
+    --school-surface: #ffffff;
+    --school-canvas: #f6f7f5;
   }
 
   body {
     font-family: var(--font-sans);
-    background-color: #fafaf9;
+    background-color: var(--school-canvas);
     color: #0f172a;
   }
 }
