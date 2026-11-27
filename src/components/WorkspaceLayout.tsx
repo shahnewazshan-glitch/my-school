@@ -204,7 +204,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               {displaySchoolName}
             </div>
             <div className="text-xs text-emerald-100 font-mono truncate">
-              ID: {session?.schoolId} · EMIS: {school?.emisCode || OFFICIAL_EMIS_CODE}
+              ID: {session?.schoolId || '139783'} · EMIS: {school?.emisCode?.trim() || OFFICIAL_EMIS_CODE}
             </div>
           </div>
         </div>

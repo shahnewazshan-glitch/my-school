@@ -116,6 +116,7 @@ const MainAppShell: React.FC = () => {
             onNavigate={handleSelectTab}
             onOpenStudentProfile={handleOpenStudentProfile}
             onOpenApkCleanup={() => handleOpenAdminSubTab('update')}
+            onOpenSchoolSetup={(sub) => handleOpenAdminSubTab(sub)}
           />
         )}
         {activeTab === 'students' && (

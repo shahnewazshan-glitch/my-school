@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import {
   ArrowRightLeft,
+  Building2,
   Check,
   Copy,
   KeyRound,
@@ -86,6 +87,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     customFields,
     pendingChanges,
     setSyncing,
+    switchSchoolId,
   } = useApp();
 
   const [adminTab, setAdminTab] = useState<'teachers' | 'approvals' | 'setup' | 'update'>(
@@ -143,8 +145,23 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [savingAppUpdate, setSavingAppUpdate] = useState(false);
   const [copiedGeneratedLink, setCopiedGeneratedLink] = useState(false);
 
+  // Setup: School Profile, ID & EMIS
+  const [schoolNameDraft, setSchoolNameDraft] = useState(
+    () => school?.schoolName || OFFICIAL_SCHOOL_NAME_EN
+  );
+  const [emisDraft, setEmisDraft] = useState(
+    () => school?.emisCode || OFFICIAL_EMIS_CODE
+  );
+  const [upazilaDraft, setUpazilaDraft] = useState(() => school?.upazilaDistrict || '');
+  const [defaultYearDraft, setDefaultYearDraft] = useState(() =>
+    String(school?.defaultAcademicYear || new Date().getFullYear())
+  );
+  const [savingSchoolProfile, setSavingSchoolProfile] = useState(false);
+
   // Zero-Data-Loss Workspace Migration Tool State
-  const [migSourceId, setMigSourceId] = useState('');
+  const [migSourceId, setMigSourceId] = useState(() =>
+    session?.schoolId && session.schoolId !== OFFICIAL_SCHOOL_ID ? session.schoolId : ''
+  );
   const [migTargetId, setMigTargetId] = useState(OFFICIAL_SCHOOL_ID);
   const [migPassword, setMigPassword] = useState('');
   const [migrating, setMigrating] = useState(false);
@@ -153,6 +170,32 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   useEffect(() => {
     setAdminTab(initialTab);
   }, [initialTab]);
+
+  useEffect(() => {
+    if (school?.schoolName !== undefined) {
+      setSchoolNameDraft(school.schoolName || OFFICIAL_SCHOOL_NAME_EN);
+    }
+    if (school?.emisCode !== undefined) {
+      setEmisDraft(school.emisCode || OFFICIAL_EMIS_CODE);
+    }
+    if (school?.upazilaDistrict !== undefined) {
+      setUpazilaDraft(school.upazilaDistrict || '');
+    }
+    if (school?.defaultAcademicYear) {
+      setDefaultYearDraft(String(school.defaultAcademicYear));
+    }
+  }, [
+    school?.schoolName,
+    school?.emisCode,
+    school?.upazilaDistrict,
+    school?.defaultAcademicYear,
+  ]);
+
+  useEffect(() => {
+    if (session?.schoolId && session.schoolId !== OFFICIAL_SCHOOL_ID && !migSourceId) {
+      setMigSourceId(session.schoolId);
+    }
+  }, [session?.schoolId, migSourceId]);
 
   useEffect(() => {
     setExamDrafts(normalizeExamConfigs(school?.examConfigs));
@@ -662,6 +705,51 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     );
   };
 
+  const handleSaveSchoolProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const instances = getFirebaseInstances();
+    if (!instances || !session) return;
+    setSavingSchoolProfile(true);
+    setSyncing(true);
+    setBanner(null);
+    try {
+      const cleanName = clampText(schoolNameDraft, 120) || OFFICIAL_SCHOOL_NAME_EN;
+      const cleanEmis = clampText(emisDraft, 40) || OFFICIAL_EMIS_CODE;
+      const cleanUpazila = clampText(upazilaDraft, 120);
+      const parsedYear = Math.trunc(Number(defaultYearDraft));
+      const cleanYear =
+        Number.isFinite(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100
+          ? parsedYear
+          : new Date().getFullYear();
+
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', session.schoolId), {
+          schoolName: cleanName,
+          emisCode: cleanEmis,
+          upazilaDistrict: cleanUpazila,
+          defaultAcademicYear: cleanYear,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `বিদ্যালয়ের তথ্য ও EMIS কোড (${cleanEmis}) সংরক্ষণ করা হয়েছে।`
+            : `Saved School Profile & EMIS Code (${cleanEmis}).`,
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingSchoolProfile(false);
+      setSyncing(false);
+    }
+  };
+
   const handleSaveExamConfigs = async () => {
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
@@ -1022,7 +1110,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         ? (dstSchoolSnap.data() as Record<string, unknown>)
         : {};
 
-      // Merge school metadata ONLY for missing fields on target (never overwrite existing target settings)
+      // Merge school metadata safely; enforce official EMIS 91411 070 804 when migrating to 139783
       const schoolPatch: Record<string, unknown> = {
         schoolId: dstId,
         updatedAt: serverTimestamp(),
@@ -1032,10 +1120,10 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           srcSchoolData.schoolName ||
           (dstId === OFFICIAL_SCHOOL_ID ? OFFICIAL_SCHOOL_NAME_EN : dstId);
       }
-      if (!dstSchoolData.emisCode) {
-        schoolPatch.emisCode =
-          srcSchoolData.emisCode ||
-          (dstId === OFFICIAL_SCHOOL_ID ? OFFICIAL_EMIS_CODE : '');
+      if (dstId === OFFICIAL_SCHOOL_ID) {
+        schoolPatch.emisCode = OFFICIAL_EMIS_CODE;
+      } else if (!dstSchoolData.emisCode && srcSchoolData.emisCode) {
+        schoolPatch.emisCode = srcSchoolData.emisCode;
       }
       if (!dstSchoolData.upazilaDistrict && srcSchoolData.upazilaDistrict) {
         schoolPatch.upazilaDistrict = srcSchoolData.upazilaDistrict;
@@ -1085,6 +1173,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         'attendanceLogs',
         'parentNotices',
         'messages',
+        'pendingChanges',
       ] as const;
 
       const summaryParts: string[] = [];
@@ -1128,12 +1217,19 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       const reportStr = summaryParts.join(' · ');
       setMigReport(reportStr);
       setMigPassword('');
+
+      if (srcId === session.schoolId) {
+        switchSchoolId(dstId);
+      }
+
       setBanner({
         type: 'success',
         text:
           lang === 'bn'
-            ? `${srcId} থেকে ${dstId}-এ নিরাপদ মাইগ্রেশন সম্পন্ন হয়েছে (কোনো বিদ্যমান তথ্য মুছে ফেলা হয়নি)।`
-            : `Zero-data-loss migration from ${srcId} to ${dstId} complete.`,
+            ? `${srcId} থেকে ${dstId}-এ নিরাপদ মাইগ্রেশন ও EMIS (${OFFICIAL_EMIS_CODE}) সেট সম্পন্ন হয়েছে।`
+            : `Zero-data-loss migration from ${srcId} to ${dstId} complete${
+                dstId === OFFICIAL_SCHOOL_ID ? ` with EMIS ${OFFICIAL_EMIS_CODE}` : ''
+              }.`,
       });
     } catch (err) {
       setBanner({
@@ -1373,9 +1469,135 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         </div>
       )}
 
-      {/* TAB 3: Marksheet (examConfigs), Subjects & Custom Fields Setup */}
+      {/* TAB 3: School Profile, EMIS & Exam Setup */}
       {adminTab === 'setup' && (
         <div className="space-y-6">
+          {/* School Profile & EMIS Code Editor */}
+          <form
+            onSubmit={handleSaveSchoolProfile}
+            className="bg-white border border-stone-200 rounded-xl p-5 space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-stone-200">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
+                  <Building2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    {lang === 'bn'
+                      ? 'বিদ্যালয়ের তথ্য, স্কুল আইডি ও EMIS কোড'
+                      : 'School Profile, School ID & EMIS Code'}
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {lang === 'bn'
+                      ? `বর্তমান স্কুল আইডি: ${session.schoolId} · অফিসিয়াল লক্ষ্য: ${OFFICIAL_SCHOOL_ID} / EMIS: ${OFFICIAL_EMIS_CODE}`
+                      : `Active School ID: ${session.schoolId} · Official Target: ${OFFICIAL_SCHOOL_ID} / EMIS: ${OFFICIAL_EMIS_CODE}`}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {session.schoolId !== OFFICIAL_SCHOOL_ID && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMigSourceId(session.schoolId);
+                      setMigTargetId(OFFICIAL_SCHOOL_ID);
+                      setAdminTab('update');
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-lg cursor-pointer whitespace-nowrap"
+                  >
+                    <ArrowRightLeft className="w-3.5 h-3.5" />
+                    <span>
+                      {lang === 'bn'
+                        ? `আইডি ${OFFICIAL_SCHOOL_ID}-তে পরিবর্তন করুন`
+                        : `Switch ID to ${OFFICIAL_SCHOOL_ID}`}
+                    </span>
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  disabled={savingSchoolProfile}
+                  className="px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer whitespace-nowrap"
+                >
+                  {savingSchoolProfile ? t(lang, 'loading') : t(lang, 'saveChanges')}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'schoolIdLabel')}
+                </label>
+                <input
+                  type="text"
+                  readOnly
+                  value={session.schoolId}
+                  className="w-full px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-lg text-slate-700"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-700">
+                    {t(lang, 'emisCode')}
+                  </label>
+                  {emisDraft.trim() !== OFFICIAL_EMIS_CODE && (
+                    <button
+                      type="button"
+                      onClick={() => setEmisDraft(OFFICIAL_EMIS_CODE)}
+                      className="text-[11px] font-semibold text-emerald-700 hover:underline cursor-pointer"
+                    >
+                      {OFFICIAL_EMIS_CODE}
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={emisDraft}
+                  onChange={(e) => setEmisDraft(e.target.value)}
+                  placeholder={OFFICIAL_EMIS_CODE}
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-stone-300 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {lang === 'bn' ? 'বিদ্যালয়ের নাম' : 'School Name'}
+                </label>
+                <input
+                  type="text"
+                  value={schoolNameDraft}
+                  onChange={(e) => setSchoolNameDraft(e.target.value)}
+                  placeholder={OFFICIAL_SCHOOL_NAME_EN}
+                  className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  {t(lang, 'upazilaDistrict')} / {t(lang, 'academicYear')}
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={upazilaDraft}
+                    onChange={(e) => setUpazilaDraft(e.target.value)}
+                    placeholder="Upazila, District"
+                    className="w-full px-3 py-2 text-sm border border-stone-300 rounded-lg"
+                  />
+                  <input
+                    type="number"
+                    value={defaultYearDraft}
+                    onChange={(e) => setDefaultYearDraft(e.target.value)}
+                    className="w-24 px-2.5 py-2 text-sm font-mono tabular-nums border border-stone-300 rounded-lg"
+                  />
+                </div>
+              </div>
+            </div>
+          </form>
+
           {/* Exam Configs Editor */}
           <div className="bg-white border border-stone-200 rounded-xl p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-stone-200">

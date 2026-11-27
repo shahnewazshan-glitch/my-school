@@ -1036,7 +1036,7 @@ export const MarksheetView: React.FC = () => {
                 </h2>
                 <p className="text-xs text-slate-600">
                   {school?.upazilaDistrict ? `${school.upazilaDistrict} · ` : ''}
-                  EMIS: {school?.emisCode || OFFICIAL_EMIS_CODE} ·{' '}
+                  EMIS: {school?.emisCode?.trim() || OFFICIAL_EMIS_CODE} ·{' '}
                   {t(lang, 'academicYear')}: {selectedAcademicYear}
                 </p>
                 <div className="pt-1 text-sm font-semibold text-emerald-800">
