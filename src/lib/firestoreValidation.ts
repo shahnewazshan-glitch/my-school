@@ -114,19 +114,21 @@ export function sanitizeRecordMap<T extends string | number | boolean>(
   return out;
 }
 
-export function validateAndBuildStudentPayload(
+const ALLOWED_CUSTOM_FIELD_TYPES = new Set(['TEXT', 'NUMBER', 'YES_NO']);
+
+export function sanitizeCustomFieldType(val: unknown): 'TEXT' | 'NUMBER' | 'YES_NO' {
+  const s = String(val ?? 'TEXT').trim().toUpperCase();
+  if (ALLOWED_CUSTOM_FIELD_TYPES.has(s)) {
+    return s as 'TEXT' | 'NUMBER' | 'YES_NO';
+  }
+  return 'TEXT';
+}
+
+function buildValidatedStudentCoreFields(
   input: Partial<StudentDoc>,
   schoolId: string,
-  updatedByName: string,
-  existingCreatedAt?: unknown
+  updatedByName: string
 ): Record<string, unknown> {
-  const photoBase64 = (input.photoBase64 || '').trim();
-  if (photoBase64.length > FIRESTORE_LIMITS.PHOTO_BASE64_MAX_CHARS) {
-    throw new Error(
-      `Student photo exceeds Firestore limit (${photoBase64.length} > ${FIRESTORE_LIMITS.PHOTO_BASE64_MAX_CHARS} chars).`
-    );
-  }
-
   const examResults = sanitizeStringRecordMap(input.examResults || {});
   if (Object.keys(examResults).length > FIRESTORE_LIMITS.EXAM_RESULTS_MAX_KEYS) {
     throw new Error(
@@ -161,7 +163,8 @@ export function validateAndBuildStudentPayload(
     dateOfBirth: String(input.dateOfBirth ?? '').trim(),
     guardianPhone: String(input.guardianPhone ?? '').trim(),
     address: String(input.address ?? '').trim(),
-    photoBase64,
+    // Never store student photos on Firestore from web (photos remain local to teacher phones)
+    photoBase64: '',
     rollNumber: String(input.rollNumber ?? '').trim(),
     nextYearRollNumber: String(input.nextYearRollNumber ?? '').trim(),
     classLevel: String(input.classLevel || 'Class 1').trim(),
@@ -175,6 +178,40 @@ export function validateAndBuildStudentPayload(
     examResults,
     sectorNotes: sanitizeStringRecordMap(parseSectorNotesMap(input.sectorNotes)),
     lastUpdatedByName: clampText(updatedByName, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
+  };
+}
+
+export function validateAndBuildStudentCreatePayload(
+  input: Partial<StudentDoc>,
+  schoolId: string,
+  updatedByName: string
+): Record<string, unknown> {
+  return {
+    ...buildValidatedStudentCoreFields(input, schoolId, updatedByName),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export function validateAndBuildStudentUpdatePayload(
+  input: Partial<StudentDoc>,
+  schoolId: string,
+  updatedByName: string
+): Record<string, unknown> {
+  return {
+    ...buildValidatedStudentCoreFields(input, schoolId, updatedByName),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export function validateAndBuildStudentPayload(
+  input: Partial<StudentDoc>,
+  schoolId: string,
+  updatedByName: string,
+  existingCreatedAt?: unknown
+): Record<string, unknown> {
+  return {
+    ...buildValidatedStudentCoreFields(input, schoolId, updatedByName),
     createdAt: existingCreatedAt || serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -192,10 +229,28 @@ export function buildSubjectPayload(
     fields: (input.fields || []).map((f) => ({
       fieldId: String(f.fieldId || '').trim(),
       label: String(f.label || '').trim(),
-      fieldType: f.fieldType || 'TEXT',
-      maxMarks: Number.isFinite(Number(f.maxMarks)) ? Number(f.maxMarks) : 0,
+      fieldType: sanitizeCustomFieldType(f.fieldType),
+      maxMarks: Number.isFinite(Number(f.maxMarks)) ? Math.trunc(Number(f.maxMarks)) : 0,
     })),
     createdAt: existingCreatedAt || serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export function buildSubjectUpdatePayload(
+  input: Partial<SubjectDoc>,
+  schoolId: string
+): Record<string, unknown> {
+  return {
+    schoolId,
+    name: String(input.name || '').trim(),
+    gradeScope: String(input.gradeScope || 'ALL').trim(),
+    fields: (input.fields || []).map((f) => ({
+      fieldId: String(f.fieldId || '').trim(),
+      label: String(f.label || '').trim(),
+      fieldType: sanitizeCustomFieldType(f.fieldType),
+      maxMarks: Number.isFinite(Number(f.maxMarks)) ? Math.trunc(Number(f.maxMarks)) : 0,
+    })),
     updatedAt: serverTimestamp(),
   };
 }
@@ -209,9 +264,23 @@ export function buildCustomFieldPayload(
     schoolId,
     category: String(input.category || 'General').trim(),
     label: String(input.label || '').trim(),
-    fieldType: input.fieldType || 'TEXT',
+    fieldType: sanitizeCustomFieldType(input.fieldType),
     resetsYearly: Boolean(input.resetsYearly),
     createdAt: existingCreatedAt || serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export function buildCustomFieldUpdatePayload(
+  input: Partial<CustomFieldDoc>,
+  schoolId: string
+): Record<string, unknown> {
+  return {
+    schoolId,
+    category: String(input.category || 'General').trim(),
+    label: String(input.label || '').trim(),
+    fieldType: sanitizeCustomFieldType(input.fieldType),
+    resetsYearly: Boolean(input.resetsYearly),
     updatedAt: serverTimestamp(),
   };
 }
@@ -227,13 +296,33 @@ export function buildAttendancePayload(params: {
 }): Record<string, unknown> {
   return {
     schoolId: params.schoolId,
-    academicYear: Number(params.academicYear),
+    academicYear: Math.trunc(Number(params.academicYear)) || new Date().getFullYear(),
     classLevel: params.classLevel,
     dateKey: params.dateKey,
     monthKey: params.dateKey.slice(0, 7),
     statuses: params.statuses,
     markedByName: clampText(params.markedByName, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
     createdAt: params.existingCreatedAt || serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export function buildAttendanceUpdatePayload(params: {
+  schoolId: string;
+  academicYear: number;
+  classLevel: string;
+  dateKey: string;
+  statuses: Record<string, AttendanceStatus>;
+  markedByName: string;
+}): Record<string, unknown> {
+  return {
+    schoolId: params.schoolId,
+    academicYear: Math.trunc(Number(params.academicYear)) || new Date().getFullYear(),
+    classLevel: params.classLevel,
+    dateKey: params.dateKey,
+    monthKey: params.dateKey.slice(0, 7),
+    statuses: params.statuses,
+    markedByName: clampText(params.markedByName, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
     updatedAt: serverTimestamp(),
   };
 }
@@ -380,7 +469,7 @@ export function buildParentNoticePayload(
     title: String(input.title || '').trim(),
     message: String(input.message || '').trim(),
     targetClass: String(input.targetClass || 'ALL').trim(),
-    academicYear: Number(input.academicYear) || new Date().getFullYear(),
+    academicYear: Math.trunc(Number(input.academicYear)) || new Date().getFullYear(),
     sentByName: clampText(input.sentByName, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
     sentByRole: input.sentByRole || 'USER',
     createdAt: serverTimestamp(),

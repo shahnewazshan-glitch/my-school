@@ -75,6 +75,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     setSelectedClass,
     isOnline,
     hasPendingSync,
+    syncError,
+    clearSyncError,
     logout,
   } = useApp();
 
@@ -99,7 +101,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
 
   const academicYears = React.useMemo(() => {
     const base = school?.defaultAcademicYear || new Date().getFullYear();
-    const years = new Set<number>([base - 1, base, base + 1, selectedAcademicYear]);
+    const years = new Set<number>([base - 2, base - 1, base, base + 1, selectedAcademicYear]);
     for (const s of students) {
       if (s.academicYear) years.add(Number(s.academicYear));
     }
@@ -521,6 +523,23 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
         {shareToast && (
           <div className="mx-4 sm:mx-6 mt-3 px-4 py-2.5 rounded-lg bg-emerald-700 text-white text-xs font-medium text-center no-print">
             {shareToast}
+          </div>
+        )}
+
+        {syncError && (
+          <div
+            role="alert"
+            className="mx-4 sm:mx-6 mt-3 px-4 py-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-900 text-xs sm:text-sm flex items-center justify-between gap-3 no-print"
+          >
+            <span>{syncError}</span>
+            <button
+              type="button"
+              onClick={clearSyncError}
+              className="p-1 text-rose-700 hover:text-rose-950 cursor-pointer shrink-0"
+              aria-label="Dismiss sync error"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </div>
         )}
 

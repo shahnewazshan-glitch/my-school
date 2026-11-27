@@ -29,15 +29,19 @@ import {
 import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildAttendancePayload,
+  buildAttendanceUpdatePayload,
   buildCustomFieldPayload,
+  buildCustomFieldUpdatePayload,
   buildSubjectPayload,
+  buildSubjectUpdatePayload,
   clampText,
   commitBatchesInChunks,
   FIRESTORE_LIMITS,
   formatFirestoreError,
   sanitizeExamConfigs,
   sanitizeStringRecordMap,
-  validateAndBuildStudentPayload,
+  validateAndBuildStudentCreatePayload,
+  validateAndBuildStudentUpdatePayload,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
@@ -319,21 +323,42 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         const stData = (payload.student || payload) as Partial<StudentDoc>;
         const targetStudentId =
           change.entityType === 'STUDENT_UPDATE'
-            ? String(payload.id || change.targetId)
-            : undefined;
+            ? String(payload.id || change.targetId || '').trim()
+            : '';
         const existing = targetStudentId
           ? students.find((s) => s.id === targetStudentId)
           : undefined;
-        const validated = validateAndBuildStudentPayload(
-          { ...existing, ...stData },
-          schoolId,
-          updatedBy,
-          existing?.createdAt
-        );
-        const ref = targetStudentId
-          ? doc(instances.db, 'schools', schoolId, 'students', targetStudentId)
-          : doc(collection(instances.db, 'schools', schoolId, 'students'));
-        await withWriteTimeout(setDoc(ref, validated, { merge: true }));
+        if (targetStudentId) {
+          const ref = doc(instances.db, 'schools', schoolId, 'students', targetStudentId);
+          const updatePayload = validateAndBuildStudentUpdatePayload(
+            { ...existing, ...stData },
+            schoolId,
+            updatedBy
+          );
+          try {
+            await withWriteTimeout(updateDoc(ref, updatePayload));
+          } catch (updateErr) {
+            const code = (updateErr as { code?: string })?.code;
+            if (code === 'not-found') {
+              const createPayload = validateAndBuildStudentCreatePayload(
+                { ...existing, ...stData },
+                schoolId,
+                updatedBy
+              );
+              await withWriteTimeout(setDoc(ref, createPayload));
+            } else {
+              throw updateErr;
+            }
+          }
+        } else {
+          const ref = doc(collection(instances.db, 'schools', schoolId, 'students'));
+          const createPayload = validateAndBuildStudentCreatePayload(
+            stData,
+            schoolId,
+            updatedBy
+          );
+          await withWriteTimeout(setDoc(ref, createPayload));
+        }
       } else if (change.entityType === 'STUDENT_DELETE') {
         const targetId = String(payload.studentId || change.targetId);
         if (targetId) {
@@ -471,20 +496,27 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
 
           await commitBatchesInChunks(instances.db, items, (batch, item) => {
             if (item.data && typeof item.data === 'object') {
-              const existingId = item.existingId ? String(item.existingId) : undefined;
+              const existingId = item.existingId ? String(item.existingId).trim() : '';
               const existing = existingId
                 ? students.find((s) => s.id === existingId)
                 : undefined;
-              const validated = validateAndBuildStudentPayload(
-                { ...existing, ...(item.data as Partial<StudentDoc>) },
-                schoolId,
-                updatedBy,
-                existing?.createdAt
-              );
-              const ref = existingId
-                ? doc(instances.db, 'schools', schoolId, 'students', existingId)
-                : doc(collection(instances.db, 'schools', schoolId, 'students'));
-              batch.set(ref, validated, { merge: true });
+              if (existingId) {
+                const ref = doc(instances.db, 'schools', schoolId, 'students', existingId);
+                const updatePayload = validateAndBuildStudentUpdatePayload(
+                  { ...existing, ...(item.data as Partial<StudentDoc>) },
+                  schoolId,
+                  updatedBy
+                );
+                batch.update(ref, updatePayload);
+              } else {
+                const ref = doc(collection(instances.db, 'schools', schoolId, 'students'));
+                const createPayload = validateAndBuildStudentCreatePayload(
+                  item.data as Partial<StudentDoc>,
+                  schoolId,
+                  updatedBy
+                );
+                batch.set(ref, createPayload);
+              }
               return;
             }
 
@@ -537,6 +569,20 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               });
             } else if (item.fieldsPatch && typeof item.fieldsPatch === 'object') {
               const rawPatch = { ...(item.fieldsPatch as Record<string, unknown>) };
+              delete rawPatch.id;
+              delete rawPatch.createdAt;
+              delete rawPatch.schoolId;
+              if ('photoBase64' in rawPatch) {
+                rawPatch.photoBase64 = '';
+              }
+              if ('academicYear' in rawPatch) {
+                const yr = Math.trunc(Number(rawPatch.academicYear));
+                if (Number.isFinite(yr) && yr >= 2000 && yr <= 2100) {
+                  rawPatch.academicYear = yr;
+                } else {
+                  delete rawPatch.academicYear;
+                }
+              }
               for (const strKey of [
                 'studentNameBn',
                 'studentNameEn',
@@ -574,14 +620,22 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           });
         }
       } else if (change.entityType === 'SUBJECT_SAVE') {
-        const existing = change.targetId
-          ? subjects.find((s) => s.id === change.targetId)
-          : undefined;
-        const subPayload = buildSubjectPayload(payload, schoolId, existing?.createdAt);
-        const ref = change.targetId
-          ? doc(instances.db, 'schools', schoolId, 'subjects', change.targetId)
-          : doc(collection(instances.db, 'schools', schoolId, 'subjects'));
-        await withWriteTimeout(setDoc(ref, subPayload, { merge: true }));
+        if (change.targetId) {
+          const ref = doc(instances.db, 'schools', schoolId, 'subjects', change.targetId);
+          try {
+            await withWriteTimeout(updateDoc(ref, buildSubjectUpdatePayload(payload, schoolId)));
+          } catch (updateErr) {
+            const code = (updateErr as { code?: string })?.code;
+            if (code === 'not-found') {
+              await withWriteTimeout(setDoc(ref, buildSubjectPayload(payload, schoolId)));
+            } else {
+              throw updateErr;
+            }
+          }
+        } else {
+          const ref = doc(collection(instances.db, 'schools', schoolId, 'subjects'));
+          await withWriteTimeout(setDoc(ref, buildSubjectPayload(payload, schoolId)));
+        }
       } else if (change.entityType === 'SUBJECT_DELETE') {
         if (change.targetId) {
           await withWriteTimeout(
@@ -589,14 +643,24 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
           );
         }
       } else if (change.entityType === 'CUSTOM_FIELD_SAVE') {
-        const existing = change.targetId
-          ? customFields.find((c) => c.id === change.targetId)
-          : undefined;
-        const cfPayload = buildCustomFieldPayload(payload, schoolId, existing?.createdAt);
-        const ref = change.targetId
-          ? doc(instances.db, 'schools', schoolId, 'customFields', change.targetId)
-          : doc(collection(instances.db, 'schools', schoolId, 'customFields'));
-        await withWriteTimeout(setDoc(ref, cfPayload, { merge: true }));
+        if (change.targetId) {
+          const ref = doc(instances.db, 'schools', schoolId, 'customFields', change.targetId);
+          try {
+            await withWriteTimeout(
+              updateDoc(ref, buildCustomFieldUpdatePayload(payload, schoolId))
+            );
+          } catch (updateErr) {
+            const code = (updateErr as { code?: string })?.code;
+            if (code === 'not-found') {
+              await withWriteTimeout(setDoc(ref, buildCustomFieldPayload(payload, schoolId)));
+            } else {
+              throw updateErr;
+            }
+          }
+        } else {
+          const ref = doc(collection(instances.db, 'schools', schoolId, 'customFields'));
+          await withWriteTimeout(setDoc(ref, buildCustomFieldPayload(payload, schoolId)));
+        }
       } else if (change.entityType === 'CUSTOM_FIELD_DELETE') {
         if (change.targetId) {
           await withWriteTimeout(
@@ -611,21 +675,25 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             String(payload.classLevel),
             String(payload.dateKey)
           );
-        const attPayload = buildAttendancePayload({
+        const attRef = doc(instances.db, 'schools', schoolId, 'attendanceLogs', docId);
+        const attParams = {
           schoolId,
           academicYear: Number(payload.academicYear),
           classLevel: String(payload.classLevel),
           dateKey: String(payload.dateKey),
           statuses: payload.statuses || {},
           markedByName: updatedBy,
-        });
-        await withWriteTimeout(
-          setDoc(
-            doc(instances.db, 'schools', schoolId, 'attendanceLogs', docId),
-            attPayload,
-            { merge: true }
-          )
-        );
+        };
+        try {
+          await withWriteTimeout(updateDoc(attRef, buildAttendanceUpdatePayload(attParams)));
+        } catch (updateErr) {
+          const code = (updateErr as { code?: string })?.code;
+          if (code === 'not-found') {
+            await withWriteTimeout(setDoc(attRef, buildAttendancePayload(attParams)));
+          } else {
+            throw updateErr;
+          }
+        }
       } else if (change.entityType === 'EXAM_CONFIG_SAVE') {
         const configs = sanitizeExamConfigs(
           Array.isArray(payload.examConfigs) ? payload.examConfigs : payload
@@ -882,7 +950,21 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const handleDeleteSubjectDoc = async (id: string) => {
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
-    await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'subjects', id));
+    setBanner(null);
+    setSyncing(true);
+    try {
+      await withWriteTimeout(
+        deleteDoc(doc(instances.db, 'schools', session.schoolId, 'subjects', id))
+      );
+      setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const handleAddCustomField = async (e: React.FormEvent) => {
@@ -908,7 +990,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     } catch (err) {
       setBanner({
         type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${err instanceof Error ? err.message : String(err)}`,
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
       });
     }
   };
@@ -916,7 +998,21 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const handleDeleteCustomField = async (id: string) => {
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
-    await deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id));
+    setBanner(null);
+    setSyncing(true);
+    try {
+      await withWriteTimeout(
+        deleteDoc(doc(instances.db, 'schools', session.schoolId, 'customFields', id))
+      );
+      setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSyncing(false);
+    }
   };
 
   // 4. Delete ONLY Uploaded APK Chunks From Server (Preserves All Student/School Data)

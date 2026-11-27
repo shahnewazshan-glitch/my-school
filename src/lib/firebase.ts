@@ -10,7 +10,7 @@ import {
 export const DEFAULT_PROJECT_ID = 'gen-lang-client-0998631791';
 export const DEFAULT_STORAGE_BUCKET = 'gen-lang-client-0998631791.firebasestorage.app';
 export const FIRESTORE_DATABASE_ID =
-  import.meta.env.VITE_FIREBASE_DATABASE_ID ||
+  (import.meta.env.VITE_FIREBASE_DATABASE_ID || '').trim() ||
   'ai-studio-android-shikkhak-d7cf47c5-f493-43a9-a72b-7dac0283910a';
 
 export interface FirebaseEnvStatus {

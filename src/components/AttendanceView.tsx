@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { doc, setDoc } from 'firebase/firestore';
+import { doc, setDoc, updateDoc } from 'firebase/firestore';
 import { CheckCheck, Download, Save, X } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildAttendancePayload,
+  buildAttendanceUpdatePayload,
   commitBatchesInChunks,
   formatFirestoreError,
   withWriteTimeout,
@@ -192,23 +193,28 @@ export const AttendanceView: React.FC = () => {
     setSyncing(true);
     setBanner(null);
     try {
-      const payload = buildAttendancePayload({
-        schoolId: session.schoolId,
-        academicYear: selectedAcademicYear,
-        classLevel: selectedClass,
-        dateKey,
-        statuses,
-        markedByName: session.name,
-        existingCreatedAt: existingLog?.createdAt,
-      });
-
-      await withWriteTimeout(
-        setDoc(
-          doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', activeDocId),
-          payload,
-          { merge: true }
-        )
-      );
+      const targetRef = doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', activeDocId);
+      if (existingLog) {
+        const updatePayload = buildAttendanceUpdatePayload({
+          schoolId: session.schoolId,
+          academicYear: selectedAcademicYear,
+          classLevel: selectedClass,
+          dateKey,
+          statuses,
+          markedByName: session.name,
+        });
+        await withWriteTimeout(updateDoc(targetRef, updatePayload));
+      } else {
+        const createPayload = buildAttendancePayload({
+          schoolId: session.schoolId,
+          academicYear: selectedAcademicYear,
+          classLevel: selectedClass,
+          dateKey,
+          statuses,
+          markedByName: session.name,
+        });
+        await withWriteTimeout(setDoc(targetRef, createPayload));
+      }
       setBanner({ type: 'success', text: t(lang, 'savedSuccess') });
     } catch (err) {
       setBanner({
@@ -235,20 +241,28 @@ export const AttendanceView: React.FC = () => {
       await commitBatchesInChunks(instances.db, datesList, (batch, dKey) => {
         const docId = getAttendanceDocId(selectedAcademicYear, selectedClass, dKey);
         const existing = logsByDate.get(dKey);
-        const payload = buildAttendancePayload({
-          schoolId: session.schoolId,
-          academicYear: selectedAcademicYear,
-          classLevel: selectedClass,
-          dateKey: dKey,
-          statuses: matrixDrafts[dKey] || {},
-          markedByName: session.name,
-          existingCreatedAt: existing?.createdAt,
-        });
-        batch.set(
-          doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', docId),
-          payload,
-          { merge: true }
-        );
+        const targetRef = doc(instances.db, 'schools', session.schoolId, 'attendanceLogs', docId);
+        if (existing) {
+          const updatePayload = buildAttendanceUpdatePayload({
+            schoolId: session.schoolId,
+            academicYear: selectedAcademicYear,
+            classLevel: selectedClass,
+            dateKey: dKey,
+            statuses: matrixDrafts[dKey] || {},
+            markedByName: session.name,
+          });
+          batch.update(targetRef, updatePayload);
+        } else {
+          const createPayload = buildAttendancePayload({
+            schoolId: session.schoolId,
+            academicYear: selectedAcademicYear,
+            classLevel: selectedClass,
+            dateKey: dKey,
+            statuses: matrixDrafts[dKey] || {},
+            markedByName: session.name,
+          });
+          batch.set(targetRef, createPayload);
+        }
       });
       setDirtyDates(new Set());
       setMatrixDrafts({});

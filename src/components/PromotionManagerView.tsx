@@ -10,7 +10,7 @@ import {
   commitBatchesInChunks,
   FIRESTORE_LIMITS,
   formatFirestoreError,
-  validateAndBuildStudentPayload,
+  validateAndBuildStudentCreatePayload,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
@@ -316,7 +316,7 @@ export const PromotionManagerView: React.FC = () => {
           }),
           ...newRecords.map((rec) => ({
             kind: 'create' as const,
-            payload: validateAndBuildStudentPayload(rec.data, session.schoolId, session.name),
+            payload: validateAndBuildStudentCreatePayload(rec.data, session.schoolId, session.name),
           })),
         ];
 

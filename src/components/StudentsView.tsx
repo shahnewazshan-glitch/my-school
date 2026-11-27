@@ -1,5 +1,5 @@
 import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, deleteDoc, doc, setDoc } from 'firebase/firestore';
+import { addDoc, collection, deleteDoc, doc, setDoc, updateDoc } from 'firebase/firestore';
 import {
   Edit3,
   Plus,
@@ -12,7 +12,9 @@ import { getFirebaseInstances } from '../lib/firebase';
 import {
   buildPendingChangePayload,
   formatFirestoreError,
+  validateAndBuildStudentCreatePayload,
   validateAndBuildStudentPayload,
+  validateAndBuildStudentUpdatePayload,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
 import { getClassLabel, t, type Language } from '../lib/i18n';
@@ -462,17 +464,31 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       };
 
       if (isAdmin) {
-        const payload = validateAndBuildStudentPayload(
-          studentInput,
-          session.schoolId,
-          session.name,
-          editingStudent.createdAt
-        );
-        const targetRef = editingStudent.id
-          ? doc(instances.db, 'schools', session.schoolId, 'students', editingStudent.id)
-          : doc(collection(instances.db, 'schools', session.schoolId, 'students'));
-
-        await withWriteTimeout(setDoc(targetRef, payload, { merge: true }));
+        if (editingStudent.id) {
+          const updatePayload = validateAndBuildStudentUpdatePayload(
+            studentInput,
+            session.schoolId,
+            session.name
+          );
+          await withWriteTimeout(
+            updateDoc(
+              doc(instances.db, 'schools', session.schoolId, 'students', editingStudent.id),
+              updatePayload
+            )
+          );
+        } else {
+          const createPayload = validateAndBuildStudentCreatePayload(
+            studentInput,
+            session.schoolId,
+            session.name
+          );
+          await withWriteTimeout(
+            setDoc(
+              doc(collection(instances.db, 'schools', session.schoolId, 'students')),
+              createPayload
+            )
+          );
+        }
         setStatusBanner({ type: 'success', text: t(lang, 'savedSuccess') });
       } else {
         validateAndBuildStudentPayload(
@@ -487,7 +503,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         const displayName =
           editingStudent.studentNameBn || editingStudent.studentNameEn || 'Student';
 
-        // Never upload or embed photoBase64 from the web companion
+        // Never upload or embed photoBase64 or client-only id from the web companion
         const pendingStudentBody: Record<string, unknown> = {
           studentNameBn: editingStudent.studentNameBn,
           studentNameEn: editingStudent.studentNameEn,
@@ -496,19 +512,19 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           dateOfBirth: editingStudent.dateOfBirth,
           guardianPhone: editingStudent.guardianPhone,
           address: editingStudent.address,
+          photoBase64: '',
           rollNumber: editingStudent.rollNumber,
           nextYearRollNumber: editingStudent.nextYearRollNumber,
           classLevel: editingStudent.classLevel,
           section: editingStudent.section,
-          academicYear: editingStudent.academicYear,
-          totalSchoolDays: Number(editingStudent.totalSchoolDays) || 0,
-          daysPresent: Number(editingStudent.daysPresent) || 0,
+          academicYear: Math.trunc(Number(editingStudent.academicYear)) || new Date().getFullYear(),
+          totalSchoolDays: Math.max(0, Math.trunc(Number(editingStudent.totalSchoolDays) || 0)),
+          daysPresent: Math.max(0, Math.trunc(Number(editingStudent.daysPresent) || 0)),
           promotionStatus: editingStudent.promotionStatus,
           sectorNotes: mergedSectorNotes,
           customValues: editingStudent.customValues,
           subjectValues: editingStudent.subjectValues,
           schoolId: session.schoolId,
-          id: editingStudent.id || undefined,
         };
 
         const pendingDoc = buildPendingChangePayload({

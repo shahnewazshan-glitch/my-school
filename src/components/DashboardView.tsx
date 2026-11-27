@@ -37,7 +37,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     students,
     attendanceLogs,
     pendingChanges,
-    loadedModules,
     selectedAcademicYear,
     selectedClass,
     setSelectedClass,
@@ -61,9 +60,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const todayKey = getTodayDateKey();
   const todayAttDocId = getAttendanceDocId(selectedAcademicYear, selectedClass, todayKey);
-  const todayAttendance = loadedModules.attendance
-    ? attendanceLogs.find((a) => a.id === todayAttDocId)
-    : undefined;
+  const todayAttendance = attendanceLogs.find((a) => a.id === todayAttDocId);
 
   const presentTodayCount = useMemo(() => {
     if (!todayAttendance?.statuses) return 0;
@@ -76,11 +73,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       : null;
 
   const pendingCount = useMemo(
-    () =>
-      loadedModules.pending
-        ? pendingChanges.filter((c) => c.status === 'PENDING').length
-        : null,
-    [loadedModules.pending, pendingChanges]
+    () => pendingChanges.filter((c) => c.status === 'PENDING').length,
+    [pendingChanges]
   );
 
   const classSubjects = useMemo(
@@ -98,15 +92,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return CLASS_LEVELS.map((cls) => {
       const count = yearStudents.filter((s) => s.classLevel === cls).length;
       const docId = getAttendanceDocId(selectedAcademicYear, cls, todayKey);
-      const log = loadedModules.attendance
-        ? attendanceLogs.find((a) => a.id === docId)
-        : undefined;
+      const log = attendanceLogs.find((a) => a.id === docId);
       const present = log?.statuses
         ? Object.values(log.statuses).filter((v) => v === 'P' || v === 'L').length
         : null;
       return { classLevel: cls, count, present };
     });
-  }, [yearStudents, attendanceLogs, loadedModules.attendance, selectedAcademicYear, todayKey]);
+  }, [yearStudents, attendanceLogs, selectedAcademicYear, todayKey]);
 
   const schoolMeta = useMemo(() => getSchoolDisplayMeta(school, lang), [school, lang]);
   const schoolDisplayName = schoolMeta.schoolName;
@@ -252,11 +244,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="mt-1 text-xs text-slate-500 tabular-nums">
             {todayAttendance
               ? `${presentTodayCount} / ${classStudents.length} ${t(lang, 'present')}`
-              : loadedModules.attendance
-              ? todayKey
-              : lang === 'bn'
-              ? 'উপস্থিতি দেখতে ক্লিক করুন'
-              : 'Click to open register'}
+              : todayKey}
           </div>
         </div>
 
@@ -272,11 +260,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               : t(lang, 'activeSubjects')}
           </div>
           <div className="mt-2 text-3xl font-bold text-amber-700 tabular-nums">
-            {session?.role === 'ADMIN'
-              ? pendingCount !== null
-                ? pendingCount
-                : '—'
-              : classSubjects.length}
+            {session?.role === 'ADMIN' ? pendingCount : classSubjects.length}
           </div>
           <div className="mt-1 text-xs text-slate-500">
             {session?.role === 'ADMIN'

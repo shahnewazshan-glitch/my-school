@@ -3,9 +3,6 @@ import {
   addDoc,
   collection,
   doc,
-  getDocs,
-  query,
-  where,
 } from 'firebase/firestore';
 import { Download, FileSpreadsheet, Printer, Upload, X } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
@@ -18,7 +15,8 @@ import {
   FIRESTORE_LIMITS,
   formatFirestoreError,
   sanitizeStringRecordMap,
-  validateAndBuildStudentPayload,
+  validateAndBuildStudentCreatePayload,
+  validateAndBuildStudentUpdatePayload,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
 import {
@@ -54,7 +52,7 @@ import {
   readImportedDob,
   writeSafeXlsxWorkbook,
 } from '../lib/spreadsheetUtils';
-import type { AttendanceLogDoc, ExamTermId, StudentDoc } from '../types/school';
+import type { ExamTermId, StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
@@ -67,7 +65,6 @@ export const MarksheetView: React.FC = () => {
     subjects,
     customFields,
     attendanceLogs,
-    loadedModules,
     selectedAcademicYear,
     selectedClass,
     setSyncing,
@@ -542,24 +539,7 @@ export const MarksheetView: React.FC = () => {
     }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(studentRows), 'Students');
 
-    let attSource = attendanceLogs;
-    if (!loadedModules.attendance) {
-      const instances = getFirebaseInstances();
-      if (instances) {
-        const snap = await getDocs(
-          query(
-            collection(instances.db, 'schools', session.schoolId, 'attendanceLogs'),
-            where('academicYear', '==', Number(selectedAcademicYear))
-          )
-        );
-        attSource = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as Omit<AttendanceLogDoc, 'id'>),
-        }));
-      }
-    }
-
-    const attRows = attSource.map((a) => ({
+    const attRows = attendanceLogs.map((a) => ({
       docId: a.id,
       academicYear: a.academicYear,
       classLevel: a.classLevel,
@@ -951,8 +931,8 @@ export const MarksheetView: React.FC = () => {
             classLevel: cls,
             section: nextSection,
             academicYear: yr,
-            totalSchoolDays: row.totalSchoolDays !== undefined && row.totalSchoolDays !== '' ? Number(row.totalSchoolDays) || 0 : existingMatch?.totalSchoolDays || 0,
-            daysPresent: row.daysPresent !== undefined && row.daysPresent !== '' ? Number(row.daysPresent) || 0 : existingMatch?.daysPresent || 0,
+            totalSchoolDays: row.totalSchoolDays !== undefined && row.totalSchoolDays !== '' ? Math.max(0, Math.trunc(Number(row.totalSchoolDays) || 0)) : Math.max(0, Math.trunc(Number(existingMatch?.totalSchoolDays) || 0)),
+            daysPresent: row.daysPresent !== undefined && row.daysPresent !== '' ? Math.max(0, Math.trunc(Number(row.daysPresent) || 0)) : Math.max(0, Math.trunc(Number(existingMatch?.daysPresent) || 0)),
             promotionStatus: nextPromo,
             sectorNotes: sanitizedSectorNotes,
             customValues: sanitizedCustom,
@@ -973,16 +953,27 @@ export const MarksheetView: React.FC = () => {
           const existing = item.existingId
             ? students.find((s) => s.id === item.existingId)
             : undefined;
-          const payload = validateAndBuildStudentPayload(
-            { ...existing, ...item.data },
-            session.schoolId,
-            session.name,
-            existing?.createdAt
-          );
-          const targetRef = item.existingId
-            ? doc(instances.db, 'schools', session.schoolId, 'students', item.existingId)
-            : doc(collection(instances.db, 'schools', session.schoolId, 'students'));
-          batch.set(targetRef, payload, { merge: true });
+          if (item.existingId) {
+            const updatePayload = validateAndBuildStudentUpdatePayload(
+              { ...existing, ...item.data },
+              session.schoolId,
+              session.name
+            );
+            batch.update(
+              doc(instances.db, 'schools', session.schoolId, 'students', item.existingId),
+              updatePayload
+            );
+          } else {
+            const createPayload = validateAndBuildStudentCreatePayload(
+              item.data,
+              session.schoolId,
+              session.name
+            );
+            batch.set(
+              doc(collection(instances.db, 'schools', session.schoolId, 'students')),
+              createPayload
+            );
+          }
         });
         setImportBanner({
           type: 'success',

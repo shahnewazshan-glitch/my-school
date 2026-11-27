@@ -10,6 +10,7 @@ import {
   where,
 } from 'firebase/firestore';
 import { getFirebaseInstances } from '../lib/firebase';
+import { formatFirestoreError } from '../lib/firestoreValidation';
 import { t, type Language } from '../lib/i18n';
 import {
   compareRollNumbers,
@@ -58,6 +59,8 @@ interface AppContextValue {
   isOnline: boolean;
   hasPendingSync: boolean;
   setSyncing: (active: boolean) => void;
+  syncError: string | null;
+  clearSyncError: () => void;
   dataLoading: boolean;
   authMessage: { type: 'error' | 'revoked'; text: string } | null;
   clearAuthMessage: () => void;
@@ -112,6 +115,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const [hasPendingSync, setHasPendingSync] = useState<boolean>(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [dataLoading, setDataLoading] = useState<boolean>(false);
   const [authMessage, setAuthMessage] = useState<{ type: 'error' | 'revoked'; text: string } | null>(
     null
@@ -131,6 +135,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const clearAuthMessage = useCallback(() => setAuthMessage(null), []);
+  const clearSyncError = useCallback(() => setSyncError(null), []);
 
   const setSyncing = useCallback((active: boolean) => {
     if (syncSafetyTimerRef.current) {
@@ -176,6 +181,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       syncSafetyTimerRef.current = null;
     }
     setHasPendingSync(false);
+    setSyncError(null);
     try {
       localStorage.removeItem(SESSION_STORAGE_KEY);
     } catch {
@@ -271,7 +277,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [lang]
   );
 
-  // Core startup listeners: ONLY school, students, subjects, customFields (NEVER appReleaseChunks)
+  // Live listeners for School Doc, Subjects, CustomFields, ParentNotices, Messages, and PendingChanges (Admin)
   useEffect(() => {
     const instances = getFirebaseInstances();
     if (!instances || !session) return;
@@ -338,32 +344,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setSchool(normalizedSchool);
 
         if (!yearInitializedRef.current && normalizedSchool.defaultAcademicYear) {
-          setSelectedAcademicYear(Number(normalizedSchool.defaultAcademicYear));
+          setSelectedAcademicYear(Math.trunc(Number(normalizedSchool.defaultAcademicYear)));
           yearInitializedRef.current = true;
         }
         setDataLoading(false);
       },
       (err) => {
-        console.error('School snapshot error:', err);
+        setSyncError(`School sync error: ${formatFirestoreError(err)}`);
         setDataLoading(false);
       }
     );
 
-    // 2. Students
-    const unsubStudents = onSnapshot(
-      collection(db, 'schools', schoolId, 'students'),
-      (snap) => {
-        const list: StudentDoc[] = snap.docs.map((d) => ({
-          ...(d.data() as Omit<StudentDoc, 'id'>),
-          id: d.id,
-        }));
-        list.sort(compareRollNumbers);
-        setStudents(list);
-      },
-      (err) => console.error('Students snapshot error:', err)
-    );
-
-    // 3. Subjects
+    // 2. Subjects (live)
     const unsubSubjects = onSnapshot(
       collection(db, 'schools', schoolId, 'subjects'),
       (snap) => {
@@ -374,10 +366,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         list.sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
         setSubjects(list);
       },
-      (err) => console.error('Subjects snapshot error:', err)
+      (err) => setSyncError(`Subjects sync error: ${formatFirestoreError(err)}`)
     );
 
-    // 4. Custom Fields
+    // 3. Custom Fields (live)
     const unsubCustomFields = onSnapshot(
       collection(db, 'schools', schoolId, 'customFields'),
       (snap) => {
@@ -388,51 +380,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         list.sort((a, b) => (a.category || '').localeCompare(b.category || ''));
         setCustomFields(list);
       },
-      (err) => console.error('CustomFields snapshot error:', err)
+      (err) => setSyncError(`Custom fields sync error: ${formatFirestoreError(err)}`)
     );
 
-    return () => {
-      unsubSchool();
-      unsubStudents();
-      unsubSubjects();
-      unsubCustomFields();
-    };
-  }, [session?.schoolId, session?.phoneNumber, session?.deviceId, session?.passwordHash, clearSessionState, lang]);
-
-  // 5. Lazy Pending Changes (only when Admin Panel / Approvals is opened)
-  useEffect(() => {
-    const instances = getFirebaseInstances();
-    if (!instances || !session || !loadedModules.pending || session.role !== 'ADMIN') return;
-
-    const q = query(
-      collection(instances.db, 'schools', session.schoolId, 'pendingChanges'),
-      orderBy('createdAt', 'desc'),
-      limit(100)
-    );
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list: PendingChangeDoc[] = snap.docs.map((d) => ({
-          ...(d.data() as Omit<PendingChangeDoc, 'id'>),
-          id: d.id,
-        }));
-        setPendingChanges(list);
-      },
-      (err) => console.error('PendingChanges snapshot error:', err)
-    );
-    return () => unsub();
-  }, [session?.schoolId, session?.role, loadedModules.pending]);
-
-  // 6 & 7. Lazy Parent Notices & Teacher Chat (latest 30 messages, only when Comms tab opens)
-  useEffect(() => {
-    const instances = getFirebaseInstances();
-    if (!instances || !session || !loadedModules.comms) return;
-
-    const schoolId = session.schoolId;
-
+    // 4. Parent Notices (live)
     const unsubNotices = onSnapshot(
       query(
-        collection(instances.db, 'schools', schoolId, 'parentNotices'),
+        collection(db, 'schools', schoolId, 'parentNotices'),
         orderBy('createdAt', 'desc'),
         limit(50)
       ),
@@ -442,15 +396,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           id: d.id,
         }));
         setParentNotices(list);
+        setLoadedModules((prev) => (prev.comms ? prev : { ...prev, comms: true }));
       },
-      (err) => console.error('ParentNotices snapshot error:', err)
+      (err) => setSyncError(`Parent notices sync error: ${formatFirestoreError(err)}`)
     );
 
+    // 5. Teacher Messages (live)
     const unsubMessages = onSnapshot(
       query(
-        collection(instances.db, 'schools', schoolId, 'messages'),
+        collection(db, 'schools', schoolId, 'messages'),
         orderBy('createdAt', 'desc'),
-        limit(30)
+        limit(50)
       ),
       (snap) => {
         const list: MessageDoc[] = snap.docs
@@ -460,38 +416,97 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }))
           .reverse();
         setMessages(list);
+        setLoadedModules((prev) => (prev.comms ? prev : { ...prev, comms: true }));
       },
-      (err) => console.error('Messages snapshot error:', err)
+      (err) => setSyncError(`Messages sync error: ${formatFirestoreError(err)}`)
     );
+
+    // 6. Pending Changes (live for Admin so approvals badge & list update simultaneously)
+    let unsubPending: (() => void) | undefined;
+    if (session.role === 'ADMIN') {
+      unsubPending = onSnapshot(
+        query(
+          collection(db, 'schools', schoolId, 'pendingChanges'),
+          orderBy('createdAt', 'desc'),
+          limit(100)
+        ),
+        (snap) => {
+          const list: PendingChangeDoc[] = snap.docs.map((d) => ({
+            ...(d.data() as Omit<PendingChangeDoc, 'id'>),
+            id: d.id,
+          }));
+          setPendingChanges(list);
+          setLoadedModules((prev) => (prev.pending ? prev : { ...prev, pending: true }));
+        },
+        (err) => setSyncError(`Pending changes sync error: ${formatFirestoreError(err)}`)
+      );
+    } else {
+      setPendingChanges([]);
+    }
 
     return () => {
+      unsubSchool();
+      unsubSubjects();
+      unsubCustomFields();
       unsubNotices();
       unsubMessages();
+      if (unsubPending) unsubPending();
     };
-  }, [session?.schoolId, loadedModules.comms]);
+  }, [
+    session?.schoolId,
+    session?.phoneNumber,
+    session?.deviceId,
+    session?.passwordHash,
+    session?.role,
+    clearSessionState,
+    lang,
+  ]);
 
-  // 8. Lazy Attendance Logs scoped to selectedAcademicYear (only when Attendance / Student Attendance tab / Backup opens)
+  // 7 & 8. Live Students & Attendance Logs filtered strictly by integer selectedAcademicYear
   useEffect(() => {
     const instances = getFirebaseInstances();
-    if (!instances || !session || !loadedModules.attendance) return;
+    if (!instances || !session) return;
 
-    const q = query(
-      collection(instances.db, 'schools', session.schoolId, 'attendanceLogs'),
-      where('academicYear', '==', selectedAcademicYear)
+    const yearInt = Math.trunc(Number(selectedAcademicYear)) || new Date().getFullYear();
+    const schoolId = session.schoolId;
+
+    const unsubStudents = onSnapshot(
+      query(
+        collection(instances.db, 'schools', schoolId, 'students'),
+        where('academicYear', '==', yearInt)
+      ),
+      (snap) => {
+        const list: StudentDoc[] = snap.docs.map((d) => ({
+          ...(d.data() as Omit<StudentDoc, 'id'>),
+          id: d.id,
+        }));
+        list.sort(compareRollNumbers);
+        setStudents(list);
+      },
+      (err) => setSyncError(`Students sync error: ${formatFirestoreError(err)}`)
     );
-    const unsub = onSnapshot(
-      q,
+
+    const unsubAttendance = onSnapshot(
+      query(
+        collection(instances.db, 'schools', schoolId, 'attendanceLogs'),
+        where('academicYear', '==', yearInt)
+      ),
       (snap) => {
         const list: AttendanceLogDoc[] = snap.docs.map((d) => ({
           ...(d.data() as Omit<AttendanceLogDoc, 'id'>),
           id: d.id,
         }));
         setAttendanceLogs(list);
+        setLoadedModules((prev) => (prev.attendance ? prev : { ...prev, attendance: true }));
       },
-      (err) => console.error('Attendance snapshot error:', err)
+      (err) => setSyncError(`Attendance sync error: ${formatFirestoreError(err)}`)
     );
-    return () => unsub();
-  }, [session?.schoolId, selectedAcademicYear, loadedModules.attendance]);
+
+    return () => {
+      unsubStudents();
+      unsubAttendance();
+    };
+  }, [session?.schoolId, selectedAcademicYear]);
 
   const value = useMemo<AppContextValue>(
     () => ({
@@ -515,6 +530,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       isOnline,
       hasPendingSync,
       setSyncing,
+      syncError,
+      clearSyncError,
       dataLoading,
       authMessage,
       clearAuthMessage,
@@ -540,6 +557,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       isOnline,
       hasPendingSync,
       setSyncing,
+      syncError,
+      clearSyncError,
       dataLoading,
       authMessage,
       clearAuthMessage,
