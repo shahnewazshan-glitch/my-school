@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { Eye, EyeOff, Globe, Lock, ShieldAlert, GraduationCap } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
 import { t } from '../lib/i18n';
-import { normalizeBdPhone, normalizeSchoolId, OFFICIAL_SCHOOL_ID } from '../lib/schoolUtils';
+import { normalizeBdPhone, normalizeSchoolId } from '../lib/schoolUtils';
 
 export const LoginScreen: React.FC = () => {
   const { lang, setLang, login, authMessage, clearAuthMessage } = useApp();
-  const [schoolIdRaw, setSchoolIdRaw] = useState(OFFICIAL_SCHOOL_ID);
+  const [schoolIdRaw, setSchoolIdRaw] = useState('');
   const [phoneRaw, setPhoneRaw] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);

@@ -6,10 +6,96 @@ import type {
 } from '../types/school';
 
 export const OFFICIAL_SCHOOL_ID = '139783';
+export const OFFICIAL_DISPLAY_SCHOOL_CODE = '139783';
 export const OFFICIAL_EMIS_CODE = '91411 070 804';
 export const OFFICIAL_SCHOOL_NAME_EN = 'Sreepur Masjid Bari GPS';
 export const OFFICIAL_SCHOOL_NAME_BN = 'শ্রীপুর মসজিদ বাড়ি সরকারি প্রাথমিক বিদ্যালয়';
 export const MANUAL_MERIT_KEY = '__manualMeritPos';
+export const PROFILE_OVERVIEW_NOTE_KEY = 'profile_overview';
+
+export function getSchoolDisplayMeta(
+  school: { displaySchoolCode?: string; emisCode?: string; schoolName?: string } | null | undefined,
+  lang: 'en' | 'bn' = 'en'
+): { displaySchoolCode: string; emisCode: string; schoolName: string } {
+  return {
+    displaySchoolCode: school?.displaySchoolCode?.trim() || OFFICIAL_DISPLAY_SCHOOL_CODE,
+    emisCode: school?.emisCode?.trim() || OFFICIAL_EMIS_CODE,
+    schoolName:
+      school?.schoolName?.trim() ||
+      (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN),
+  };
+}
+
+/**
+ * Safely parse student.sectorNotes whether stored as a Firestore Map<String, String>
+ * or as a legacy plain/multi-line string, preserving profile_overview,
+ * govt_stipend_<year>, govt_cub_<year>, and any custom sector keys.
+ */
+export function parseSectorNotesMap(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw) return out;
+
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (v === undefined || v === null) continue;
+      const key = String(k).trim();
+      const val = String(v).trim();
+      if (key && val) {
+        out[key] = val;
+      }
+    }
+    return out;
+  }
+
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return out;
+    const lines = trimmed.split(/\r?\n/);
+    const overviewLines: string[] = [];
+    for (const line of lines) {
+      const m = line.match(
+        /^(profile_overview|govt_stipend_\d{4}|govt_cub_\d{4}|sector_[a-zA-Z0-9_-]+)\s*:\s*(.*)$/
+      );
+      if (m) {
+        const key = m[1].trim();
+        const val = m[2].trim();
+        if (val) out[key] = val;
+      } else {
+        overviewLines.push(line);
+      }
+    }
+    const remainingOverview = overviewLines.join('\n').trim();
+    if (remainingOverview && !out[PROFILE_OVERVIEW_NOTE_KEY]) {
+      out[PROFILE_OVERVIEW_NOTE_KEY] = remainingOverview;
+    }
+    return out;
+  }
+
+  return out;
+}
+
+export function readProfileOverviewNote(raw: unknown): string {
+  const map = parseSectorNotesMap(raw);
+  return map[PROFILE_OVERVIEW_NOTE_KEY] || '';
+}
+
+export function buildMergedSectorNotes(
+  existingRaw: unknown,
+  patch: Record<string, string>
+): Record<string, string> {
+  const merged = parseSectorNotesMap(existingRaw);
+  for (const [rawKey, rawVal] of Object.entries(patch)) {
+    const key = String(rawKey).trim();
+    if (!key) continue;
+    const val = String(rawVal ?? '').trim();
+    if (!val) {
+      delete merged[key];
+    } else {
+      merged[key] = val;
+    }
+  }
+  return merged;
+}
 
 export const TERM_ORDER: ExamTermId[] = ['exam_1', 'exam_2', 'exam_3'];
 

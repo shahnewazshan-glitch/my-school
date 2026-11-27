@@ -21,6 +21,7 @@ import {
   getClassSubjectsForMarksheet,
   getOfficialExamLabel,
   normalizeExamConfigs,
+  parseSectorNotesMap,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
@@ -277,7 +278,7 @@ export const PromotionManagerView: React.FC = () => {
           dateOfBirth: st.dateOfBirth,
           guardianPhone: st.guardianPhone,
           address: st.address,
-          photoBase64: isAdmin ? st.photoBase64 : '',
+          photoBase64: '',
           rollNumber: d.nextYearRollNumber || st.rollNumber,
           nextYearRollNumber: '',
           classLevel: targetClass,
@@ -289,7 +290,7 @@ export const PromotionManagerView: React.FC = () => {
           customValues: nextCustomValues,
           subjectValues: {},
           examResults: {},
-          sectorNotes: st.sectorNotes || '',
+          sectorNotes: parseSectorNotesMap(st.sectorNotes),
         };
 
         newRecords.push({

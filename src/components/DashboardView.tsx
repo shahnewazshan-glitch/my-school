@@ -12,12 +12,9 @@ import {
   formatPhotoSrc,
   getAttendanceDocId,
   getClassSubjectsForMarksheet,
+  getSchoolDisplayMeta,
   getTodayDateKey,
   matchesStudentSearch,
-  OFFICIAL_EMIS_CODE,
-  OFFICIAL_SCHOOL_ID,
-  OFFICIAL_SCHOOL_NAME_BN,
-  OFFICIAL_SCHOOL_NAME_EN,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS } from '../types/school';
 import type { NavTab } from './WorkspaceLayout';
@@ -26,14 +23,12 @@ interface DashboardViewProps {
   onNavigate: (tab: NavTab) => void;
   onOpenStudentProfile: (studentId: string) => void;
   onOpenApkCleanup?: () => void;
-  onOpenSchoolSetup?: (tab: 'setup' | 'update') => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
   onOpenStudentProfile,
   onOpenApkCleanup,
-  onOpenSchoolSetup,
 }) => {
   const {
     lang,
@@ -53,12 +48,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
   const showLegacyApkCleanupBanner =
     session?.role === 'ADMIN' && hasLegacyApkMetadata(school) && Boolean(onOpenApkCleanup);
-
-  const needsSchoolIdOrEmisUpdate =
-    session?.role === 'ADMIN' &&
-    Boolean(onOpenSchoolSetup) &&
-    (session.schoolId !== OFFICIAL_SCHOOL_ID ||
-      (school?.emisCode || '').trim() !== OFFICIAL_EMIS_CODE);
 
   const yearStudents = useMemo(
     () => students.filter((s) => Number(s.academicYear) === Number(selectedAcademicYear)),
@@ -119,10 +108,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     });
   }, [yearStudents, attendanceLogs, loadedModules.attendance, selectedAcademicYear, todayKey]);
 
-  const schoolDisplayName =
-    school?.schoolName?.trim() ||
-    (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
-  const emisDisplay = school?.emisCode?.trim() || OFFICIAL_EMIS_CODE;
+  const schoolMeta = useMemo(() => getSchoolDisplayMeta(school, lang), [school, lang]);
+  const schoolDisplayName = schoolMeta.schoolName;
+  const emisDisplay = schoolMeta.emisCode;
 
   const handleDropdownNavigate = (tab: string) => {
     if (!tab) return;
@@ -141,9 +129,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </h2>
             <div className="mt-1.5 flex flex-wrap items-center justify-center md:justify-start gap-x-3 gap-y-1 text-sm text-slate-600">
               <span>
-                {t(lang, 'schoolIdLabel')}:{' '}
+                {t(lang, 'displaySchoolCodeLabel')}:{' '}
                 <span className="font-mono font-semibold text-emerald-800">
-                  {session?.schoolId}
+                  {schoolMeta.displaySchoolCode}
                 </span>
               </span>
               <span aria-hidden="true">·</span>
@@ -166,8 +154,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          {/* Clean Dropdown Menu instead of cluttered buttons */}
+          {/* Clean Dropdown Menu + Govt Portal Quick Access */}
           <div className="flex flex-wrap items-center justify-center md:justify-end gap-2.5">
+            <button
+              type="button"
+              onClick={() => onNavigate('govt-portal')}
+              className="px-3.5 py-2 text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-950 border border-amber-300 rounded-lg cursor-pointer whitespace-nowrap"
+            >
+              {t(lang, 'navGovtPortal')}
+            </button>
+
             <div className="relative min-w-[200px]">
               <select
                 aria-label={t(lang, 'quickActions')}
@@ -177,6 +173,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               >
                 <option value="">{t(lang, 'quickActions')} ▾</option>
                 <option value="students">{t(lang, 'navStudents')}</option>
+                <option value="govt-portal">{t(lang, 'navGovtPortal')}</option>
                 <option value="attendance">{t(lang, 'navAttendance')}</option>
                 <option value="batch-marks">{t(lang, 'navBatchMarks')}</option>
                 <option value="marksheet">{t(lang, 'navMarksheet')}</option>
@@ -193,43 +190,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </section>
-
-      {needsSchoolIdOrEmisUpdate && (
-        <section className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="space-y-0.5">
-            <h3 className="text-sm font-semibold text-emerald-950">
-              {lang === 'bn'
-                ? `স্কুল আইডি (${OFFICIAL_SCHOOL_ID}) ও EMIS (${OFFICIAL_EMIS_CODE}) আপডেট করুন`
-                : `Update School ID to ${OFFICIAL_SCHOOL_ID} & EMIS to ${OFFICIAL_EMIS_CODE}`}
-            </h3>
-            <p className="text-xs text-emerald-900/90">
-              {lang === 'bn'
-                ? `বর্তমান আইডি: ${session?.schoolId} · EMIS: ${emisDisplay}। কোনো তথ্য না হারিয়ে নিরাপদে পরিবর্তন করুন।`
-                : `Currently connected as ID ${session?.schoolId} · EMIS ${emisDisplay}. Update safely with zero data loss.`}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() =>
-              onOpenSchoolSetup?.(
-                session?.schoolId !== OFFICIAL_SCHOOL_ID ? 'update' : 'setup'
-              )
-            }
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg cursor-pointer whitespace-nowrap shrink-0 self-start sm:self-auto"
-          >
-            <span>
-              {session?.schoolId !== OFFICIAL_SCHOOL_ID
-                ? lang === 'bn'
-                  ? `আইডি ${OFFICIAL_SCHOOL_ID}-এ যান`
-                  : `Migrate to ${OFFICIAL_SCHOOL_ID}`
-                : lang === 'bn'
-                ? 'EMIS সেট করুন'
-                : 'Set Official EMIS'}
-            </span>
-            <ArrowRight className="w-3.5 h-3.5" />
-          </button>
-        </section>
-      )}
 
       {/* One-time Admin Notice when legacy APK metadata/chunks remain on server */}
       {showLegacyApkCleanupBanner && (

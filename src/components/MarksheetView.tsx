@@ -21,8 +21,14 @@ import {
   validateAndBuildStudentPayload,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
+import {
+  getTargetCustomFieldKey,
+  GOVT_PRESET_FIELDS,
+  resolveStudentPortalData,
+} from '../lib/govtPortal';
 import { getClassLabel, t } from '../lib/i18n';
 import {
+  buildMergedSectorNotes,
   calculateSubjectGrade,
   computeClassMeritDetails,
   computeStudentTermSummary,
@@ -31,14 +37,23 @@ import {
   getClassSubjectsForMarksheet,
   getExamAbsentKey,
   getOfficialExamLabel,
+  getSchoolDisplayMeta,
   getTermSubjectScore,
   isAbsentMarkerValue,
   normalizeExamConfigs,
-  OFFICIAL_EMIS_CODE,
-  OFFICIAL_SCHOOL_NAME_BN,
-  OFFICIAL_SCHOOL_NAME_EN,
+  parseSectorNotesMap,
   TERM_ORDER,
 } from '../lib/schoolUtils';
+import {
+  downloadSafeCsvWithBom,
+  expandScientificAndStripDotZero,
+  getRowCellByAliases,
+  normalizeImportedDigitId,
+  normalizeImportedPhone,
+  readImportedBrn,
+  readImportedDob,
+  writeSafeXlsxWorkbook,
+} from '../lib/spreadsheetUtils';
 import type { AttendanceLogDoc, ExamTermId, StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
@@ -219,9 +234,11 @@ export const MarksheetView: React.FC = () => {
     [activeStudent, classSubjects, meritDetailsMap, selectedExam]
   );
 
-  const schoolTitle =
-    school?.schoolName?.trim() ||
-    (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+  const schoolMeta = useMemo(
+    () => getSchoolDisplayMeta(school, lang),
+    [school, lang]
+  );
+  const schoolTitle = schoolMeta.schoolName;
 
   // Export single-exam (1st or 2nd) or full academic year combined (3rd) marksheet
   const exportMarksheetFile = async (format: 'xlsx' | 'csv') => {
@@ -264,7 +281,11 @@ export const MarksheetView: React.FC = () => {
           : '',
       ];
       const aoa = [
-        [`${schoolTitle} — ${examTitle}`],
+        [
+          `${schoolTitle} — ${examTitle}`,
+          `School Code: ${schoolMeta.displaySchoolCode}`,
+          `EMIS: ${schoolMeta.emisCode}`,
+        ],
         [
           `Student: ${activeStudent.studentNameBn || activeStudent.studentNameEn}`,
           `Roll: ${activeStudent.rollNumber}`,
@@ -277,11 +298,15 @@ export const MarksheetView: React.FC = () => {
         ...bodyRows,
         totalsRow,
       ];
+      const filename = `Marksheet_${selectedExam}_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
+      if (format === 'csv') {
+        downloadSafeCsvWithBom(aoa[0].map(String), aoa.slice(1), filename);
+        return;
+      }
       const ws = XLSX.utils.aoa_to_sheet(aoa);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, selectedExam === 'exam_1' ? '1st Term' : '2nd Term');
-      const filename = `Marksheet_${selectedExam}_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
-      XLSX.writeFile(wb, filename, { bookType: format });
+      writeSafeXlsxWorkbook(XLSX, wb, filename);
       return;
     }
 
@@ -345,7 +370,11 @@ export const MarksheetView: React.FC = () => {
     ];
 
     const aoa = [
-      [`${schoolTitle} — ${examTitle}`],
+      [
+        `${schoolTitle} — ${examTitle}`,
+        `School Code: ${schoolMeta.displaySchoolCode}`,
+        `EMIS: ${schoolMeta.emisCode}`,
+      ],
       [
         `Student: ${activeStudent.studentNameBn || activeStudent.studentNameEn}`,
         `Roll: ${activeStudent.rollNumber}`,
@@ -361,6 +390,12 @@ export const MarksheetView: React.FC = () => {
       totalsRow,
     ];
 
+    const filename = `Marksheet_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
+    if (format === 'csv') {
+      downloadSafeCsvWithBom(aoa[0].map(String), aoa.slice(1), filename);
+      return;
+    }
+
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!merges'] = [
       { s: { r: 3, c: 0 }, e: { r: 4, c: 0 } },
@@ -373,12 +408,12 @@ export const MarksheetView: React.FC = () => {
 
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Combined Marksheet');
-    const filename = `Marksheet_${selectedClass.replace(/\s+/g, '_')}_Roll_${safeRoll}_${selectedAcademicYear}.${format}`;
-    XLSX.writeFile(wb, filename, { bookType: format });
+    writeSafeXlsxWorkbook(XLSX, wb, filename);
   };
 
   // Export class tabulation + student roster for active exam (single exam for 1st/2nd, combined for 3rd)
   const exportClassRosterOrTabulation = async (format: 'xlsx' | 'csv') => {
+    if (classStudents.length === 0) return;
     const XLSX = await import('xlsx');
     const isCombined = selectedExam === 'exam_3';
     const rows = classStudents.map((st) => {
@@ -386,14 +421,30 @@ export const MarksheetView: React.FC = () => {
       const t2 = computeStudentTermSummary(st, classSubjects, 'exam_2');
       const t3 = computeStudentTermSummary(st, classSubjects, 'exam_3');
       const meritDetail = meritDetailsMap.get(st.id);
+      const portalData = resolveStudentPortalData(
+        st,
+        customFields,
+        Number(st.academicYear) || selectedAcademicYear
+      );
 
       const base: Record<string, string | number> = {
-        rollNumber: st.rollNumber,
+        schoolCode: schoolMeta.displaySchoolCode,
+        emisCode: schoolMeta.emisCode,
+        rollNumber: String(st.rollNumber ?? ''),
         studentNameBn: st.studentNameBn || '',
         studentNameEn: st.studentNameEn || '',
         fatherNameEn: st.fatherNameEn || '',
         motherNameEn: st.motherNameEn || '',
         dateOfBirth: st.dateOfBirth || '',
+        brn: portalData.brn || '',
+        gender: portalData.gender || '',
+        religion: portalData.religion || '',
+        bloodGroup: portalData.bloodGroup || '',
+        fatherNid: portalData.fatherNid || '',
+        motherNid: portalData.motherNid || '',
+        mfsNumber: portalData.mfsNumber || '',
+        mfsProvider: portalData.mfsProvider || '',
+        cubPack: portalData.cubPack || '',
         guardianPhone: st.guardianPhone || '',
         address: st.address || '',
         classLevel: st.classLevel,
@@ -441,12 +492,22 @@ export const MarksheetView: React.FC = () => {
       return base;
     });
 
+    const suffix = isCombined ? 'Roster' : selectedExam;
+    const filename = `${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}_${suffix}.${format}`;
+    if (format === 'csv') {
+      const headers = Object.keys(rows[0] || {});
+      downloadSafeCsvWithBom(
+        headers,
+        rows.map((r) => headers.map((h) => r[h] ?? '')),
+        filename
+      );
+      return;
+    }
+
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, isCombined ? 'Combined Tabulation' : selectedExam);
-    const suffix = isCombined ? 'Roster' : selectedExam;
-    const filename = `${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}_${suffix}.${format}`;
-    XLSX.writeFile(wb, filename, { bookType: format });
+    writeSafeXlsxWorkbook(XLSX, wb, filename);
   };
 
   const exportFullSchoolBackup = async () => {
@@ -457,11 +518,13 @@ export const MarksheetView: React.FC = () => {
     const studentRows = students.map((st) => ({
       studentId: st.id,
       schoolId: st.schoolId,
+      displaySchoolCode: schoolMeta.displaySchoolCode,
+      emisCode: schoolMeta.emisCode,
       academicYear: st.academicYear,
       classLevel: st.classLevel,
       section: st.section || '',
-      rollNumber: st.rollNumber,
-      nextYearRollNumber: st.nextYearRollNumber || '',
+      rollNumber: String(st.rollNumber ?? ''),
+      nextYearRollNumber: String(st.nextYearRollNumber ?? ''),
       studentNameBn: st.studentNameBn || '',
       studentNameEn: st.studentNameEn || '',
       fatherNameEn: st.fatherNameEn || '',
@@ -472,7 +535,7 @@ export const MarksheetView: React.FC = () => {
       totalSchoolDays: st.totalSchoolDays || 0,
       daysPresent: st.daysPresent || 0,
       promotionStatus: st.promotionStatus || '',
-      sectorNotes: st.sectorNotes || '',
+      sectorNotesJson: JSON.stringify(parseSectorNotesMap(st.sectorNotes)),
       customValuesJson: JSON.stringify(st.customValues || {}),
       subjectValuesJson: JSON.stringify(st.subjectValues || {}),
       examResultsJson: JSON.stringify(st.examResults || {}),
@@ -524,9 +587,10 @@ export const MarksheetView: React.FC = () => {
     }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(cfRows), 'CustomFields');
 
-    XLSX.writeFile(
+    writeSafeXlsxWorkbook(
+      XLSX,
       wb,
-      `${session.schoolId || 'School'}_Backup_${selectedAcademicYear}.xlsx`
+      `${schoolMeta.displaySchoolCode || session.schoolId || 'School'}_Backup_${selectedAcademicYear}.xlsx`
     );
   };
 
@@ -548,6 +612,7 @@ export const MarksheetView: React.FC = () => {
       const firstSheet = wb.Sheets[wb.SheetNames[0]];
       const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, {
         defval: '',
+        raw: true,
       });
 
       if (rawRows.length === 0) {
@@ -562,13 +627,39 @@ export const MarksheetView: React.FC = () => {
       }> = [];
 
       for (const row of rawRows) {
-        const nameBn = String(row.studentNameBn || row['Student Name (Bangla)'] || row['Name (Bn)'] || '').trim();
-        const nameEn = String(row.studentNameEn || row['Student Name (English)'] || row['Name'] || '').trim();
+        const nameBn = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, [
+            'studentNameBn',
+            'Student Name (Bangla)',
+            'Name (Bn)',
+            'NameBn',
+            'শিক্ষার্থীর নাম (বাংলা)',
+            'নাম (বাংলা)',
+          ])
+        );
+        const nameEn = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, [
+            'studentNameEn',
+            'Student Name (English)',
+            'Name',
+            'NameEn',
+            'Student Name',
+            'শিক্ষার্থীর নাম',
+          ])
+        );
         if (!nameBn && !nameEn) continue;
 
-        const roll = String(row.rollNumber || row['Roll'] || row['Roll No'] || '').trim();
-        const cls = String(row.classLevel || row['Class'] || selectedClass).trim();
-        const yr = Number(row.academicYear || row['Year'] || selectedAcademicYear) || selectedAcademicYear;
+        const roll = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['rollNumber', 'Roll', 'Roll No', 'রোল'])
+        );
+        const cls =
+          expandScientificAndStripDotZero(
+            getRowCellByAliases(row, ['classLevel', 'Class', 'শ্রেণি'])
+          ) || selectedClass;
+        const yrRaw = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['academicYear', 'Year', 'শিক্ষাবর্ষ'])
+        );
+        const yr = Number(yrRaw) || selectedAcademicYear;
 
         const existingMatch = students.find(
           (s) =>
@@ -608,10 +699,47 @@ export const MarksheetView: React.FC = () => {
         if (typeof row.customValuesJson === 'string' && row.customValuesJson.trim().startsWith('{')) {
           try {
             const parsedCustom = JSON.parse(row.customValuesJson) as Record<string, unknown>;
-            nextCustom = { ...nextCustom, ...parsedCustom };
+            for (const [ck, cv] of Object.entries(parsedCustom)) {
+              nextCustom[ck] = expandScientificAndStripDotZero(cv);
+            }
             hasCustomJson = true;
           } catch {
             // ignore malformed JSON cell
+          }
+        }
+
+        // Govt Portal fields (strict BRN vs DOB separation, leading-zero mobile preservation,
+        // and case-insensitive matching against existing customFields without duplicating labels)
+        let hasGovtCustomChanges = false;
+        const importedBrn = readImportedBrn(row);
+        if (importedBrn) {
+          const brnKey = getTargetCustomFieldKey(customFields, 'cf_govt_brn');
+          if (String(nextCustom[brnKey] ?? '').trim() !== importedBrn) {
+            nextCustom[brnKey] = importedBrn;
+            hasGovtCustomChanges = true;
+          }
+        }
+
+        for (const spec of GOVT_PRESET_FIELDS) {
+          if (spec.id === 'cf_govt_brn') continue;
+          const cellVal = getRowCellByAliases(row, [
+            spec.id,
+            spec.labelEn,
+            spec.labelBn,
+            ...spec.aliases,
+          ]);
+          const normalizedVal =
+            spec.kind === 'digitId'
+              ? normalizeImportedDigitId(cellVal)
+              : spec.kind === 'phone'
+              ? normalizeImportedPhone(cellVal)
+              : expandScientificAndStripDotZero(cellVal);
+          if (normalizedVal) {
+            const targetKey = getTargetCustomFieldKey(customFields, spec.id);
+            if (String(nextCustom[targetKey] ?? '').trim() !== normalizedVal) {
+              nextCustom[targetKey] = normalizedVal;
+              hasGovtCustomChanges = true;
+            }
           }
         }
 
@@ -712,18 +840,99 @@ export const MarksheetView: React.FC = () => {
         const sanitizedCustom = sanitizeStringRecordMap(nextCustom);
         const sanitizedSubjectVals = sanitizeStringRecordMap(nextSubjectVals);
 
+        // Preserve existing sectorNotes keys (profile_overview, govt_stipend_<year>, govt_cub_<year>)
+        let nextSectorNotes = parseSectorNotesMap(existingMatch?.sectorNotes);
+        let hasSectorNotesChange = false;
+
+        if (typeof row.sectorNotesJson === 'string' && row.sectorNotesJson.trim().startsWith('{')) {
+          try {
+            const parsedNotes = JSON.parse(row.sectorNotesJson) as Record<string, unknown>;
+            const patchNotes = parseSectorNotesMap(parsedNotes);
+            if (Object.keys(patchNotes).length > 0) {
+              nextSectorNotes = buildMergedSectorNotes(nextSectorNotes, patchNotes);
+              hasSectorNotesChange = true;
+            }
+          } catch {
+            // ignore malformed JSON
+          }
+        }
+        if (row.sectorNotes !== undefined && row.sectorNotes !== '') {
+          if (typeof row.sectorNotes === 'string' && row.sectorNotes.trim().startsWith('{')) {
+            try {
+              const parsedNotes = JSON.parse(row.sectorNotes) as Record<string, unknown>;
+              const patchNotes = parseSectorNotesMap(parsedNotes);
+              if (Object.keys(patchNotes).length > 0) {
+                nextSectorNotes = buildMergedSectorNotes(nextSectorNotes, patchNotes);
+                hasSectorNotesChange = true;
+              }
+            } catch {
+              // fallback to text parsing
+              const patchNotes = parseSectorNotesMap(row.sectorNotes);
+              if (Object.keys(patchNotes).length > 0) {
+                nextSectorNotes = buildMergedSectorNotes(nextSectorNotes, patchNotes);
+                hasSectorNotesChange = true;
+              }
+            }
+          } else {
+            const patchNotes = parseSectorNotesMap(row.sectorNotes);
+            if (Object.keys(patchNotes).length > 0) {
+              nextSectorNotes = buildMergedSectorNotes(nextSectorNotes, patchNotes);
+              hasSectorNotesChange = true;
+            }
+          }
+        }
+        const sanitizedSectorNotes = sanitizeStringRecordMap(nextSectorNotes);
+
         const nextStudentNameBn = nameBn || nameEn;
         const nextStudentNameEn = nameEn || nameBn;
+        const importedFather = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['fatherNameEn', "Father's Name", 'Father Name', 'পিতার নাম'])
+        );
+        const importedMother = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['motherNameEn', "Mother's Name", 'Mother Name', 'মাতার নাম'])
+        );
+        const importedDob = readImportedDob(row);
+        const importedPhone = normalizeImportedPhone(
+          getRowCellByAliases(row, ['guardianPhone', 'Guardian Phone', 'Phone', 'Mobile', 'অভিভাবকের ফোন'])
+        );
+        const importedAddress = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['address', 'Address', 'ঠিকানা'])
+        );
+        const importedNextRoll = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['nextYearRollNumber', 'Next Roll', 'Next Year Roll'])
+        );
+        const importedSection = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['section', 'Section', 'শাখা'])
+        );
+        const importedPromo = expandScientificAndStripDotZero(
+          getRowCellByAliases(row, ['promotionStatus', 'Promotion Status'])
+        );
+
+        const nextFather = importedFather || existingMatch?.fatherNameEn || '';
+        const nextMother = importedMother || existingMatch?.motherNameEn || '';
+        const nextDob = importedDob || existingMatch?.dateOfBirth || '';
+        const nextPhone = importedPhone || existingMatch?.guardianPhone || '';
+        const nextAddress = importedAddress || existingMatch?.address || '';
+        const nextRoll = importedNextRoll || existingMatch?.nextYearRollNumber || '';
+        const nextSection = importedSection || existingMatch?.section || '';
+        const nextPromo = importedPromo || existingMatch?.promotionStatus || '';
+
         const hasNonExamChanges =
           !existingMatch ||
           hasCustomJson ||
+          hasGovtCustomChanges ||
           hasSubjJson ||
+          hasSectorNotesChange ||
           nextStudentNameBn !== (existingMatch.studentNameBn || '') ||
           nextStudentNameEn !== (existingMatch.studentNameEn || '') ||
-          String(row.fatherNameEn || row["Father's Name"] || '').trim() !== (existingMatch.fatherNameEn || '') ||
-          String(row.motherNameEn || row["Mother's Name"] || '').trim() !== (existingMatch.motherNameEn || '') ||
-          String(row.guardianPhone || row['Guardian Phone'] || '').trim() !== (existingMatch.guardianPhone || '') ||
-          String(row.section || row['Section'] || '').trim() !== (existingMatch.section || '');
+          nextFather !== (existingMatch.fatherNameEn || '') ||
+          nextMother !== (existingMatch.motherNameEn || '') ||
+          nextDob !== (existingMatch.dateOfBirth || '') ||
+          nextPhone !== (existingMatch.guardianPhone || '') ||
+          nextAddress !== (existingMatch.address || '') ||
+          nextSection !== (existingMatch.section || '') ||
+          nextRoll !== (existingMatch.nextYearRollNumber || '') ||
+          nextPromo !== (existingMatch.promotionStatus || '');
 
         parsedStudents.push({
           existingId: existingMatch?.id,
@@ -732,20 +941,20 @@ export const MarksheetView: React.FC = () => {
           data: {
             studentNameBn: nextStudentNameBn,
             studentNameEn: nextStudentNameEn,
-            fatherNameEn: String(row.fatherNameEn || row["Father's Name"] || existingMatch?.fatherNameEn || '').trim(),
-            motherNameEn: String(row.motherNameEn || row["Mother's Name"] || existingMatch?.motherNameEn || '').trim(),
-            dateOfBirth: String(row.dateOfBirth || row['Date of Birth'] || existingMatch?.dateOfBirth || '').trim(),
-            guardianPhone: String(row.guardianPhone || row['Guardian Phone'] || existingMatch?.guardianPhone || '').trim(),
-            address: String(row.address || row['Address'] || existingMatch?.address || '').trim(),
+            fatherNameEn: nextFather,
+            motherNameEn: nextMother,
+            dateOfBirth: nextDob,
+            guardianPhone: nextPhone,
+            address: nextAddress,
             rollNumber: roll,
-            nextYearRollNumber: String(row.nextYearRollNumber || row['Next Roll'] || existingMatch?.nextYearRollNumber || '').trim(),
+            nextYearRollNumber: nextRoll,
             classLevel: cls,
-            section: String(row.section || row['Section'] || existingMatch?.section || '').trim(),
+            section: nextSection,
             academicYear: yr,
             totalSchoolDays: row.totalSchoolDays !== undefined && row.totalSchoolDays !== '' ? Number(row.totalSchoolDays) || 0 : existingMatch?.totalSchoolDays || 0,
             daysPresent: row.daysPresent !== undefined && row.daysPresent !== '' ? Number(row.daysPresent) || 0 : existingMatch?.daysPresent || 0,
-            promotionStatus: String(row.promotionStatus || existingMatch?.promotionStatus || '').trim(),
-            sectorNotes: String(row.sectorNotes || existingMatch?.sectorNotes || '').trim(),
+            promotionStatus: nextPromo,
+            sectorNotes: sanitizedSectorNotes,
             customValues: sanitizedCustom,
             subjectValues: sanitizedSubjectVals,
             examResults: sanitizedResults,
@@ -1036,7 +1245,8 @@ export const MarksheetView: React.FC = () => {
                 </h2>
                 <p className="text-xs text-slate-600">
                   {school?.upazilaDistrict ? `${school.upazilaDistrict} · ` : ''}
-                  EMIS: {school?.emisCode?.trim() || OFFICIAL_EMIS_CODE} ·{' '}
+                  {t(lang, 'displaySchoolCodeLabel')}: {schoolMeta.displaySchoolCode} ·{' '}
+                  EMIS: {schoolMeta.emisCode} ·{' '}
                   {t(lang, 'academicYear')}: {selectedAcademicYear}
                 </p>
                 <div className="pt-1 text-sm font-semibold text-emerald-800">

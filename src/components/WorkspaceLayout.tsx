@@ -10,6 +10,7 @@ import {
   Download,
   FileSpreadsheet,
   GraduationCap,
+  Landmark,
   LayoutDashboard,
   Link2,
   LogOut,
@@ -28,7 +29,7 @@ import {
 import { useApp } from '../contexts/AppContext';
 import { getClassLabel, t } from '../lib/i18n';
 import {
-  OFFICIAL_EMIS_CODE,
+  getSchoolDisplayMeta,
   OFFICIAL_SCHOOL_NAME_BN,
   OFFICIAL_SCHOOL_NAME_EN,
   resolveDirectApkDownloadInfo,
@@ -45,6 +46,7 @@ export type NavTab =
   | 'marksheet'
   | 'analytics'
   | 'comms'
+  | 'govt-portal'
   | 'admin';
 
 interface WorkspaceLayoutProps {
@@ -120,6 +122,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     { id: 'marksheet', label: t(lang, 'navMarksheet'), icon: FileSpreadsheet },
     { id: 'analytics', label: t(lang, 'navAnalytics'), icon: BarChart3 },
     { id: 'comms', label: t(lang, 'navComms'), icon: MessageSquareText },
+    { id: 'govt-portal', label: t(lang, 'navGovtPortal'), icon: Landmark },
     {
       id: 'admin',
       label: t(lang, 'navAdmin'),
@@ -136,9 +139,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
   const activeNavTitle =
     visibleNavItems.find((i) => i.id === activeTab)?.label || t(lang, 'navDashboard');
 
-  const displaySchoolName =
-    school?.schoolName?.trim() ||
-    (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+  const schoolMeta = useMemo(() => getSchoolDisplayMeta(school, lang), [school, lang]);
+  const displaySchoolName = schoolMeta.schoolName;
 
   const resolvedApkInfo = useMemo(
     () => (school?.appUpdateUrl ? resolveDirectApkDownloadInfo(school.appUpdateUrl) : null),
@@ -156,8 +158,8 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
     const shareUrl = typeof window !== 'undefined' ? window.location.origin : '';
     const text =
       lang === 'bn'
-        ? `${OFFICIAL_SCHOOL_NAME_BN} (স্কুল কোড: ${session?.schoolId || '139783'}, EMIS: ${OFFICIAL_EMIS_CODE}) — ওয়েব সঙ্গী: ${shareUrl}`
-        : `${OFFICIAL_SCHOOL_NAME_EN} (School Code: ${session?.schoolId || '139783'}, EMIS: ${OFFICIAL_EMIS_CODE}) — Web Companion: ${shareUrl}`;
+        ? `${OFFICIAL_SCHOOL_NAME_BN} (স্কুল কোড: ${schoolMeta.displaySchoolCode}, EMIS: ${schoolMeta.emisCode}) — ওয়েব সঙ্গী: ${shareUrl}`
+        : `${OFFICIAL_SCHOOL_NAME_EN} (School Code: ${schoolMeta.displaySchoolCode}, EMIS: ${schoolMeta.emisCode}) — Web Companion: ${shareUrl}`;
     try {
       if (navigator.share) {
         await navigator.share({ title: displaySchoolName, text, url: shareUrl });
@@ -204,7 +206,7 @@ export const WorkspaceLayout: React.FC<WorkspaceLayoutProps> = ({
               {displaySchoolName}
             </div>
             <div className="text-xs text-emerald-100 font-mono truncate">
-              ID: {session?.schoolId || '139783'} · EMIS: {school?.emisCode?.trim() || OFFICIAL_EMIS_CODE}
+              Code: {schoolMeta.displaySchoolCode} · EMIS: {schoolMeta.emisCode}
             </div>
           </div>
         </div>

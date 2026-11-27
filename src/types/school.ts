@@ -67,6 +67,7 @@ export interface RecentMessageSummary {
 
 export interface SchoolDoc {
   schoolId: string;
+  displaySchoolCode?: string;
   schoolName: string;
   emisCode?: string;
   upazilaDistrict?: string;

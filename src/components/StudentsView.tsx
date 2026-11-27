@@ -5,7 +5,6 @@ import {
   Plus,
   Search,
   Trash2,
-  Upload,
   X,
 } from 'lucide-react';
 import { useApp } from '../contexts/AppContext';
@@ -18,11 +17,13 @@ import {
 } from '../lib/firestoreValidation';
 import { getClassLabel, t, type Language } from '../lib/i18n';
 import {
+  buildMergedSectorNotes,
   compareRollNumbers,
-  compressImageToBase64,
   formatPhotoSrc,
   matchesClassScope,
   matchesStudentSearch,
+  PROFILE_OVERVIEW_NOTE_KEY,
+  readProfileOverviewNote,
 } from '../lib/schoolUtils';
 import { CLASS_LEVELS, type StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -151,7 +152,6 @@ interface StudentFormState {
   guardianPhone: string;
   address: string;
   photoBase64: string;
-  photoChanged: boolean;
   rollNumber: string;
   nextYearRollNumber: string;
   classLevel: string;
@@ -161,6 +161,7 @@ interface StudentFormState {
   daysPresent: string;
   promotionStatus: string;
   sectorNotes: string;
+  existingSectorNotes?: unknown;
   customValues: Record<string, string | number | boolean>;
   subjectValues: Record<string, string | number | boolean>;
   examResults: Record<string, number | string>;
@@ -210,7 +211,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     text: string;
   } | null>(null);
   const [confirmDeleteStudent, setConfirmDeleteStudent] = useState<StudentDoc | null>(null);
-  const [photoError, setPhotoError] = useState<string | null>(null);
 
   const isAdmin = session?.role === 'ADMIN';
 
@@ -358,7 +358,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
   }, [filteredStudents, page]);
 
   const openCreateModal = () => {
-    setPhotoError(null);
     setEditingStudent({
       studentNameBn: '',
       studentNameEn: '',
@@ -368,7 +367,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       guardianPhone: '',
       address: '',
       photoBase64: '',
-      photoChanged: true,
       rollNumber: String(filteredStudents.length + 1),
       nextYearRollNumber: '',
       classLevel: selectedClass,
@@ -378,6 +376,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
       daysPresent: '0',
       promotionStatus: '',
       sectorNotes: '',
+      existingSectorNotes: {},
       customValues: {},
       subjectValues: {},
       examResults: {},
@@ -386,7 +385,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
 
   const openEditModal = useCallback(
     (st: StudentDoc) => {
-      setPhotoError(null);
       setEditingStudent({
         id: st.id,
         createdAt: st.createdAt,
@@ -398,7 +396,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         guardianPhone: st.guardianPhone || '',
         address: st.address || '',
         photoBase64: st.photoBase64 || '',
-        photoChanged: false,
         rollNumber: String(st.rollNumber ?? ''),
         nextYearRollNumber: String(st.nextYearRollNumber ?? ''),
         classLevel: st.classLevel || selectedClass,
@@ -407,14 +404,8 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         totalSchoolDays: String(st.totalSchoolDays ?? 0),
         daysPresent: String(st.daysPresent ?? 0),
         promotionStatus: String(st.promotionStatus || ''),
-        sectorNotes:
-          typeof st.sectorNotes === 'string'
-            ? st.sectorNotes
-            : st.sectorNotes && typeof st.sectorNotes === 'object'
-            ? Object.entries(st.sectorNotes)
-                .map(([k, v]) => `${k}: ${String(v ?? '')}`)
-                .join('\n')
-            : '',
+        sectorNotes: readProfileOverviewNote(st.sectorNotes),
+        existingSectorNotes: st.sectorNotes,
         customValues:
           st.customValues && typeof st.customValues === 'object' && !Array.isArray(st.customValues)
             ? { ...st.customValues }
@@ -432,20 +423,6 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     [selectedClass, selectedAcademicYear]
   );
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !editingStudent) return;
-    setPhotoError(null);
-    try {
-      const compressed = await compressImageToBase64(file, 98000);
-      setEditingStudent((prev) =>
-        prev ? { ...prev, photoBase64: compressed, photoChanged: true } : null
-      );
-    } catch (err) {
-      setPhotoError(err instanceof Error ? err.message : 'Photo compression failed');
-    }
-  };
-
   const handleSaveStudent = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingStudent || !session) return;
@@ -457,6 +434,10 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
     setStatusBanner(null);
 
     try {
+      const mergedSectorNotes = buildMergedSectorNotes(editingStudent.existingSectorNotes, {
+        [PROFILE_OVERVIEW_NOTE_KEY]: editingStudent.sectorNotes,
+      });
+
       const studentInput: Partial<StudentDoc> = {
         studentNameBn: editingStudent.studentNameBn,
         studentNameEn: editingStudent.studentNameEn,
@@ -474,7 +455,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         totalSchoolDays: Number(editingStudent.totalSchoolDays) || 0,
         daysPresent: Number(editingStudent.daysPresent) || 0,
         promotionStatus: editingStudent.promotionStatus,
-        sectorNotes: editingStudent.sectorNotes,
+        sectorNotes: mergedSectorNotes,
         customValues: editingStudent.customValues,
         subjectValues: editingStudent.subjectValues,
         examResults: editingStudent.examResults,
@@ -506,7 +487,7 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
         const displayName =
           editingStudent.studentNameBn || editingStudent.studentNameEn || 'Student';
 
-        // For non-admin edits, omit heavy unchanged photoBase64 and examResults (not edited in this modal)
+        // Never upload or embed photoBase64 from the web companion
         const pendingStudentBody: Record<string, unknown> = {
           studentNameBn: editingStudent.studentNameBn,
           studentNameEn: editingStudent.studentNameEn,
@@ -523,15 +504,12 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
           totalSchoolDays: Number(editingStudent.totalSchoolDays) || 0,
           daysPresent: Number(editingStudent.daysPresent) || 0,
           promotionStatus: editingStudent.promotionStatus,
-          sectorNotes: editingStudent.sectorNotes,
+          sectorNotes: mergedSectorNotes,
           customValues: editingStudent.customValues,
           subjectValues: editingStudent.subjectValues,
           schoolId: session.schoolId,
           id: editingStudent.id || undefined,
         };
-        if (isCreate || editingStudent.photoChanged) {
-          pendingStudentBody.photoBase64 = editingStudent.photoBase64;
-        }
 
         const pendingDoc = buildPendingChangePayload({
           schoolId: session.schoolId,
@@ -845,8 +823,8 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
             </div>
 
             <form onSubmit={handleSaveStudent} className="flex-1 overflow-y-auto p-6 space-y-6">
-              {/* Photo Upload */}
-              <div className="flex flex-wrap items-center gap-4 pb-5 border-b border-stone-200">
+              {/* Local-only Photo Notice (Zero server-side photograph uploads) */}
+              <div className="flex flex-wrap items-center gap-4 pb-4 border-b border-stone-200">
                 {formatPhotoSrc(editingStudent.photoBase64) ? (
                   <img
                     src={formatPhotoSrc(editingStudent.photoBase64)!}
@@ -854,41 +832,20 @@ export const StudentsView: React.FC<StudentsViewProps> = ({
                     loading="lazy"
                     decoding="async"
                     referrerPolicy="no-referrer"
-                    className="w-16 h-16 rounded-xl object-cover border border-stone-200"
+                    className="w-14 h-14 rounded-xl object-cover border border-stone-200 shrink-0"
                   />
                 ) : (
-                  <div className="w-16 h-16 rounded-xl bg-stone-100 border border-stone-200 flex items-center justify-center text-slate-400 text-xs">
-                    Photo
+                  <div className="w-14 h-14 rounded-xl bg-stone-100 border border-stone-200 flex items-center justify-center text-slate-400 text-xs shrink-0">
+                    {(editingStudent.studentNameEn || editingStudent.studentNameBn || '?')
+                      .charAt(0)
+                      .toUpperCase()}
                   </div>
                 )}
-                <div className="space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white border border-stone-300 rounded-lg hover:bg-stone-50 cursor-pointer">
-                      <Upload className="w-3.5 h-3.5" />
-                      <span>{t(lang, 'uploadPhoto')}</span>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={handlePhotoUpload}
-                        className="hidden"
-                      />
-                    </label>
-                    {editingStudent.photoBase64 && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEditingStudent((p) =>
-                            p ? { ...p, photoBase64: '', photoChanged: true } : null
-                          )
-                        }
-                        className="px-3 py-1.5 text-xs font-medium text-rose-700 bg-rose-50 border border-rose-200 rounded-lg hover:bg-rose-100 cursor-pointer"
-                      >
-                        {t(lang, 'removePhoto')}
-                      </button>
-                    )}
+                <div className="space-y-0.5">
+                  <div className="text-xs font-semibold text-slate-800">
+                    {t(lang, 'studentPhoto')}
                   </div>
                   <p className="text-xs text-slate-500">{t(lang, 'photoHint')}</p>
-                  {photoError && <p className="text-xs text-rose-600">{photoError}</p>}
                 </div>
               </div>
 

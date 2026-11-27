@@ -1,4 +1,5 @@
 import { serverTimestamp, writeBatch, type Firestore } from 'firebase/firestore';
+import { parseSectorNotesMap } from './schoolUtils';
 import type {
   AttendanceStatus,
   CustomFieldDoc,
@@ -172,15 +173,7 @@ export function validateAndBuildStudentPayload(
     customValues,
     subjectValues,
     examResults,
-    sectorNotes:
-      typeof input.sectorNotes === 'string'
-        ? input.sectorNotes.trim()
-        : input.sectorNotes && typeof input.sectorNotes === 'object'
-        ? Object.entries(input.sectorNotes)
-            .map(([k, v]) => `${k}: ${String(v ?? '').trim()}`)
-            .join('\n')
-            .trim()
-        : '',
+    sectorNotes: sanitizeStringRecordMap(parseSectorNotesMap(input.sectorNotes)),
     lastUpdatedByName: clampText(updatedByName, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
     createdAt: existingCreatedAt || serverTimestamp(),
     updatedAt: serverTimestamp(),

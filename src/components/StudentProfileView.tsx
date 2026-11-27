@@ -30,9 +30,11 @@ import {
   sanitizeStringRecordMap,
   withWriteTimeout,
 } from '../lib/firestoreValidation';
+import { getPortalStatusKey } from '../lib/govtPortal';
 import { getClassLabel, t } from '../lib/i18n';
 import {
   applyManualMeritShift,
+  buildMergedSectorNotes,
   calculateSubjectGrade,
   compareRollNumbers,
   computeClassMeritDetails,
@@ -42,15 +44,18 @@ import {
   getClassSubjectsForMarksheet,
   getExamAbsentKey,
   getOfficialExamLabel,
+  getSchoolDisplayMeta,
   getTermSubjectScore,
   isAbsentMarkerValue,
   MANUAL_MERIT_KEY,
   matchesClassScope,
   normalizeExamConfigs,
-  OFFICIAL_SCHOOL_NAME_BN,
-  OFFICIAL_SCHOOL_NAME_EN,
+  parseSectorNotesMap,
+  PROFILE_OVERVIEW_NOTE_KEY,
+  readProfileOverviewNote,
   TERM_ORDER,
 } from '../lib/schoolUtils';
+import { writeSafeXlsxWorkbook } from '../lib/spreadsheetUtils';
 import { CLASS_LEVELS, type ExamTermId, type StudentDoc } from '../types/school';
 import { ErrorBoundary } from './ErrorBoundary';
 import { ExamSetupModal } from './ExamSetupModal';
@@ -181,17 +186,16 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
         : {},
     [student?.subjectValues]
   );
-  const safeSectorNotesText = useMemo(() => {
-    const raw = student?.sectorNotes;
-    if (typeof raw === 'string') return raw;
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      const entries = Object.entries(raw as Record<string, unknown>)
-        .filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')
-        .map(([k, v]) => `${k}: ${String(v)}`);
-      return entries.join('\n');
-    }
-    return '';
-  }, [student?.sectorNotes]);
+  const schoolMeta = useMemo(() => getSchoolDisplayMeta(school, lang), [school, lang]);
+
+  const safeSectorNotesMap = useMemo(
+    () => parseSectorNotesMap(student?.sectorNotes),
+    [student?.sectorNotes]
+  );
+  const safeSectorNotesText = useMemo(
+    () => readProfileOverviewNote(student?.sectorNotes),
+    [student?.sectorNotes]
+  );
 
   // Reset edit states when student changes
   useEffect(() => {
@@ -551,11 +555,14 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
 
     try {
       if (isAdmin) {
+        const mergedNotes = buildMergedSectorNotes(student.sectorNotes, {
+          [PROFILE_OVERVIEW_NOTE_KEY]: trimmedComment,
+        });
         await withWriteTimeout(
           updateDoc(
             doc(instances.db, 'schools', session.schoolId, 'students', student.id),
             {
-              sectorNotes: trimmedComment,
+              sectorNotes: mergedNotes,
               lastUpdatedByName: clampText(session.name, FIRESTORE_LIMITS.USER_NAME_MAX_CHARS),
               updatedAt: serverTimestamp(),
             }
@@ -573,14 +580,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
           summary: `Comment Update: ${student.studentNameBn || student.studentNameEn}`,
           detailsText: `Class ${student.classLevel} (Roll ${student.rollNumber})`,
           payloadJson: JSON.stringify({
-            kind: 'ROLL_PROMOTION',
-            updates: [
-              {
-                studentId: student.id,
-                studentName: clampText(student.studentNameBn || student.studentNameEn, 80),
-                fieldsPatch: { sectorNotes: trimmedComment },
+            updates: {
+              [student.id]: {
+                [`sectorNotes.${PROFILE_OVERVIEW_NOTE_KEY}`]: trimmedComment,
               },
-            ],
+            },
           }),
           status: 'PENDING',
         });
@@ -675,9 +679,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       ? activeTermSummary.gpa.toFixed(2)
       : '0.00';
 
-    const schoolNameLine =
-      school?.schoolName?.trim() ||
-      (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+    const schoolNameLine = schoolMeta.schoolName;
 
     const summaryText = [
       `*${schoolNameLine}*`,
@@ -709,9 +711,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
   const handleExportStudentExcel = async () => {
     if (!student) return;
     const XLSX = await import('xlsx');
-    const schoolTitle =
-      school?.schoolName?.trim() ||
-      (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN);
+    const schoolTitle = schoolMeta.schoolName;
     const safeClassFile = safeClassLevel.replace(/\s+/g, '_');
     const safeRollFile = String(student.rollNumber ?? 'student').replace(/[^a-zA-Z0-9_-]/g, '_');
 
@@ -747,6 +747,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       const aoa = [
         [`${schoolTitle} — ${examLabel}`],
         [
+          `School Code: ${schoolMeta.displaySchoolCode}`,
+          `EMIS: ${schoolMeta.emisCode}`,
           `Student: ${student.studentNameBn || student.studentNameEn}`,
           `Roll: ${student.rollNumber}`,
           `Class: ${student.classLevel}`,
@@ -760,7 +762,11 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
       const ws = XLSX.utils.aoa_to_sheet(aoa);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, 'Marksheet');
-      XLSX.writeFile(wb, `Marksheet_${activeExamId}_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
+      writeSafeXlsxWorkbook(
+        XLSX,
+        wb,
+        `Marksheet_${activeExamId}_${safeClassFile}_Roll_${safeRollFile}.xlsx`
+      );
       return;
     }
 
@@ -824,6 +830,8 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     const aoa = [
       [`${schoolTitle} — ${getOfficialExamLabel('exam_3', lang)}`],
       [
+        `School Code: ${schoolMeta.displaySchoolCode}`,
+        `EMIS: ${schoolMeta.emisCode}`,
         `Student: ${student.studentNameBn || student.studentNameEn}`,
         `Roll: ${student.rollNumber}`,
         `Class: ${student.classLevel}`,
@@ -846,7 +854,7 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Marksheet');
-    XLSX.writeFile(wb, `Marksheet_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
+    writeSafeXlsxWorkbook(XLSX, wb, `Marksheet_${safeClassFile}_Roll_${safeRollFile}.xlsx`);
   };
 
   // Save Yearly & Promotion fields
@@ -1272,6 +1280,37 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
                       : 'No overview or performance comment recorded yet.')}
                 </p>
               )}
+
+              {(() => {
+                const yr = Number(student.academicYear) || new Date().getFullYear();
+                const stipendDone =
+                  (safeSectorNotesMap[getPortalStatusKey('stipend', yr)] || '').toLowerCase() ===
+                  'submitted';
+                const cubDone =
+                  (safeSectorNotesMap[getPortalStatusKey('cub', yr)] || '').toLowerCase() ===
+                  'submitted';
+                if (!stipendDone && !cubDone) return null;
+                return (
+                  <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px]">
+                    {stipendDone && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 font-medium">
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span>
+                          {lang === 'bn' ? `উপবৃত্তি (${yr}): জমাকৃত` : `Stipend ${yr}: Submitted`}
+                        </span>
+                      </span>
+                    )}
+                    {cubDone && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-50 border border-sky-200 text-sky-800 font-medium">
+                        <CheckCircle2 className="w-3 h-3" />
+                        <span>
+                          {lang === 'bn' ? `কাব স্কাউট (${yr}): জমাকৃত` : `Cub Scout ${yr}: Submitted`}
+                        </span>
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -1546,9 +1585,12 @@ export const StudentProfileView: React.FC<StudentProfileViewProps> = ({
             {/* Screen + Print Card Header */}
             <div className="text-center border-b border-stone-200 print:border-b-2 print:border-slate-800 pb-3 space-y-1">
               <h2 className="text-lg sm:text-xl font-bold text-slate-900">
-                {school?.schoolName?.trim() ||
-                  (lang === 'bn' ? OFFICIAL_SCHOOL_NAME_BN : OFFICIAL_SCHOOL_NAME_EN)}
+                {schoolMeta.schoolName}
               </h2>
+              <p className="text-[11px] text-slate-500 font-mono tabular-nums">
+                {t(lang, 'displaySchoolCodeLabel')}: {schoolMeta.displaySchoolCode} · EMIS:{' '}
+                {schoolMeta.emisCode}
+              </p>
               <div className="text-xs font-semibold text-emerald-800">
                 {getOfficialExamLabel(activeExamId, lang)}
               </div>

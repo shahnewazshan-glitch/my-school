@@ -37,6 +37,9 @@ const AnalyticsView = lazy(() =>
 const CommsView = lazy(() =>
   import('./components/CommsView').then((m) => ({ default: m.CommsView }))
 );
+const GovtPortalView = lazy(() =>
+  import('./components/GovtPortalView').then((m) => ({ default: m.GovtPortalView }))
+);
 const AdminPanelView = lazy(() =>
   import('./components/AdminPanelView').then((m) => ({ default: m.AdminPanelView }))
 );
@@ -116,7 +119,6 @@ const MainAppShell: React.FC = () => {
             onNavigate={handleSelectTab}
             onOpenStudentProfile={handleOpenStudentProfile}
             onOpenApkCleanup={() => handleOpenAdminSubTab('update')}
-            onOpenSchoolSetup={(sub) => handleOpenAdminSubTab(sub)}
           />
         )}
         {activeTab === 'students' && (
@@ -136,6 +138,7 @@ const MainAppShell: React.FC = () => {
           <AnalyticsView onOpenStudentProfile={handleOpenStudentProfile} />
         )}
         {activeTab === 'comms' && <CommsView />}
+        {activeTab === 'govt-portal' && <GovtPortalView />}
         {activeTab === 'admin' && session.role === 'ADMIN' && (
           <AdminPanelView initialTab={adminInitialTab} />
         )}

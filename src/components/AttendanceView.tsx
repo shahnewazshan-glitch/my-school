@@ -11,6 +11,7 @@ import {
 } from '../lib/firestoreValidation';
 import { getClassLabel, t } from '../lib/i18n';
 import { getAttendanceDocId, getTodayDateKey } from '../lib/schoolUtils';
+import { writeSafeXlsxWorkbook } from '../lib/spreadsheetUtils';
 import type { AttendanceStatus } from '../types/school';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
@@ -334,7 +335,8 @@ export const AttendanceView: React.FC = () => {
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Yearly Attendance');
-    XLSX.writeFile(
+    writeSafeXlsxWorkbook(
+      XLSX,
       wb,
       `Attendance_${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}.xlsx`
     );

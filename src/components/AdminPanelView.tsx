@@ -3,14 +3,11 @@ import {
   collection,
   deleteDoc,
   doc,
-  getDoc,
-  getDocs,
   serverTimestamp,
   setDoc,
   updateDoc,
 } from 'firebase/firestore';
 import {
-  ArrowRightLeft,
   Building2,
   Check,
   Copy,
@@ -45,17 +42,19 @@ import {
 } from '../lib/firestoreValidation';
 import { t } from '../lib/i18n';
 import {
+  buildMergedSectorNotes,
   formatTimestampDateTime,
   getAttendanceDocId,
   getOfficialExamLabel,
+  getSchoolDisplayMeta,
   isSameHostnameUrl,
   normalizeAppUpdateUrl,
   normalizeBdPhone,
   normalizeExamConfigs,
-  normalizeSchoolId,
+  OFFICIAL_DISPLAY_SCHOOL_CODE,
   OFFICIAL_EMIS_CODE,
-  OFFICIAL_SCHOOL_ID,
   OFFICIAL_SCHOOL_NAME_EN,
+  parseSectorNotesMap,
   resolveDirectApkDownloadInfo,
   sha256Hex,
   verifySelfHostedApkUrl,
@@ -87,7 +86,6 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     customFields,
     pendingChanges,
     setSyncing,
-    switchSchoolId,
   } = useApp();
 
   const [adminTab, setAdminTab] = useState<'teachers' | 'approvals' | 'setup' | 'update'>(
@@ -145,27 +143,22 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
   const [savingAppUpdate, setSavingAppUpdate] = useState(false);
   const [copiedGeneratedLink, setCopiedGeneratedLink] = useState(false);
 
-  // Setup: School Profile, ID & EMIS
+  // Setup: School Profile, Display School Code & EMIS (never mutates schoolId)
   const [schoolNameDraft, setSchoolNameDraft] = useState(
     () => school?.schoolName || OFFICIAL_SCHOOL_NAME_EN
   );
+  const [displaySchoolCodeDraft, setDisplaySchoolCodeDraft] = useState(
+    () => school?.displaySchoolCode?.trim() || OFFICIAL_DISPLAY_SCHOOL_CODE
+  );
   const [emisDraft, setEmisDraft] = useState(
-    () => school?.emisCode || OFFICIAL_EMIS_CODE
+    () => school?.emisCode?.trim() || OFFICIAL_EMIS_CODE
   );
   const [upazilaDraft, setUpazilaDraft] = useState(() => school?.upazilaDistrict || '');
   const [defaultYearDraft, setDefaultYearDraft] = useState(() =>
     String(school?.defaultAcademicYear || new Date().getFullYear())
   );
   const [savingSchoolProfile, setSavingSchoolProfile] = useState(false);
-
-  // Zero-Data-Loss Workspace Migration Tool State
-  const [migSourceId, setMigSourceId] = useState(() =>
-    session?.schoolId && session.schoolId !== OFFICIAL_SCHOOL_ID ? session.schoolId : ''
-  );
-  const [migTargetId, setMigTargetId] = useState(OFFICIAL_SCHOOL_ID);
-  const [migPassword, setMigPassword] = useState('');
-  const [migrating, setMigrating] = useState(false);
-  const [migReport, setMigReport] = useState<string | null>(null);
+  const [savingDisplayCodeEmis, setSavingDisplayCodeEmis] = useState(false);
 
   useEffect(() => {
     setAdminTab(initialTab);
@@ -175,8 +168,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     if (school?.schoolName !== undefined) {
       setSchoolNameDraft(school.schoolName || OFFICIAL_SCHOOL_NAME_EN);
     }
+    if (school?.displaySchoolCode !== undefined) {
+      setDisplaySchoolCodeDraft(school.displaySchoolCode?.trim() || OFFICIAL_DISPLAY_SCHOOL_CODE);
+    }
     if (school?.emisCode !== undefined) {
-      setEmisDraft(school.emisCode || OFFICIAL_EMIS_CODE);
+      setEmisDraft(school.emisCode?.trim() || OFFICIAL_EMIS_CODE);
     }
     if (school?.upazilaDistrict !== undefined) {
       setUpazilaDraft(school.upazilaDistrict || '');
@@ -186,16 +182,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     }
   }, [
     school?.schoolName,
+    school?.displaySchoolCode,
     school?.emisCode,
     school?.upazilaDistrict,
     school?.defaultAcademicYear,
   ]);
-
-  useEffect(() => {
-    if (session?.schoolId && session.schoolId !== OFFICIAL_SCHOOL_ID && !migSourceId) {
-      setMigSourceId(session.schoolId);
-    }
-  }, [session?.schoolId, migSourceId]);
 
   useEffect(() => {
     setExamDrafts(normalizeExamConfigs(school?.examConfigs));
@@ -372,9 +363,11 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             const mergedExam: Record<string, unknown> = { ...(existing.examResults || {}) };
             const mergedSubj: Record<string, unknown> = { ...(existing.subjectValues || {}) };
             const mergedCustom: Record<string, unknown> = { ...(existing.customValues || {}) };
+            let mergedNotes: Record<string, string> = parseSectorNotesMap(existing.sectorNotes);
             let touchedExam = false;
             let touchedSubj = false;
             let touchedCustom = false;
+            let touchedNotes = false;
             const directFields: Record<string, unknown> = {};
 
             for (const [k, v] of Object.entries(patchObj)) {
@@ -396,12 +389,31 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 const str = String(v ?? '').trim();
                 if (str === '') delete mergedCustom[subKey];
                 else mergedCustom[subKey] = str;
+              } else if (k.startsWith('sectorNotes.')) {
+                touchedNotes = true;
+                const subKey = k.slice('sectorNotes.'.length);
+                const str = String(v ?? '').trim();
+                if (str === '') delete mergedNotes[subKey];
+                else mergedNotes[subKey] = str;
+              } else if (k === 'sectorNotes') {
+                touchedNotes = true;
+                mergedNotes =
+                  typeof v === 'object' && v !== null && !Array.isArray(v)
+                    ? { ...mergedNotes, ...parseSectorNotesMap(v) }
+                    : buildMergedSectorNotes(mergedNotes, {
+                        profile_overview: String(v ?? ''),
+                      });
               } else if (
                 [
+                  'studentNameBn',
+                  'studentNameEn',
+                  'fatherNameEn',
+                  'motherNameEn',
+                  'dateOfBirth',
+                  'address',
                   'rollNumber',
                   'nextYearRollNumber',
                   'guardianPhone',
-                  'sectorNotes',
                   'section',
                   'promotionStatus',
                   'classLevel',
@@ -440,6 +452,9 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 throw new Error('Custom values limit exceeded.');
               }
               docUpdate.customValues = sanitized;
+            }
+            if (touchedNotes) {
+              docUpdate.sectorNotes = sanitizeStringRecordMap(mergedNotes);
             }
 
             batch.update(doc(instances.db, 'schools', schoolId, 'students', studentId), docUpdate);
@@ -523,10 +538,15 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             } else if (item.fieldsPatch && typeof item.fieldsPatch === 'object') {
               const rawPatch = { ...(item.fieldsPatch as Record<string, unknown>) };
               for (const strKey of [
+                'studentNameBn',
+                'studentNameEn',
+                'fatherNameEn',
+                'motherNameEn',
+                'dateOfBirth',
+                'address',
                 'rollNumber',
                 'nextYearRollNumber',
                 'guardianPhone',
-                'sectorNotes',
                 'section',
                 'promotionStatus',
                 'classLevel',
@@ -534,6 +554,16 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 if (strKey in rawPatch) {
                   rawPatch[strKey] = String(rawPatch[strKey] ?? '').trim();
                 }
+              }
+              if ('sectorNotes' in rawPatch) {
+                const rawSn = rawPatch.sectorNotes;
+                rawPatch.sectorNotes = sanitizeStringRecordMap(
+                  typeof rawSn === 'object' && rawSn !== null && !Array.isArray(rawSn)
+                    ? { ...parseSectorNotesMap(existing.sectorNotes), ...parseSectorNotesMap(rawSn) }
+                    : buildMergedSectorNotes(existing.sectorNotes, {
+                        profile_overview: String(rawSn ?? ''),
+                      })
+                );
               }
               batch.update(ref, {
                 ...rawPatch,
@@ -705,6 +735,44 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     );
   };
 
+  const handleSetDisplayCodeAndEmis = async () => {
+    const instances = getFirebaseInstances();
+    if (!instances || !session) return;
+    setSavingDisplayCodeEmis(true);
+    setSyncing(true);
+    setBanner(null);
+    try {
+      const cleanCode = clampText(displaySchoolCodeDraft, 40) || OFFICIAL_DISPLAY_SCHOOL_CODE;
+      const cleanEmis = clampText(emisDraft, 40) || OFFICIAL_EMIS_CODE;
+
+      await withWriteTimeout(
+        updateDoc(doc(instances.db, 'schools', session.schoolId), {
+          displaySchoolCode: cleanCode,
+          emisCode: cleanEmis,
+          updatedAt: serverTimestamp(),
+        })
+      );
+
+      setDisplaySchoolCodeDraft(cleanCode);
+      setEmisDraft(cleanEmis);
+      setBanner({
+        type: 'success',
+        text:
+          lang === 'bn'
+            ? `প্রদর্শিত স্কুল কোড (${cleanCode}) ও EMIS কোড (${cleanEmis}) সংরক্ষণ করা হয়েছে।`
+            : `Updated Display School Code (${cleanCode}) & EMIS (${cleanEmis}) with zero changes to Login Workspace ID.`,
+      });
+    } catch (err) {
+      setBanner({
+        type: 'error',
+        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
+      });
+    } finally {
+      setSavingDisplayCodeEmis(false);
+      setSyncing(false);
+    }
+  };
+
   const handleSaveSchoolProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     const instances = getFirebaseInstances();
@@ -714,6 +782,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     setBanner(null);
     try {
       const cleanName = clampText(schoolNameDraft, 120) || OFFICIAL_SCHOOL_NAME_EN;
+      const cleanCode = clampText(displaySchoolCodeDraft, 40) || OFFICIAL_DISPLAY_SCHOOL_CODE;
       const cleanEmis = clampText(emisDraft, 40) || OFFICIAL_EMIS_CODE;
       const cleanUpazila = clampText(upazilaDraft, 120);
       const parsedYear = Math.trunc(Number(defaultYearDraft));
@@ -725,6 +794,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       await withWriteTimeout(
         updateDoc(doc(instances.db, 'schools', session.schoolId), {
           schoolName: cleanName,
+          displaySchoolCode: cleanCode,
           emisCode: cleanEmis,
           upazilaDistrict: cleanUpazila,
           defaultAcademicYear: cleanYear,
@@ -736,8 +806,8 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
         type: 'success',
         text:
           lang === 'bn'
-            ? `বিদ্যালয়ের তথ্য ও EMIS কোড (${cleanEmis}) সংরক্ষণ করা হয়েছে।`
-            : `Saved School Profile & EMIS Code (${cleanEmis}).`,
+            ? `বিদ্যালয়ের তথ্য, কোড (${cleanCode}) ও EMIS (${cleanEmis}) সংরক্ষণ করা হয়েছে।`
+            : `Saved School Profile, Code (${cleanCode}) & EMIS (${cleanEmis}).`,
       });
     } catch (err) {
       setBanner({
@@ -1042,205 +1112,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
     }
   };
 
-  // 6. Zero-Data-Loss Workspace Migration Tool (Never overwrites or deletes destination data)
-  const handleMigrateWorkspace = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const instances = getFirebaseInstances();
-    if (!instances || !session) return;
 
-    const srcId = normalizeSchoolId(migSourceId);
-    const dstId = normalizeSchoolId(migTargetId);
-
-    if (!srcId || !dstId) {
-      setBanner({
-        type: 'error',
-        text:
-          lang === 'bn'
-            ? 'সঠিক উৎস এবং গন্তব্য স্কুল আইডি লিখুন।'
-            : 'Please enter valid Source and Target School IDs.',
-      });
-      return;
-    }
-
-    if (srcId === dstId) {
-      setBanner({
-        type: 'error',
-        text:
-          lang === 'bn'
-            ? 'উৎস এবং গন্তব্য স্কুল আইডি আলাদা হতে হবে।'
-            : 'Source and Target School IDs must be different.',
-      });
-      return;
-    }
-
-    if (!migPassword) {
-      setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
-      return;
-    }
-
-    setMigrating(true);
-    setSyncing(true);
-    setBanner(null);
-    setMigReport(null);
-
-    try {
-      const currentAdminRecord = teachers.find(
-        (m) =>
-          normalizeBdPhone(m.phoneNumber) === session.phoneNumber &&
-          m.role === 'ADMIN'
-      );
-      if (!currentAdminRecord?.passwordHash) {
-        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
-        return;
-      }
-      const enteredHash = await sha256Hex(migPassword);
-      if (enteredHash !== currentAdminRecord.passwordHash.toLowerCase()) {
-        setBanner({ type: 'error', text: t(lang, 'wrongAdminPassword') });
-        return;
-      }
-
-      const srcSchoolSnap = await getDoc(doc(instances.db, 'schools', srcId));
-      if (!srcSchoolSnap.exists()) {
-        throw new Error(`Source school "${srcId}" does not exist.`);
-      }
-      const srcSchoolData = srcSchoolSnap.data() as Record<string, unknown>;
-      const dstSchoolRef = doc(instances.db, 'schools', dstId);
-      const dstSchoolSnap = await getDoc(dstSchoolRef);
-      const dstSchoolData = dstSchoolSnap.exists()
-        ? (dstSchoolSnap.data() as Record<string, unknown>)
-        : {};
-
-      // Merge school metadata safely; enforce official EMIS 91411 070 804 when migrating to 139783
-      const schoolPatch: Record<string, unknown> = {
-        schoolId: dstId,
-        updatedAt: serverTimestamp(),
-      };
-      if (!dstSchoolData.schoolName) {
-        schoolPatch.schoolName =
-          srcSchoolData.schoolName ||
-          (dstId === OFFICIAL_SCHOOL_ID ? OFFICIAL_SCHOOL_NAME_EN : dstId);
-      }
-      if (dstId === OFFICIAL_SCHOOL_ID) {
-        schoolPatch.emisCode = OFFICIAL_EMIS_CODE;
-      } else if (!dstSchoolData.emisCode && srcSchoolData.emisCode) {
-        schoolPatch.emisCode = srcSchoolData.emisCode;
-      }
-      if (!dstSchoolData.upazilaDistrict && srcSchoolData.upazilaDistrict) {
-        schoolPatch.upazilaDistrict = srcSchoolData.upazilaDistrict;
-      }
-      if (!dstSchoolData.defaultAcademicYear && srcSchoolData.defaultAcademicYear) {
-        schoolPatch.defaultAcademicYear = srcSchoolData.defaultAcademicYear;
-      }
-      if (
-        (!Array.isArray(dstSchoolData.examConfigs) || dstSchoolData.examConfigs.length === 0) &&
-        Array.isArray(srcSchoolData.examConfigs)
-      ) {
-        schoolPatch.examConfigs = sanitizeExamConfigs(srcSchoolData.examConfigs);
-      }
-
-      const existingDstTeachers = Array.isArray(dstSchoolData.teachers)
-        ? (dstSchoolData.teachers as TeacherMember[])
-        : [];
-      const srcTeachers = Array.isArray(srcSchoolData.teachers)
-        ? (srcSchoolData.teachers as TeacherMember[])
-        : [];
-      const mergedTeachers = [...existingDstTeachers];
-      for (const stMember of srcTeachers) {
-        const normPhone = normalizeBdPhone(stMember.phoneNumber || '');
-        const already = mergedTeachers.some(
-          (m) =>
-            normalizeBdPhone(m.phoneNumber || '') === normPhone ||
-            (stMember.deviceId && m.deviceId === stMember.deviceId)
-        );
-        if (!already) {
-          mergedTeachers.push(stMember);
-        }
-      }
-      if (mergedTeachers.length > existingDstTeachers.length || !dstSchoolSnap.exists()) {
-        schoolPatch.teachers = mergedTeachers;
-      }
-      if (!dstSchoolSnap.exists()) {
-        schoolPatch.createdAt = serverTimestamp();
-      }
-
-      await withWriteTimeout(setDoc(dstSchoolRef, schoolPatch, { merge: true }));
-
-      // Subcollections to migrate WITHOUT overwriting existing destination doc IDs
-      const subcols = [
-        'students',
-        'subjects',
-        'customFields',
-        'attendanceLogs',
-        'parentNotices',
-        'messages',
-        'pendingChanges',
-      ] as const;
-
-      const summaryParts: string[] = [];
-
-      for (const subcol of subcols) {
-        const [srcSnap, dstSnap] = await Promise.all([
-          getDocs(collection(instances.db, 'schools', srcId, subcol)),
-          getDocs(collection(instances.db, 'schools', dstId, subcol)),
-        ]);
-
-        const existingDstIds = new Set(dstSnap.docs.map((d) => d.id));
-        const toCopy = srcSnap.docs.filter((d) => !existingDstIds.has(d.id));
-        const skipped = srcSnap.docs.length - toCopy.length;
-
-        if (toCopy.length > 0) {
-          await withWriteTimeout(
-            commitBatchesInChunks(
-              instances.db,
-              toCopy,
-              (batch, srcDoc) => {
-                const raw = srcDoc.data() as Record<string, unknown>;
-                const cloned: Record<string, unknown> = {
-                  ...raw,
-                  schoolId: dstId,
-                  updatedAt: serverTimestamp(),
-                };
-                batch.set(
-                  doc(instances.db, 'schools', dstId, subcol, srcDoc.id),
-                  cloned,
-                  { merge: true }
-                );
-              },
-              200
-            )
-          );
-        }
-
-        summaryParts.push(`${subcol}: +${toCopy.length} copied (${skipped} kept)`);
-      }
-
-      const reportStr = summaryParts.join(' · ');
-      setMigReport(reportStr);
-      setMigPassword('');
-
-      if (srcId === session.schoolId) {
-        switchSchoolId(dstId);
-      }
-
-      setBanner({
-        type: 'success',
-        text:
-          lang === 'bn'
-            ? `${srcId} থেকে ${dstId}-এ নিরাপদ মাইগ্রেশন ও EMIS (${OFFICIAL_EMIS_CODE}) সেট সম্পন্ন হয়েছে।`
-            : `Zero-data-loss migration from ${srcId} to ${dstId} complete${
-                dstId === OFFICIAL_SCHOOL_ID ? ` with EMIS ${OFFICIAL_EMIS_CODE}` : ''
-              }.`,
-      });
-    } catch (err) {
-      setBanner({
-        type: 'error',
-        text: `${t(lang, 'errorPrefix')} ${formatFirestoreError(err)}`,
-      });
-    } finally {
-      setMigrating(false);
-      setSyncing(false);
-    }
-  };
 
   const pendingBadgeCount = pendingChanges.filter((c) => c.status === 'PENDING').length;
 
@@ -1472,7 +1344,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
       {/* TAB 3: School Profile, EMIS & Exam Setup */}
       {adminTab === 'setup' && (
         <div className="space-y-6">
-          {/* School Profile & EMIS Code Editor */}
+          {/* School Profile, Display School Code & EMIS Code Editor */}
           <form
             onSubmit={handleSaveSchoolProfile}
             className="bg-white border border-stone-200 rounded-xl p-5 space-y-4"
@@ -1485,36 +1357,29 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
                 <div>
                   <h3 className="text-base font-semibold text-slate-900">
                     {lang === 'bn'
-                      ? 'বিদ্যালয়ের তথ্য, স্কুল আইডি ও EMIS কোড'
-                      : 'School Profile, School ID & EMIS Code'}
+                      ? 'বিদ্যালয়ের তথ্য, প্রদর্শিত স্কুল কোড ও EMIS কোড'
+                      : 'School Profile, Display School Code & EMIS'}
                   </h3>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    {lang === 'bn'
-                      ? `বর্তমান স্কুল আইডি: ${session.schoolId} · অফিসিয়াল লক্ষ্য: ${OFFICIAL_SCHOOL_ID} / EMIS: ${OFFICIAL_EMIS_CODE}`
-                      : `Active School ID: ${session.schoolId} · Official Target: ${OFFICIAL_SCHOOL_ID} / EMIS: ${OFFICIAL_EMIS_CODE}`}
+                    {(() => {
+                      const meta = getSchoolDisplayMeta(school, lang);
+                      return lang === 'bn'
+                        ? `প্রদর্শিত কোড: ${meta.displaySchoolCode} · EMIS: ${meta.emisCode} · লগইন আইডি: ${session.schoolId} (অপরিবর্তিত)`
+                        : `Display Code: ${meta.displaySchoolCode} · EMIS: ${meta.emisCode} · Workspace Login ID: ${session.schoolId} (unchanged)`;
+                    })()}
                   </p>
                 </div>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                {session.schoolId !== OFFICIAL_SCHOOL_ID && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMigSourceId(session.schoolId);
-                      setMigTargetId(OFFICIAL_SCHOOL_ID);
-                      setAdminTab('update');
-                    }}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-lg cursor-pointer whitespace-nowrap"
-                  >
-                    <ArrowRightLeft className="w-3.5 h-3.5" />
-                    <span>
-                      {lang === 'bn'
-                        ? `আইডি ${OFFICIAL_SCHOOL_ID}-তে পরিবর্তন করুন`
-                        : `Switch ID to ${OFFICIAL_SCHOOL_ID}`}
-                    </span>
-                  </button>
-                )}
+                <button
+                  type="button"
+                  disabled={savingDisplayCodeEmis}
+                  onClick={handleSetDisplayCodeAndEmis}
+                  className="px-3.5 py-2 text-xs font-semibold bg-amber-50 hover:bg-amber-100 disabled:opacity-50 text-amber-950 border border-amber-300 rounded-lg cursor-pointer whitespace-nowrap"
+                >
+                  {savingDisplayCodeEmis ? t(lang, 'loading') : t(lang, 'setDisplayCodeEmisBtn')}
+                </button>
                 <button
                   type="submit"
                   disabled={savingSchoolProfile}
@@ -1525,16 +1390,40 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
               <div>
                 <label className="block text-xs font-medium text-slate-700 mb-1">
-                  {t(lang, 'schoolIdLabel')}
+                  {t(lang, 'workspaceIdUnchangedLabel')}
                 </label>
                 <input
                   type="text"
                   readOnly
                   value={session.schoolId}
-                  className="w-full px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-lg text-slate-700"
+                  className="w-full px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-lg text-slate-600"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-700">
+                    {t(lang, 'displaySchoolCodeLabel')}
+                  </label>
+                  {displaySchoolCodeDraft.trim() !== OFFICIAL_DISPLAY_SCHOOL_CODE && (
+                    <button
+                      type="button"
+                      onClick={() => setDisplaySchoolCodeDraft(OFFICIAL_DISPLAY_SCHOOL_CODE)}
+                      className="text-[11px] font-semibold text-emerald-700 hover:underline cursor-pointer"
+                    >
+                      {OFFICIAL_DISPLAY_SCHOOL_CODE}
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={displaySchoolCodeDraft}
+                  onChange={(e) => setDisplaySchoolCodeDraft(e.target.value)}
+                  placeholder={OFFICIAL_DISPLAY_SCHOOL_CODE}
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-stone-300 rounded-lg"
                 />
               </div>
 
@@ -2029,98 +1918,7 @@ export const AdminPanelView: React.FC<AdminPanelViewProps> = ({
             </div>
           </form>
 
-          {/* B. Zero-Data-Loss Workspace Migration Tool */}
-          <form
-            onSubmit={handleMigrateWorkspace}
-            className="bg-white border border-stone-200 rounded-xl p-6 space-y-4"
-          >
-            <div className="flex items-start gap-3 pb-3 border-b border-stone-200">
-              <div className="w-10 h-10 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center shrink-0">
-                <ArrowRightLeft className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-semibold text-slate-900">
-                  {lang === 'bn'
-                    ? 'নিরাপদ ওয়ার্কস্পেস মাইগ্রেশন (Zero Data Loss)'
-                    : 'Zero-Data-Loss Workspace Migration'}
-                </h3>
-                <p className="text-xs text-slate-600 mt-0.5 leading-relaxed">
-                  {lang === 'bn'
-                    ? 'পুরোনো স্কুল আইডি থেকে অফিসিয়াল স্কুল আইডি (139783)-তে অনুপস্থিত শিক্ষার্থী, নম্বর, উপস্থিতি ও তথ্য কপি করুন। গন্তব্যের কোনো বিদ্যমান তথ্য মুছে ফেলা বা প্রতিস্থাপন করা হবে না।'
-                    : 'Safely copy missing students, marks, subjects, customFields, attendance, notices, and messages from an older School ID into Target School ID (139783). Existing destination records are never overwritten or deleted.'}
-                </p>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">
-                  {lang === 'bn' ? 'উৎস স্কুল আইডি (পুরোনো)' : 'Source School ID (Old)'}
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={migSourceId}
-                  onChange={(e) => setMigSourceId(e.target.value)}
-                  placeholder="e.g. OLD-SCHOOL-ID"
-                  className="w-full px-3 py-2 text-sm font-mono border border-stone-300 rounded-lg uppercase"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">
-                  {lang === 'bn' ? 'গন্তব্য স্কুল আইডি (অফিসিয়াল)' : 'Target School ID (Official)'}
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={migTargetId}
-                  onChange={(e) => setMigTargetId(e.target.value)}
-                  placeholder={OFFICIAL_SCHOOL_ID}
-                  className="w-full px-3 py-2 text-sm font-mono border border-stone-300 rounded-lg uppercase"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 mb-1">
-                  {t(lang, 'adminPasswordLabel')}
-                </label>
-                <div className="relative">
-                  <KeyRound className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="password"
-                    required
-                    value={migPassword}
-                    onChange={(e) => setMigPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="w-full pl-9 pr-3 py-2 text-sm border border-stone-300 rounded-lg"
-                  />
-                </div>
-              </div>
-              <button
-                type="submit"
-                disabled={migrating}
-                className="px-4 py-2.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white rounded-lg cursor-pointer"
-              >
-                {migrating
-                  ? lang === 'bn'
-                    ? 'মাইগ্রেট হচ্ছে...'
-                    : 'Migrating safely...'
-                  : lang === 'bn'
-                  ? 'নিরাপদে মাইগ্রেট করুন'
-                  : 'Run Safe Merge Migration'}
-              </button>
-            </div>
-
-            {migReport && (
-              <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-950 font-mono">
-                {migReport}
-              </div>
-            )}
-          </form>
-
-          {/* C. Safe Server APK Cleanup */}
+          {/* B. Safe Server APK Cleanup */}
           <form
             onSubmit={handleDeleteApkChunks}
             className="bg-white border border-stone-200 rounded-xl p-6 space-y-5"

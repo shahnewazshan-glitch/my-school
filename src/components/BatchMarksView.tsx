@@ -37,6 +37,7 @@ import {
   normalizeExamConfigs,
   TERM_ORDER,
 } from '../lib/schoolUtils';
+import { writeSafeXlsxWorkbook } from '../lib/spreadsheetUtils';
 import { CLASS_LEVELS, type ExamTermId, type StudentDoc } from '../types/school';
 import { DEFAULT_PAGE_SIZE, PaginationBar } from './PaginationBar';
 
@@ -1182,7 +1183,8 @@ export const BatchMarksView: React.FC<BatchMarksViewProps> = ({ onOpenStudentPro
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Merit List');
-    XLSX.writeFile(
+    writeSafeXlsxWorkbook(
+      XLSX,
       wb,
       `Merit_List_${selectedClass.replace(/\s+/g, '_')}_${selectedAcademicYear}.xlsx`
     );
